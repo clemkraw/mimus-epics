@@ -1,0 +1,17 @@
+[package]
+name = "mimus-serve"
+version = "0.1.0"
+edition = "2024"
+description = "PVA server: sockets, session state machine, emission loop"
+license = "MIT"
+
+[dependencies]
+mimus-wire = { path = "../mimus-wire" }
+mimus-profile = { path = "../mimus-profile" }
+mimus-emit = { path = "../mimus-emit" }
+bytes = { workspace = true }
+socket2 = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
