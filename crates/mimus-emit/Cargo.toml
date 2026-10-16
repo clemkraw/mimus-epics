@@ -1,0 +1,13 @@
+[package]
+name = "mimus-emit"
+version = "0.1.0"
+edition = "2024"
+description = "Template rendering, scheduling and emission accounting"
+license = "MIT"
+
+[dependencies]
+mimus-profile = { path = "../mimus-profile" }
+
+[[bench]]
+name = "emit"
+harness = false
