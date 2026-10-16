@@ -1,0 +1,13 @@
+[package]
+name = "mimus-calibrate"
+version = "0.1.0"
+edition = "2024"
+description = "Extracting message templates by observing a reference IOC"
+license = "MIT"
+
+[dependencies]
+mimus-wire = { path = "../mimus-wire" }
+mimus-profile = { path = "../mimus-profile" }
+mimus-emit = { path = "../mimus-emit" }
+bytes = { workspace = true }
+tokio = { workspace = true }
