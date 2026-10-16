@@ -1,0 +1,9 @@
+[package]
+name = "mimus-wire"
+version = "0.1.0"
+edition = "2024"
+description = "PVAccess wire format: framing and codec"
+license = "MIT"
+
+[dependencies]
+bytes = { workspace = true }
