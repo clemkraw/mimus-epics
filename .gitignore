@@ -2,3 +2,13 @@
 .idea
 *.profile.json
 /tests/fixtures/**/*.pcap
+
+# Calibrated profile and benchmark run directories
+/profile.json
+/pvxs*.json
+/bench-*/
+
+# Files the OS leaves behind
+Thumbs.db
+desktop.ini
+.DS_Store
