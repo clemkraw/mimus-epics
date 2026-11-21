@@ -1,0 +1,733 @@
+//! `mimus` CLI.
+//!
+//! Intentionally thin: parse arguments, load a profile, build a fleet, bind
+//! sockets, and print a report. All substantive decisions live in the library
+//! crates, where they can be tested without starting a process.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use clap::{Parser, Subcommand};
+use mimus_emit::{Backpressure, Counters, RateMix};
+use mimus_profile::{DescriptorPolicy, Profile};
+use mimus_serve::fleet::{Fleet, FleetSpec, Layout};
+use mimus_serve::session::{Pipeline, SessionConfig};
+use mimus_serve::{Ioc, NameTemplate};
+
+mod calibrate;
+mod demo;
+mod report;
+
+#[derive(Parser)]
+#[command(
+    name = "mimus",
+    version,
+    about = "A self-calibrating PVAccess traffic generator",
+    long_about = "MIMUS learns the shape of the messages a reference softIocPVX emits, \
+                  then replays them at facility scale without any EPICS code in memory.\n\n\
+                  Scope is PVXS (QSRV2)."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Serve a fleet of virtual IOCs from a profile.
+    Serve(Box<ServeArgs>),
+    /// Print the contents of a profile without serving it.
+    Inspect {
+        profile: PathBuf,
+        /// Compare against a second profile.
+        ///
+        /// Useful across PVXS upgrades: if the environments match, a difference
+        /// indicates a MIMUS bug; otherwise, it indicates a change in PVXS
+        /// wire behavior.
+        #[arg(long)]
+        diff: Option<PathBuf>,
+    },
+    /// Extract templates by observing a reference softIocPVX.
+    ///
+    /// The IOC must have the reference catalogue loaded. Calibration monitors
+    /// every channel in the list until each has yielded enough data to analyze,
+    /// validates the result against the bytes it was derived from, and writes
+    /// the profile only if validation succeeds.
+    Calibrate(Box<CalibrateArgs>),
+    /// Write a hand-crafted profile for trying the server out.
+    ///
+    /// Not a substitute for calibration. The profile is marked synthetic, and
+    /// every command that uses it makes that explicit.
+    DemoProfile {
+        #[arg(short, long, default_value = "demo.profile.json")]
+        out: PathBuf,
+    },
+}
+
+#[derive(Parser)]
+struct ServeArgs {
+    /// Profile produced by `mimus calibrate`.
+    #[arg(short, long)]
+    profile: PathBuf,
+
+    /// Number of virtual IOCs. Each listens on a separate port and appears to
+    /// clients as a separate server. Consumers typically run one task per
+    /// connection, so this limits how much work can spread across cores.
+    #[arg(long, default_value_t = 1)]
+    iocs: u16,
+
+    /// Total number of channels across the fleet.
+    #[arg(long, default_value_t = 1000)]
+    pvs: u32,
+
+    /// Update rate per channel, in Hz. The offered load is `pvs × rate`.
+    #[arg(long = "rate-hz", default_value_t = 1.0)]
+    rate_hz: f64,
+
+    /// Distribute channels across several rates: `10:2,1:60,0.1:38` assigns
+    /// 2% of channels to 10 Hz, 60% to 1 Hz, and 38% to 0.1 Hz.
+    ///
+    /// Real facilities rarely run everything at the same frequency. The
+    /// distribution shapes the offered load, not just its total volume.
+    /// Overrides `--rate-hz`.
+    #[arg(long = "rate-mix")]
+    rate_mix: Option<String>,
+
+    /// Pattern for channel names. Tokens: `{i}` global index, `{ioc}`,
+    /// `{n}` index within the IOC, `{t}` template name. `{i:06}` zero-pads.
+    ///
+    /// Real facility names can be thirty or forty characters long. At a
+    /// million channels, this increases the memory used by the consumer's
+    /// name maps, so shorter names understate its footprint.
+    #[arg(long = "name-template")]
+    name_template: Option<String>,
+
+    /// Whether to honour pipeline credits (`strict`) or only count them
+    /// (`permissive`, the default).
+    ///
+    /// A real PVXS server withholds updates from pipelined clients when they
+    /// run out of credits. Strict mode is opt-in because an incorrect credit
+    /// encoding can stall a subscription outright, a more severe failure than
+    /// sending slightly too fast.
+    #[arg(long, default_value = "permissive")]
+    pipeline: Pipeline,
+
+    /// Initial credits for a pipelined monitor, before any acknowledgements.
+    #[arg(long = "initial-credits", default_value_t = 4)]
+    initial_credits: i32,
+
+    /// Drop one live connection every N seconds, without warning.
+    ///
+    /// The consumer must detect the disconnect, reconnect, and resubscribe
+    /// to every channel. At scale, this reconnect storm is a much harder
+    /// test than steady state, and one that cannot be run against real IOCs.
+    #[arg(long = "drop-connections")]
+    drop_connections: Option<f64>,
+
+    /// Select templates to serve and their relative proportions.
+    ///
+    /// `double` serves a single type; `double:3,int:1` allocates three
+    /// quarters to `double` and one quarter to `int`. By default, all
+    /// templates in the profile are served in equal proportions.
+    ///
+    /// This matters because a population consisting of a single template
+    /// can keep a consumer on its fast path and inflate performance figures.
+    /// Comparing throughput across different template mixes is meaningless.
+    /// The selected mix belongs in the run manifest.
+    #[arg(long)]
+    mix: Option<String>,
+
+    /// Prefix for generated PV names.
+    #[arg(long, default_value = "MIM")]
+    prefix: String,
+
+    /// How channels are distributed across IOCs.
+    ///
+    /// `blocked` assigns contiguous ranges, as in a real facility.
+    /// `round-robin` interleaves channels, which can favour clients that
+    /// partition their work in the same way.
+    #[arg(long, default_value = "blocked")]
+    layout: Layout,
+
+    /// How to handle backpressure when the consumer falls behind.
+    ///
+    /// `block` lets TCP throttle the sender, measuring the consumer's
+    /// effective capacity. `drop` maintains the nominal rate and counts
+    /// discarded updates, as an IOC does when its monitor queue overflows.
+    /// These modes answer different questions; published results must
+    /// identify which one was used.
+    #[arg(long, default_value = "block")]
+    backpressure: Backpressure,
+
+    /// Scheduler resolution in microseconds. Reduce it for rates above a few hundred hertz.
+    #[arg(long = "tick-us", default_value_t = 1000)]
+    tick_us: u64,
+
+    /// Address to bind.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+
+    /// Starting port. Each IOC uses the next port; zero lets the OS assign it.
+    #[arg(long = "base-port", default_value_t = 5075)]
+    base_port: u16,
+
+    /// Maximum queued bytes before the drop policy discards updates.
+    /// Models an IOC's monitor queue depth.
+    #[arg(long = "high-water", default_value_t = 1 << 20)]
+    high_water: usize,
+
+    /// Send a full type descriptor with every monitor update instead of
+    /// caching it per connection. Only use if the reference server does so.
+    #[arg(long = "always-full-descriptor")]
+    always_full: bool,
+
+    /// Delay outgoing updates by up to this many microseconds before writing.
+    ///
+    /// Zero, the default, writes on every tick, resulting in one syscall per
+    /// connection per tick, as in an IOC. In a measured run, delivering the
+    /// same 42 MB across eight connections instead of one cost 3.6 times
+    /// as much CPU because each write carried only an eighth of the data.
+    ///
+    /// A nonzero value reduces that overhead at the cost of latency, which
+    /// consumers measuring end-to-end time against the timestamp field will
+    /// observe. The value is recorded in the run manifest.
+    #[arg(long = "coalesce-us", default_value_t = 0)]
+    coalesce_us: u64,
+
+    /// Respond to PVAccess searches over UDP so clients can discover MIMUS
+    /// as they would discover an IOC.
+    ///
+    /// Clients broadcast searches on port 5076 by default. Zero disables
+    /// the responder, which is useful when a real IOC on the same host
+    /// already occupies the port. Two programs cannot share the port, so
+    /// the second to start would fail to bind rather than silently stop
+    /// responding.
+    #[arg(long = "search-port", default_value_t = 5076)]
+    search_port: u16,
+
+    /// Address on which the search responder listens.
+    ///
+    /// Unlike `--bind`, which controls the TCP listeners, this address
+    /// receives UDP broadcasts addressed to a subnet rather than a host.
+    /// Binding to 127.0.0.1 prevents broadcast searches from reaching
+    /// the responder, even if discovery appears enabled.
+    #[arg(long = "search-bind", default_value = "0.0.0.0")]
+    search_bind: String,
+
+    /// Print the first outgoing message of each shape in hexadecimal.
+    ///
+    /// Rejected bytes are the evidence needed to diagnose why a client
+    /// rejected a message.
+    #[arg(long)]
+    debug: bool,
+
+    /// Stop after this many seconds. Runs until interrupted otherwise.
+    #[arg(long = "duration-s")]
+    duration_s: Option<f64>,
+
+    /// Write the accounting report to this file on exit.
+    #[arg(long = "report")]
+    report: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct CalibrateArgs {
+    /// Address of the reference IOC (host:port).
+    #[arg(short, long, default_value = "127.0.0.1:5075")]
+    addr: String,
+
+    /// Channels to observe, one per line. Lines starting with `#` are comments.
+    ///
+    /// This is not the record list: QSRV2 exposes record fields as channels
+    /// in their own right, and some PVA type codes are only accessible through those fields.
+    #[arg(short, long, default_value = "catalogue/channels.txt")]
+    channels: PathBuf,
+
+    #[arg(short, long, default_value = "profile.json")]
+    out: PathBuf,
+
+    /// Catalogue database to record in the manifest for provenance.
+    #[arg(long)]
+    catalogue: Option<PathBuf>,
+
+    /// Number of distinct message bodies a changing channel must exhibit.
+    ///
+    /// Seven was insufficient in the capture this was designed around:
+    /// the high byte of a double remained unchanged across seven updates
+    /// because the value stayed within the same decade. Unchanging fields
+    /// are frozen into the template, which is correct for the capture
+    /// window but may not hold outside it.
+    #[arg(long = "min-distinct", default_value_t = 30)]
+    min_distinct: usize,
+
+    /// Seconds without new observations before a channel is considered
+    /// settled, such as a setpoint or deadbanded channel repeating one body.
+    #[arg(long = "settled-after", default_value_t = 30.0)]
+    settled_after: f64,
+
+    /// Overall calibration deadline in seconds.
+    #[arg(long = "deadline-s", default_value_t = 600.0)]
+    deadline_s: f64,
+
+    /// PVXS version of the reference IOC, recorded in the manifest.
+    /// A profile is meaningful only in the context of the environment that produced it.
+    #[arg(long = "pvxs-version", default_value = "unknown")]
+    pvxs_version: String,
+
+    /// EPICS Base version of the reference IOC.
+    #[arg(long = "epics-version", default_value = "unknown")]
+    epics_version: String,
+
+    /// Log observations at each step, channel by channel.
+    #[arg(long)]
+    debug: bool,
+
+    /// Write a profile even if calibration criteria are not met.
+    ///
+    /// Useful during development, but risky elsewhere: an incomplete profile
+    /// can be served without errors while silently missing data that downstream consumers
+    /// cannot detect. Missing criteria are reported, and the run is marked accordingly.
+    #[arg(long = "allow-incomplete")]
+    allow_incomplete: bool,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let code = match cli.command {
+        Command::Serve(args) => run_serve(*args),
+        Command::Calibrate(args) => calibrate::run(calibrate::Args {
+            addr: args.addr,
+            channels: args.channels,
+            out: args.out,
+            catalogue: args.catalogue,
+            min_distinct: args.min_distinct,
+            settled_after: args.settled_after,
+            deadline_s: args.deadline_s,
+            pvxs_version: args.pvxs_version,
+            epics_version: args.epics_version,
+            debug: args.debug,
+            allow_incomplete: args.allow_incomplete,
+        }),
+        Command::Inspect { profile, diff } => run_inspect(&profile, diff.as_deref()),
+        Command::DemoProfile { out } => demo::write(&out),
+    };
+    std::process::exit(code);
+}
+
+/// Parse a comma-separated list of `name` or `name:share` entries.
+fn parse_mix(spec: &str) -> Result<Vec<(String, u32)>, String> {
+    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, share) = match part.split_once(':') {
+            None => (part, 1u32),
+            Some((n, s)) => (
+                n,
+                s.parse::<u32>()
+                    .map_err(|_| format!("{s:?} is not a share"))?,
+            ),
+        };
+        if name.is_empty() {
+            return Err(format!("{part:?} has no template name"));
+        }
+        out.push((name.to_string(), share));
+    }
+    if out.is_empty() {
+        return Err("no templates given".into());
+    }
+    Ok(out)
+}
+
+fn load(path: &std::path::Path) -> Result<Profile, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    Profile::from_json(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A hand-crafted profile cannot support measurement claims.
+/// Serving it is fine, but its synthetic status must be explicit.
+fn warn_if_synthetic(profile: &Profile) {
+    if profile.manifest.synthetic {
+        eprintln!("┌───────────────────────────────────────────────────────────┐");
+        eprintln!("│ SYNTHETIC PROFILE — not calibrated against a real IOC.     │");
+        eprintln!("│ Useful for trying the server out. Nothing produced from    │");
+        eprintln!("│ this run is a measurement of anything.                     │");
+        eprintln!("└───────────────────────────────────────────────────────────┘");
+    }
+}
+
+/// Templates derived from few updates are not invalid, but measurements
+/// based on them warrant a caveat.
+fn warn_if_weakly_supported(profile: &Profile) {
+    let weak = profile.weakly_supported(mimus_profile::DEFAULT_MIN_OBSERVATIONS);
+    if weak.is_empty() {
+        return;
+    }
+    eprintln!(
+        "note: {} template(s) were distilled from fewer than {} updates. A field \
+         that did not move during calibration is frozen into the template, which \
+         is right for that window and wrong outside it:",
+        weak.len(),
+        mimus_profile::DEFAULT_MIN_OBSERVATIONS
+    );
+    for (name, n) in weak.iter().take(8) {
+        eprintln!("  {name:<28} {n} update(s)");
+    }
+}
+
+fn run_serve(args: ServeArgs) -> i32 {
+    let profile = match load(&args.profile) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    warn_if_synthetic(&profile);
+
+    let rate_mix = match &args.rate_mix {
+        None => RateMix::uniform(args.rate_hz),
+        Some(spec) => match RateMix::parse(spec) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("error: --rate-mix: {e}");
+                return 1;
+            }
+        },
+    };
+
+    let names = match &args.name_template {
+        None => NameTemplate::default_pattern(&args.prefix),
+        Some(pattern) => match NameTemplate::new(pattern) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("error: --name-template: {e}");
+                return 1;
+            }
+        },
+    };
+
+    let mut spec = FleetSpec::uniform(&profile, args.iocs, args.pvs);
+    spec.layout = args.layout;
+    spec.rate_mix = rate_mix.clone();
+    spec.names = names;
+    if let Some(mix) = &args.mix {
+        spec.mix = match parse_mix(mix) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("error: --mix: {e}");
+                return 1;
+            }
+        };
+    }
+
+    let fleet = match Fleet::build(&profile, &spec) {
+        Ok(f) => Arc::new(f),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    // Opening messages retain their calibration timestamps unless their values
+    // can be traversed. Warn explicitly so clients do not unknowingly store
+    // stale initial samples.
+    for (name, why) in fleet.unstamped_openings() {
+        eprintln!("warning: {name}: opening message sent with its recorded timestamp: {why}");
+    }
+
+    let cfg = SessionConfig {
+        buffer_size: profile.session_rules.server_buffer_size,
+        registry_size: profile.session_rules.server_registry_size,
+        descriptor_policy: if args.always_full {
+            DescriptorPolicy::AlwaysFull
+        } else {
+            profile.session_rules.descriptor_policy
+        },
+        backpressure: args.backpressure,
+        rate_mix: rate_mix.clone(),
+        tick_us: args.tick_us,
+        high_water: args.high_water,
+        drop_connections: args
+            .drop_connections
+            .map(std::time::Duration::from_secs_f64),
+        coalesce_us: args.coalesce_us,
+        debug: args.debug,
+        pipeline: args.pipeline,
+        initial_credits: args.initial_credits,
+        ..Default::default()
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: cannot start the runtime: {e}");
+            return 1;
+        }
+    };
+
+    let mix_label = spec
+        .mix
+        .iter()
+        .map(|(n, w)| format!("{n}:{w}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let summary = report::RunSummary {
+        mix: mix_label,
+        iocs: args.iocs,
+        pvs: args.pvs,
+        rate_mix: rate_mix.to_string(),
+        offered_eps: rate_mix.aggregate_rate(args.pvs),
+        name_template: spec.names.pattern().to_string(),
+        drop_connections_s: args.drop_connections,
+        pipeline: args.pipeline.to_string(),
+        coalesce_us: args.coalesce_us,
+        layout: args.layout.to_string(),
+        backpressure: args.backpressure.to_string(),
+        tick_us: args.tick_us,
+    };
+
+    runtime.block_on(async move {
+        let mut totals = Vec::new();
+        let mut addrs = Vec::new();
+
+        for i in 0..args.iocs {
+            let port = if args.base_port == 0 {
+                0
+            } else {
+                args.base_port + i
+            };
+            let bind = format!("{}:{}", args.bind, port);
+            let ioc = match Ioc::bind(i, &bind, cfg.clone(), Arc::clone(&fleet)).await {
+                Ok(ioc) => ioc,
+                Err(e) => {
+                    eprintln!("error: cannot bind {bind}: {e}");
+                    return 1;
+                }
+            };
+            addrs.push(ioc.addr);
+            totals.push(ioc.totals());
+            tokio::spawn(ioc.serve());
+        }
+
+        // Start discovery once all IOCs are listening and their ports are known.
+        //
+        // Without discovery, clients must be told where to connect. A consumer
+        // whose configuration had to be changed for the benchmark is not quite
+        // the same consumer that would connect to a real IOC.
+        let mut discovery = None;
+        if args.search_port != 0 {
+            // Discovery must advertise addresses that the listeners can reach.
+            //
+            // A responder bound to every interface advertises the host's
+            // reachable address. If the listeners are restricted to loopback,
+            // remote clients are directed to an address where nothing is
+            // listening and receive a connection refusal. Being undiscoverable
+            // is a limitation; advertising an unreachable endpoint is misleading.
+            if args.bind == "127.0.0.1" && args.search_bind == "0.0.0.0" {
+                eprintln!(
+                    "warning: searches are answered on every interface but the \
+                     listeners are on 127.0.0.1, so a client elsewhere will be \
+                     told to connect where nothing is listening. Use \
+                     --bind 0.0.0.0 for a reachable server, or \
+                     --search-bind 127.0.0.1 to keep both on the loopback."
+                );
+            }
+            let endpoints: Vec<mimus_serve::IocEndpoint> = addrs
+                .iter()
+                .enumerate()
+                .map(|(i, a)| mimus_serve::IocEndpoint {
+                    index: i as u16,
+                    tcp_port: a.port(),
+                    guid: mimus_serve::listener::guid_for(i as u16),
+                })
+                .collect();
+            match mimus_serve::SearchResponder::bind(
+                &args.search_bind,
+                args.search_port,
+                Arc::clone(&fleet),
+                endpoints,
+            )
+            .await
+            {
+                Ok(r) => {
+                    let r = Arc::new(r);
+                    discovery = Some(Arc::clone(&r));
+                    tokio::spawn(async move { r.serve().await });
+                }
+                Err(e) => {
+                    // Serving remains available to clients configured with
+                    // explicit endpoints. Warn so clients relying on discovery
+                    // are not left without an explanation.
+                    eprintln!(
+                        "warning: cannot answer searches on {}:{} ({e}). Clients will \
+                         need EPICS_PVA_NAME_SERVERS. Another PVAccess program may \
+                         already hold the port; --search-port 0 turns this off.",
+                        args.search_bind, args.search_port
+                    );
+                }
+            }
+        }
+
+        report::print_banner(&profile, &fleet, &summary, &addrs, discovery.is_some());
+
+        let started = std::time::Instant::now();
+        match args.duration_s {
+            Some(s) => tokio::time::sleep(std::time::Duration::from_secs_f64(s)).await,
+            None => {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    eprintln!("warning: cannot listen for interrupts; running until killed");
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+
+        // Snapshot counters while sessions are still open, rather than relying
+        // on end-of-session totals.
+        let mut merged = Counters::default();
+        let mut sessions = 0u64;
+        let mut subscriptions = 0u64;
+        for t in &totals {
+            merged.merge(&t.snapshot());
+            sessions += t.sessions_total();
+            subscriptions += t.subscriptions();
+        }
+
+        report::finish(
+            &profile,
+            &summary,
+            merged,
+            sessions,
+            subscriptions,
+            started.elapsed().as_secs_f64(),
+            args.report.as_deref(),
+        );
+        0
+    })
+}
+
+fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
+    let profile = match load(path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    warn_if_synthetic(&profile);
+    warn_if_weakly_supported(&profile);
+
+    println!("{}", profile.manifest.summary());
+    println!("{}", profile.coverage_summary());
+    println!();
+    println!("{:<24} {:>6} {:>6}  shape", "template", "PVs", "obs");
+    for (name, pvs) in profile.coverage() {
+        let t = profile.template(name).expect("listed");
+        let shape = if t.is_fixed_width() {
+            format!("{} B fixed", t.max_len())
+        } else {
+            format!("{}..{} B variable", t.min_len(), t.max_len())
+        };
+        println!("{name:<24} {pvs:>6} {:>6}  {shape}", t.observations);
+    }
+
+    if let Some(share) = profile.session_rules.dominant_share() {
+        println!();
+        println!(
+            "dominant changed-set covers {:.1}% of observed updates",
+            share * 100.0
+        );
+        if share < 0.95 {
+            println!(
+                "  note: a large minority of updates use other patterns; emitting only \
+                 the dominant one would leave decode paths untested"
+            );
+        }
+    }
+
+    let Some(other_path) = diff else {
+        return 0;
+    };
+    let other = match load(other_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    println!();
+    let same_env = profile.manifest.same_environment(&other.manifest);
+    if same_env {
+        println!("same reference environment — any difference below is a MIMUS bug");
+    } else {
+        println!("different reference environment — differences are wire-behaviour changes");
+        println!("  a: {}", profile.manifest.summary());
+        println!("  b: {}", other.manifest.summary());
+    }
+
+    let mut differences = 0;
+    for t in &profile.templates {
+        match other.template(&t.name) {
+            None => {
+                println!("  - {} present in a, absent from b", t.name);
+                differences += 1;
+            }
+            Some(o) => {
+                if t.chunks != o.chunks || t.slots != o.slots {
+                    println!("  ~ {} differs in shape", t.name);
+                    differences += 1;
+                } else if t.introspection != o.introspection {
+                    println!("  ~ {} differs in its type descriptor", t.name);
+                    differences += 1;
+                }
+            }
+        }
+    }
+    for t in &other.templates {
+        if profile.template(&t.name).is_none() {
+            println!("  + {} present in b, absent from a", t.name);
+            differences += 1;
+        }
+    }
+    if differences == 0 {
+        println!("  no differences");
+        return 0;
+    }
+    // Differences between profiles from the same environment indicate a
+    // defect. Exit nonzero so CI can detect it without parsing the output.
+    i32::from(same_env)
+}
+
+#[cfg(test)]
+mod mix_tests {
+    use super::parse_mix;
+
+    #[test]
+    fn a_bare_name_is_an_equal_share() {
+        assert_eq!(parse_mix("double").unwrap(), vec![("double".into(), 1)]);
+    }
+
+    #[test]
+    fn shares_are_parsed_and_kept_in_order() {
+        assert_eq!(
+            parse_mix("double:3,int:1").unwrap(),
+            vec![("double".into(), 3), ("int".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn whitespace_and_trailing_commas_are_tolerated() {
+        assert_eq!(
+            parse_mix(" double , int , ").unwrap(),
+            vec![("double".into(), 1), ("int".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn nonsense_is_refused_rather_than_guessed() {
+        // Serving a different mix than requested would silently invalidate the run.
+        assert!(parse_mix("").is_err());
+        assert!(parse_mix("double:x").is_err());
+        assert!(parse_mix(":3").is_err());
+    }
+}
