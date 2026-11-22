@@ -17,6 +17,7 @@ use mimus_profile::{
     Assignment, DescriptorPolicy, Introspection, Manifest, Profile, ScalarType, SessionRules, Slot,
     SlotRole, SlotWidth, Template,
 };
+use mimus_serve::Dropper;
 use mimus_serve::fleet::{Fleet, FleetSpec, Layout};
 use mimus_serve::session::{Session, SessionConfig};
 use mimus_wire::codec::{Reader, put_i16, put_i32, put_size, put_string};
@@ -39,14 +40,14 @@ fn template(name: &str, intro_tag: u8) -> Template {
         full: vec![0xFF, 0xFD, intro_tag, 0x00, 0x80],
         id_only: Some(vec![0xFF, 0xFE, intro_tag, 0x00]),
     })
-    .push_fixed(vec![0x03, 0x83, 0x01])
-    .push_slot(
-        Slot::new(1, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::Value {
-            scalar: ScalarType::F64,
-        }),
-    )
-    .push_slot(Slot::new(2, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds))
-    .push_slot(Slot::new(3, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos));
+        .push_fixed(vec![0x03, 0x83, 0x01])
+        .push_slot(
+            Slot::new(1, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::Value {
+                scalar: ScalarType::F64,
+            }),
+        )
+        .push_slot(Slot::new(2, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds))
+        .push_slot(Slot::new(3, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos));
     t.observations = 100;
     t
 }
@@ -2392,4 +2393,49 @@ async fn the_wheel_delivers_the_rate_it_was_asked_for() {
         observed > 12.0 && observed < 30.0,
         "asked for 20 Hz, delivered {observed} Hz over {span} s"
     );
+}
+
+// ------------------------------------------------------- connection drops
+
+/// Whether the server has closed this connection, judged by a read that
+/// returns end-of-stream before the deadline.
+async fn closed_within(c: &mut Client, within: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(within, c.stream.read_buf(&mut c.inbox)).await,
+        Ok(Ok(0)) | Ok(Err(_))
+    )
+}
+
+#[tokio::test]
+async fn a_drop_request_closes_exactly_one_live_connection() {
+    let dropper = Dropper::new();
+    let cfg = SessionConfig {
+        dropper: Some(Arc::clone(&dropper)),
+        ..fast_config()
+    };
+    let f = fleet(10, 1);
+    let mut a = Client::connect(start(Arc::clone(&f), cfg.clone()).await).await;
+    let mut b = Client::connect(start(f, cfg).await).await;
+    a.handshake().await;
+    b.handshake().await;
+
+    dropper.request();
+    let closed_a = closed_within(&mut a, Duration::from_millis(500)).await;
+    let closed_b = closed_within(&mut b, Duration::from_millis(500)).await;
+    assert!(
+        closed_a ^ closed_b,
+        "one request must close one connection: a closed {closed_a}, b closed {closed_b}"
+    );
+}
+
+#[tokio::test]
+async fn without_a_request_a_connection_stays_open() {
+    let dropper = Dropper::new();
+    let cfg = SessionConfig {
+        dropper: Some(dropper),
+        ..fast_config()
+    };
+    let mut c = Client::connect(start(fleet(10, 1), cfg).await).await;
+    c.handshake().await;
+    assert!(!closed_within(&mut c, Duration::from_millis(300)).await);
 }
