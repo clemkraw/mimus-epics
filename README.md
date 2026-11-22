@@ -9,9 +9,10 @@
   <p align="center">
     <a href="#why">Why</a> •
     <a href="#how-it-works">How it works</a> •
-    <a href="#fidelity">Fidelity</a> •
+    <a href="#quick-start">Quick start</a> •
     <a href="#usage">Usage</a> •
-    <a href="#accounting">Accounting</a> •
+    <a href="#performance">Performance</a> •
+    <a href="#fidelity">Fidelity</a> •
     <a href="#scope-and-limitations">Scope</a> •
     <a href="#status">Status</a>
   </p>
@@ -23,4 +24,367 @@
   </p>
 </div>
 
-> **A standalone PVAccess traffic generator. EPICS base is not required to build or run MIMUS** — it is a single Rust binary, not an EPICS module. A reference `softIocPVX` is needed once, during the calibration phase, to teach MIMUS what to emit.
+> **A standalone PVAccess traffic generator. EPICS base is not required to build or run MIMUS** - it is a single Rust binary, not an EPICS module. A reference `softIocPVX` is needed once, during the calibration phase, to teach MIMUS what to emit.
+
+---
+
+## Why
+
+Testing an EPICS 7 client (an archiver, a gateway, a forwarder, a control-room display) at facility scale means generating a facility-scale PVAccess stream. Today the only way to do that is to run the real thing: a fleet of `softIocPVX` processes.
+
+That approach breaks down well below the scale that matters. A soft IOC carries records, scan threads and a server-side pvData structure for every PV, and processes every record on every scan. A facility-scale population needs many such processes, and on a single measurement host they compete with the system under test for the same cores: the number you measure is no longer the number you wanted.
+
+But a client does not observe an IOC. It observes **bytes on a socket**. For a scalar monitor update in steady state, the PVAccess message is a fixed-shape frame in which only the value and the timestamp change from one update to the next.
+
+MIMUS exploits exactly that. It watches a real `softIocPVX`, learns the byte-level shape of the messages it emits, verifies that it can reproduce them exactly, then replays them at arbitrary scale without any EPICS code in memory.
+
+## How it works
+
+MIMUS runs in three phases. The reference IOC and the client under test never coexist: by the time the client connects, no EPICS process is running.
+
+```
+  ┌─────────────────────────────┐
+  │  softIocPVX (reference)     │   1 · calibrate
+  │  catalogue/, every type     │
+  └──────────────┬──────────────┘
+                 │  real PVAccess traffic
+                 ▼
+  ┌─────────────────────────────┐
+  │  mimus calibrate            │   observe · diff · verify
+  │  learns message templates   │
+  └──────────────┬──────────────┘
+                 ▼
+  ┌─────────────────────────────┐
+  │  profile.json               │   templates + session rules
+  └──────────────┬──────────────┘
+                 ▼
+  ┌─────────────────────────────┐
+  │  reference IOC stopped      │   2 · teardown
+  └──────────────┬──────────────┘
+                 ▼
+  ┌─────────────────────────────┐
+  │  mimus serve                │   3 · generate
+  │  N ports = N virtual IOCs   │
+  └──────────────┬──────────────┘
+                 ▼
+  ┌─────────────────────────────┐
+  │  client under test          │
+  │  archiver · gateway · UI    │
+  └─────────────────────────────┘
+```
+
+### 1 · Calibrate
+
+`mimus calibrate` connects to a reference `softIocPVX` as an ordinary PVAccess client and subscribes to every channel in [`catalogue/channels.txt`](catalogue/channels.txt). It parses the PVAccess **framing** (message boundaries, request ids, monitor sub-commands) but treats each monitor payload as opaque bytes.
+
+Variable regions are found by **differential analysis**: successive updates of the same channel are compared byte by byte. Bytes that never change become the fixed part of a template; bytes that change become slots. When serving, the timestamp slots get the current time, and every other slot, the value included, replays the bytes it took during calibration, in order and in a loop.
+
+Observation ends on a **completeness criterion**, not a timer: every channel must show at least `--min-distinct` distinct bodies (30 by default) or settle, repeating one body for `--settled-after` seconds. A channel the IOC never answers is reported as a gap rather than holding up the run. Calibration then builds one template per type descriptor; [the catalogue README](catalogue/README.md#from-catalogue-to-profile) describes exactly which channel each template comes from.
+
+### 2 · Verify, then teardown
+
+Before anything is written, every template must reproduce exactly the bytes it was built from, and one of its messages is rendered through the emitter that will serve it. A type that falls short of an exact match is left out of the profile and reported by name; if nothing verifies, no profile is written. Once the profile exists, the reference IOC is no longer needed.
+
+This is what makes fidelity a verified property rather than a claim - see [Fidelity](#fidelity).
+
+### 3 · Generate
+
+`mimus serve` loads the profile, replicates its templates across the requested number of channels and opens one listening socket per virtual IOC. Each socket behaves as an independent IOC: it validates the connection, answers searches, creates channels, serves `GET`, `GET_FIELD` and `MONITOR` (with pipelining), answers echoes, and then emits.
+
+Emission runs on a timing wheel. At each tick, the channels due in that bucket have their compiled template copied into the connection's write buffer with the value and timestamp slots written in place.
+
+## Quick start
+
+```bash
+# 0 · build (no EPICS needed)
+cargo build --release
+
+# 1 · start the reference IOC with the catalogue, and let its arrays fill
+softIocPVX -S -d catalogue/catalogue.db -d catalogue/catalogue-groups.db &
+sleep 70
+
+# 2 · calibrate; the versions go into the profile's manifest (pvxinfo -V prints them)
+./target/release/mimus calibrate --addr 127.0.0.1:5075 \
+    --channels catalogue/channels.txt --catalogue catalogue/catalogue.db \
+    --pvxs-version <PVXS version> --epics-version <EPICS base version> \
+    --out profile.json
+kill %1                     # the reference IOC is no longer needed
+
+# 3 · see what was learned
+./target/release/mimus inspect profile.json
+
+# 4 · serve 100 000 double channels at 10 Hz from 4 virtual IOCs
+#     (without --mix, every template in the profile is served in equal shares)
+./target/release/mimus serve --profile profile.json \
+    --iocs 4 --pvs 100000 --rate-hz 10 --mix ntscalar_f64 --search-port 0
+
+# 5 · in another terminal, read them with the PVXS tools
+export EPICS_PVA_NAME_SERVERS="127.0.0.1:5075 127.0.0.1:5076 127.0.0.1:5077 127.0.0.1:5078"
+pvxget MIM:ntscalar_f64:0
+pvxmonitor MIM:ntscalar_f64:0
+```
+
+Channel names follow `MIM:{template}:{index}` by default, with one index across the whole fleet, and `mimus serve` prints the address list to use with the name of a channel it serves. To try the server without a reference IOC, `mimus demo-profile` writes a hand-made profile; it is marked synthetic, and every command that loads it says so.
+
+## Usage
+
+```
+mimus calibrate     extract templates by observing a reference softIocPVX
+mimus inspect       print what a profile contains, without serving it
+mimus serve         serve a fleet of virtual IOCs from a profile
+mimus demo-profile  write a hand-made profile for trying the server out
+```
+
+`mimus <command> --help` gives the full description of every option.
+
+### `mimus calibrate`
+
+| Option | Default | What it does |
+|---|---|---|
+| `-a, --addr` | `127.0.0.1:5075` | Reference IOC, `host:port` |
+| `-c, --channels` | `catalogue/channels.txt` | Channels to observe, one per line |
+| `-o, --out` | `profile.json` | Profile to write |
+| `--catalogue` | - | Database recorded in the manifest, so a profile can be traced to what produced it |
+| `--pvxs-version`, `--epics-version` | `unknown` | Versions of the reference IOC, recorded in the manifest |
+| `--min-distinct` | `30` | Distinct bodies a moving channel must show |
+| `--settled-after` | `30` | Seconds without anything new before a channel counts as settled |
+| `--deadline-s` | `600` | Overall limit |
+| `--allow-incomplete` | off | Write a profile even if the criterion was not met (development only) |
+| `--debug` | off | Print what was seen, channel by channel |
+
+### `mimus inspect`
+
+`mimus inspect profile.json` lists the templates with the number of channels assigned to each, their body size and whether it varies, and how much of the observed traffic the dominant changed-set covers. `mimus inspect a.json --diff b.json` compares two profiles and exits nonzero when they come from the same environment and still differ.
+
+### `mimus serve`
+
+**Population and load**
+
+| Option | Default | What it does |
+|---|---|---|
+| `-p, --profile` | - | Profile produced by `mimus calibrate` |
+| `--pvs` | `1000` | Total channels across the fleet |
+| `--iocs` | `1` | Virtual IOCs, one listening port each. A consumer typically runs one task per connection, so this caps how far its work can spread across cores |
+| `--rate-hz` | `1` | Updates per second per channel. Offered load is `pvs × rate` |
+| `--rate-mix` | - | Several rates at once: `10:2,1:60,0.1:38` puts 2 % of channels at 10 Hz, 60 % at 1 Hz, 38 % at 0.1 Hz. Overrides `--rate-hz` |
+| `--mix` | every template, equal shares | Which templates to serve and in what proportion: `ntscalar_f64:3,ntscalar_i32:1` |
+| `--layout` | `blocked` | `blocked` gives each IOC a contiguous range of channels, as a facility does; `round-robin` interleaves them |
+| `--prefix` | `MIM` | Prefix of the default names |
+| `--name-template` | `{prefix}:{t}:{i}` | Name pattern. Tokens: `{i}` global index, `{ioc}` IOC index, `{n}` index within the IOC, `{t}` template; `{i:06}` pads. Real names run to 30 or 40 characters, which drives a consumer's memory for name maps |
+
+**Network and discovery**
+
+| Option | Default | What it does |
+|---|---|---|
+| `--bind` | `127.0.0.1` | Address of the TCP listeners |
+| `--base-port` | `5075` | First TCP port; each IOC takes the next one. `0` lets the OS pick |
+| `--search-port` | `5076` | UDP port on which searches are answered. `0` turns the responder off |
+| `--search-bind` | `0.0.0.0` | Address the UDP responder listens on |
+
+**Protocol behaviour**
+
+| Option | Default | What it does |
+|---|---|---|
+| `--backpressure` | `block` | `block` lets TCP throttle MIMUS; `drop` holds the nominal rate and counts what it discards (see below) |
+| `--high-water` | `1048576` | Bytes allowed to queue per connection before `drop` discards: the stand-in for an IOC's monitor queue |
+| `--pipeline` | `permissive` | `strict` withholds updates from a pipelined client with no credit left, as PVXS does; `permissive` only counts credits |
+| `--initial-credits` | `4` | Credits a pipelined monitor starts with |
+| `--always-full-descriptor` | off | Send the full type descriptor on every monitor, whatever the profile recorded |
+| `--tick-us` | `1000` | Scheduler resolution; lower it for rates above a few hundred hertz |
+| `--coalesce-us` | `0` | Hold updates back up to this long to write them in fewer, larger writes. Zero writes on every tick, as an IOC does; a nonzero value adds latency a consumer will see in the timestamps |
+
+**Faults and run control**
+
+| Option | Default | What it does |
+|---|---|---|
+| `--drop-connections` | - | Drop one live connection every N seconds without warning: the consumer must reconnect and re-subscribe every channel |
+| `--duration-s` | until interrupted | Stop after this many seconds |
+| `--report` | - | Write the accounting report (JSON) here on exit |
+| `--debug` | off | Print the first message of each shape, in hex, as it goes out |
+
+### Examples
+
+```bash
+# one million channels at 1 Hz across 20 virtual IOCs, with facility-like names
+mimus serve -p profile.json --iocs 20 --pvs 1000000 --rate-hz 1 \
+    --name-template 'SR:C{ioc:02}:DEV{n:05}:{t}'
+
+# a realistic spread of scan rates, a single type, one hour, with a report
+mimus serve -p profile.json --iocs 8 --pvs 200000 \
+    --rate-mix 10:2,1:60,0.1:38 --mix ntscalar_f64 \
+    --duration-s 3600 --report run.json
+
+# loss under offered load instead of saturation
+mimus serve -p profile.json --iocs 16 --pvs 500000 --rate-hz 7 --backpressure drop
+
+# a reconnection storm every 30 s
+mimus serve -p profile.json --iocs 10 --pvs 100000 --drop-connections 30
+```
+
+### Discovery
+
+With the defaults, MIMUS answers UDP searches on port 5076 while its TCP listeners stay on the loopback. A client on the same host that searches by unicast (`EPICS_PVA_ADDR_LIST=127.0.0.1`) finds it. A client that broadcasts, or one on another host, is told to connect to an address where nothing listens; MIMUS warns about this at startup. Choose one of:
+
+- **`--bind 0.0.0.0`**: the server is reachable from the network, and UDP discovery works for every client.
+- **`--search-port 0`** and `EPICS_PVA_NAME_SERVERS` set to the addresses MIMUS prints: no UDP at all. This is also the way to run beside a real IOC that already holds port 5076.
+
+### Backpressure: two different questions
+
+When the client under test cannot keep up, TCP would normally throttle the sender which silently turns a throughput measurement into something else. A real IOC does not behave that way: its monitor queue overflows, it drops, and it keeps running at its scan rate. MIMUS makes the choice explicit:
+
+- **`--backpressure block`**: MIMUS lets TCP throttle it. What it managed to send over the window *is* the client's real absorption capacity. This is the saturation measurement.
+- **`--backpressure drop`**: MIMUS holds its nominal rate and discards what does not fit within `--high-water`, counting every discard, as an IOC would. This is the loss-under-offered-load measurement.
+
+These answer different questions. Any published figure must state which mode produced it.
+
+## Accounting
+
+MIMUS knows exactly what it put on the wire. On exit it prints a summary and, with `--report`, writes it as JSON. Abridged, from a 12-second run of 1 000 channels at 10 Hz with `pvxmonitor` subscribed to all of them:
+
+```json
+{
+  "emitted": 110511,
+  "dropped_backpressure": 0,
+  "bytes": 4679701,
+  "elapsed_s": 12.0,
+  "offered_eps": 10000.0,
+  "achieved_eps": 9207.96,
+  "late_ticks": 0,
+  "flow_control_holds": 0,
+  "pipeline_acks": 0,
+  "sessions": 2,
+  "subscriptions": 1000,
+  "wheel_steps": 21919,
+  "profile": { "pvxs_version": "1.4.1", "epics_base_version": "7.0.8.1", "templates": 26, "synthetic": false, "...": "..." },
+  "run": { "iocs": 2, "pvs": 1000, "rate_mix": "10:1", "mix": "ntscalar_f64:1", "backpressure": "block", "...": "..." }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `emitted` | Updates written to the wire, opening messages included |
+| `dropped_backpressure` | Updates discarded under `--backpressure drop`. Counted, never silent |
+| `bytes` | Bytes written, headers included |
+| `achieved_eps` | `emitted / elapsed_s`, over the whole run, including any time before the consumer subscribed |
+| `late_ticks` | Ticks the emitter could not finish in time. Nonzero means the offered rate was not delivered, and any figure from the run must say so |
+| `flow_control_holds` | Updates withheld from a pipelined client with no credit left (`--pipeline strict` only) |
+| `wheel_steps` | Turns of the timing wheel, to tell a wheel turning at the wrong speed from a wrong population |
+| `profile`, `run` | The manifest: what was served, and with which options |
+
+`emitted` is what makes an end-to-end conservation check possible on the consumer side. For an archiver:
+
+```
+mimus.emitted == rows_stored
+               + mimus.dropped_backpressure
+               + <every loss counter the client exposes>
+```
+
+Any residual is either a bug in the client or a missing counter in it, and both are worth knowing. A consumer that cannot close this equation is a consumer that loses data without noticing.
+
+## Performance
+
+### Cost model
+
+The work MIMUS does per update is small and constant:
+
+- **No encoding.** Each template is compiled once. Serving an update copies its fixed bytes and writes the slots in place. A steady-state `double` update is a 41-byte frame, of which 20 bytes are rewritten: the value (8), `secondsPastEpoch` (8) and `nanoseconds` (4).
+- **No records.** There is no record processing, no scan thread and no pvData structure. Each channel is a small fixed-size record (its template, IOC, rate group, seed and update counter) plus its name and an entry in the name index that answers searches. The message itself exists once per template, not once per channel.
+- **Few system calls.** A timing wheel finds the channels due on each tick, and each connection's updates for the tick go out in one write. `--coalesce-us` batches further, at the cost of latency.
+- **A light startup.** Starting builds the channel table and opens the listeners; there is no record to initialize, process or scan.
+
+### Measuring it
+
+Three scripts at the root of the repository measure MIMUS against `softIocPVX` on the same machine. They need Linux, `python3`, a PVXS build (`PVXS_BIN`, default `/opt/epics/pvxs/bin/linux-x86_64`), a release build of MIMUS and a calibrated profile.
+
+| Script | What it does |
+|---|---|
+| `bench.sh` | Every measurement behind the published figures, in one run: memory; capacity of MIMUS and of `softIocPVX`; every template; the whole profile on both sides; head to head; subscription; a soak; where `softIocPVX` stops serving (population against rate); records per IOC process; one channel up to ten million updates a second; the reference client (`pvxmonitor`) on both; timing accuracy; interoperability of every template with `pvxinfo`, `pvxget` and `pvxmonitor`; and a drift control run last |
+| `bench-selftest.sh` | Checks the benchmark's own consumer against a fake server whose true frame count is known, in ten shapes from a steady stream to a silent server. `bench.sh` runs it first and refuses to start if it fails |
+| `repro-pvxs-stall.sh` | A standalone reproduction, with nothing from MIMUS in it, of a `softIocPVX` monitor stall observed during the benchmark |
+
+```bash
+cargo build --release
+sudo cpupower frequency-set -g performance    # optional; the governor is recorded either way
+./bench.sh --profile profile.json --reps 5     # about eleven hours; --quick for a short check
+./bench.sh --report bench-YYYYMMDD-HHMMSS      # print the report of a finished run again
+```
+
+Every measurement is validated, retried on failure, and excluded by name if it never validates. A run writes `bench-YYYYMMDD-HHMMSS/` with `run.json` (every parameter, the profile and its hash, the hash of the script), the raw per-point data, the machine's 
+clock and load through the run, and the soak trend, so any figure can be checked without rerunning it.
+
+### Results
+
+Measured figures are published with the accompanying paper. Each comes from a `bench.sh` run and is quoted with its `run.json`; a figure without one is not a result of this project.
+
+## Fidelity
+
+The obvious objection to any synthetic load generator is: *how do you know it is not gentler than the real thing?* MIMUS answers mechanically rather than rhetorically.
+
+- **The ground truth is the reference implementation, not the specification.** Templates are extracted from bytes actually emitted by `softIocPVX`, so implementation details the specification does not mandate - field ordering, structure composition, changed-set conventions - are reproduced rather than guessed.
+- **No knowledge of EPICS records is compiled in.** MIMUS knows the PVAccess protocol and the PVData encoding, but no normative-type definitions and no record semantics. If PVXS changes what it puts on the wire, the observation changes and the templates follow.
+- **Every calibration re-verifies.** The verification step is not an optional test; it is the gate every template passes to enter a profile.
+- **Coverage is a number, not an adjective.** Calibration reports how many templates it built and which channels map to which: `82 PVs observed → 26 distinct templates` is a statement a reviewer can check.
+- **MIMUS refuses to synthesize what it has not learned.** There is no built-in template and no "close enough" fallback. A type absent from the catalogue is a type MIMUS cannot serve.
+
+### What a profile reproduces
+
+For every type it observed, a profile reproduces:
+
+- the exact type descriptor;
+- the **opening message** of a subscription or a `GET`, taken from the opening messages the reference IOC sent for that type, with its timestamp set to the channel's last processing time. Opening messages rotate across the served channels, so limits, units, enum choices and alarm states vary as they did on the IOC;
+- a stream of **steady-state updates** in the shape the IOC used most for that type, typically value and timestamp, at the rate chosen when serving. Length changes are reproduced: a string whose length moves between updates stays variable.
+
+What it does not reproduce yet, by design of the current calibration: channels that stay static, alarm transitions, and the less frequent update shapes of a type. [The catalogue README](catalogue/README.md#from-catalogue-to-profile) gives the detail.
+
+### Session rules
+
+A profile is more than a bag of bytes. It also records what the reference server did at the session level: the buffer and introspection-registry sizes it proposed, the changed-sets it used and how often, and whether it ever sent a type descriptor as a reference to one it had sent before. PVAccess allows a server to send a full descriptor once per connection and only its identifier afterwards; PVXS sends the full descriptor every time. MIMUS does what the profile observed. The per-connection registry is implemented for servers that do use it, and `--always-full-descriptor` forces full descriptors whatever the profile says.
+
+## Scope and limitations
+
+- **The monitor path, plus `GET` and `GET_FIELD`.** The monitor path dominates a long-running client's workload; the two read commands make `pvxget` and `pvxinfo` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. `PUT` and `RPC` are out of scope, and MIMUS sends no beacons.
+- **PVXS (QSRV2) only.** QSRV1 puts different bytes on the wire for the same record; a profile calibrated against one is wrong against the other.
+- **One update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape. Channels that are static on the IOC update at the serving rate (`--rate-hz` must be positive), and a channel keeps the alarm state of its opening message.
+- **Structure is replicated; IOC dynamics are not.** Scan jitter under host load and monitor-queue behavior are properties *of an IOC*, and MIMUS deliberately does not reproduce them: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client (overflow policy) it is exposed as `--backpressure`.
+- **A profile is bound to a version.** Its manifest records the PVXS and EPICS base versions, a checksum of the catalogue database, the host, the date and the MIMUS version. Comparing profiles across PVXS releases is, incidentally, a wire-behavior change detector.
+- **Calibrate at small scale, generate at large scale.** The shipped catalogue has fewer than a hundred channels, enough to cover every type. Replication to millions happens afterwards, without the reference IOC.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| [`crates/mimus-wire`](crates/mimus-wire) | PVAccess framing, headers, segmentation reassembly, control messages, a generic PVData walker |
+| [`crates/mimus-profile`](crates/mimus-profile) | Profile format: templates, slots, session rules, manifest, schema versioning |
+| [`crates/mimus-emit`](crates/mimus-emit) | Template compilation and rendering, signals, timing wheel, counters |
+| [`crates/mimus-calibrate`](crates/mimus-calibrate) | Client mode: observation, differential analysis, template building, shadow verification |
+| [`crates/mimus-serve`](crates/mimus-serve) | Server mode: fleet and naming, listeners, sessions, the per-connection type registry, UDP search responder |
+| [`src`](src) | The `mimus` command line |
+| [`catalogue`](catalogue) | The reference database and channel list calibration runs against |
+| `bench.sh`, `bench-selftest.sh`, `repro-pvxs-stall.sh` | The benchmark and its companions |
+
+## Building and testing
+
+```bash
+cargo build --release
+cargo test --workspace
+```
+
+No EPICS base, no PVXS, no C++ toolchain. The Rust version is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). Continuous integration checks formatting, Clippy with warnings denied and the whole test suite in a Debian 13 container. A `softIocPVX` is needed only for `mimus calibrate` and the benchmark; see the [PVXS documentation](https://epics-base.github.io/pvxs/). Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Related work
+
+Synthetic PVAccess servers exist ([`p4p`](https://github.com/mdavidsaver/p4p) and libraries built on it can serve arbitrary PVs) but they are full protocol implementations, with the per-event cost that implies. Benchmarks of EPICS infrastructure generally drive load from real IOCs; see, for example, the ESS study [*An Archiver Appliance Performance and Resources Consumption Study*](https://doi.org/10.18429/JACoW-ICALEPCS2021-WEPV048) (ICALEPCS'21, WEPV048).
+
+The underlying technique (learning message templates from observed traffic and replaying them at scale) is long established in network testing (tcpreplay, Ostinato, Cisco TRex). MIMUS applies it to PVAccess.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+## Author
+
+Clément Krawiec.
+
+MIMUS was developed with the help of Claude, Anthropic's AI assistant, used through the Claude app ([claude.ai](https://claude.ai)) rather than Claude Code.
+
+MIMUS was written to benchmark [AURA-EPICS](https://github.com/clemkraw/aura-epics), a high-throughput PVAccess archiver, but has no dependency on it: any PVAccess client can be driven by it.
