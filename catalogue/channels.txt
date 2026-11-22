@@ -1,0 +1,123 @@
+# Channels for `mimus calibrate` to observe.
+#
+# Not the same thing as the record list. QSRV2 serves every record *field*
+# as a channel of its own, and some PVA type codes are only reachable that
+# way - no base record carries an unsigned VAL, for instance.
+#
+# Two channels per type throughout: calibration templates the opening
+# message of a type by comparing the opening messages of its channels, and a
+# second channel shows whether the server sends the type descriptor again or
+# only a reference to it.
+#
+# Order matters. Calibration builds one template per type, from the first
+# channel of that type in this list, so each type lists a moving channel
+# before its static ones, and the strings list the variable-length
+# MIM:STRV:* first. A type whose channels are all static is templated as
+# static.
+
+# --- scalars, moving ---------------------------------------------------
+MIM:F64:0
+MIM:F64:1
+MIM:I32:0
+MIM:I32:1
+MIM:I64:0
+MIM:I64:1
+MIM:STRV:0
+MIM:STRV:1
+MIM:STR:0
+MIM:STR:1
+MIM:LSTR:0
+MIM:LSTR:1
+
+# --- narrow types: one-element aai, served as scalars ------------------
+MIM:F32:0
+MIM:F32:1
+MIM:I8:0
+MIM:I8:1
+MIM:U8:0
+MIM:U8:1
+MIM:I16:0
+MIM:I16:1
+MIM:U16:0
+MIM:U16:1
+MIM:U64:0
+MIM:U64:1
+
+# --- field channels ----------------------------------------------------
+#
+# QSRV2 serves each record field as an NTScalar channel typed after the
+# field:  .RVAL -> uint32_t   .PREC -> int16_t   .UDF -> uint8_t
+#
+# uint32, moving: MIM:MBBI:* use Raw Soft Channel, so RVAL follows the input.
+MIM:MBBI:0.RVAL
+MIM:MBBI:1.RVAL
+# uint32, static: MIM:BI:* use Soft Channel, which leaves RVAL alone.
+MIM:BI:0.RVAL
+MIM:BI:1.RVAL
+# int16 and uint8, static: after MIM:I16:* and MIM:U8:* above.
+MIM:F64:0.PREC
+MIM:F64:1.PREC
+MIM:F64:0.UDF
+MIM:F64:1.UDF
+
+# --- enums -------------------------------------------------------------
+MIM:BI:0
+MIM:BI:1
+MIM:MBBI:0
+MIM:MBBI:1
+MIM:MBBI:S:0
+MIM:MBBI:S:1
+
+# --- arrays, moving ----------------------------------------------------
+MIM:AF64:0
+MIM:AF64:1
+MIM:AF32:0
+MIM:AF32:1
+MIM:AI8:0
+MIM:AI8:1
+MIM:AU8:0
+MIM:AU8:1
+MIM:AI16:0
+MIM:AI16:1
+MIM:AU16:0
+MIM:AU16:1
+MIM:AI32:0
+MIM:AI32:1
+MIM:AU32:0
+MIM:AU32:1
+MIM:AI64:0
+MIM:AI64:1
+MIM:AU64:0
+MIM:AU64:1
+MIM:ASTRM:0
+MIM:ASTRM:1
+
+# --- arrays, static ----------------------------------------------------
+MIM:ASTR:0
+MIM:ASTR:1
+MIM:AEMPTY:0
+MIM:AEMPTY:1
+MIM:AF64:S:0
+MIM:AF64:S:1
+
+# --- static scalars ----------------------------------------------------
+MIM:F64:S:0
+MIM:F64:S:1
+MIM:I32:S:0
+MIM:I32:S:1
+MIM:STR:S:0
+MIM:STR:S:1
+
+# --- alarm transitions -------------------------------------------------
+MIM:ALM:0
+MIM:ALM:1
+MIM:INVALID:0
+MIM:INVALID:1
+
+# --- composites, needs catalogue-groups.db -----------------------------
+MIM:GRP:0
+MIM:GRP:1
+MIM:GRP:2
+MIM:GRP:3
+MIM:GRP:BOOL
+MIM:GRP:BOOL:B
