@@ -25,7 +25,7 @@ use tokio::net::TcpStream;
 
 use crate::fleet::Fleet;
 use crate::registry::Registry;
-use crate::shared::SharedCounters;
+use crate::shared::{Dropper, SharedCounters};
 
 /// Configuration shared by sessions that belong to the same virtual IOC.
 #[derive(Debug, Clone)]
@@ -49,9 +49,9 @@ pub struct SessionConfig {
     ///
     /// Models the monitor queue depth of an IOC.
     pub high_water: usize,
-    /// Interval at which to drop a live session to exercise client
-    /// reconnection behavior. `None` disables connection drops.
-    pub drop_connections: Option<std::time::Duration>,
+    /// Shared request to close one live session without warning, to
+    /// exercise a consumer's reconnection. `None` disables connection drops.
+    pub dropper: Option<Arc<Dropper>>,
     /// Maximum delay before buffered updates are written.
     ///
     /// A value of zero writes on every tick, matching IOC behavior and
@@ -91,7 +91,7 @@ impl Default for SessionConfig {
             rate_mix: RateMix::uniform(1.0),
             tick_us: 1000,
             high_water: 1 << 20,
-            drop_connections: None,
+            dropper: None,
             coalesce_us: 0,
             debug: false,
             pipeline: Pipeline::default(),
@@ -176,6 +176,17 @@ pub enum SessionEnd {
     /// safely continue after a protocol error.
     Protocol(String),
     Io(std::io::Error),
+    /// MIMUS closed the connection on purpose, under `--drop-connections`.
+    Dropped,
+}
+
+/// Completes when this session has claimed a drop request, and never when
+/// connection drops are disabled.
+async fn claim_drop(dropper: Option<&Dropper>) {
+    match dropper {
+        Some(d) => d.claim().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl std::fmt::Display for SessionEnd {
@@ -184,6 +195,7 @@ impl std::fmt::Display for SessionEnd {
             Self::ClientClosed => f.write_str("client closed"),
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
             Self::Io(e) => write!(f, "io error: {e}"),
+            Self::Dropped => f.write_str("dropped by MIMUS"),
         }
     }
 }
@@ -279,6 +291,11 @@ impl Session {
         // while the schedule is empty. It is not rebuilt on each tick.
         let mut ticker = tokio::time::interval(std::time::Duration::from_micros(self.cfg.tick_us));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // One wait for a drop request, kept across iterations: recreating it
+        // on every tick would register with the shared request a thousand
+        // times a second per session.
+        let dropper = self.cfg.dropper.clone();
+        let mut dropped = std::pin::pin!(claim_drop(dropper.as_deref()));
 
         let end = loop {
             // When there is nothing scheduled, wait only for socket input.
@@ -286,6 +303,7 @@ impl Session {
             // until the schedule contains work.
             let idle = self.schedule.is_empty();
             tokio::select! {
+                () = &mut dropped => break SessionEnd::Dropped,
                 _ = ticker.tick(), if !idle => {
                     self.emit_due();
                     if self.should_flush()
@@ -345,6 +363,9 @@ impl Session {
             let live = self.monitors.values().filter(|m| m.started).count() as u64;
             for _ in 0..live {
                 shared.subscription_stopped();
+            }
+            if matches!(end, SessionEnd::Dropped) {
+                shared.session_dropped();
             }
         }
         (end, self.counters)
