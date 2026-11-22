@@ -222,9 +222,9 @@ update carries only the ones that changed.
 ## Version pinning
 
 A profile is only meaningful alongside the environment that produced it.
-The manifest records the PVXS and EPICS base versions, the SHA-256 of the
-database passed with `--catalogue`, the host, the date and the MIMUS
-version:
+The manifest records the PVXS and EPICS base versions, a checksum of the
+database passed with `--catalogue` (FNV-1a 64-bit and size, enough to
+notice a changed catalogue), the host, the date and the MIMUS version:
 
 ```bash
 mimus calibrate --addr 127.0.0.1:5075 \
