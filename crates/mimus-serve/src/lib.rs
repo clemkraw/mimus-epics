@@ -14,5 +14,5 @@ pub use listener::Ioc;
 pub use naming::{NameContext, NameError, NameTemplate};
 pub use registry::Registry;
 pub use session::{Session, SessionConfig, SessionEnd};
-pub use shared::SharedCounters;
+pub use shared::{Dropper, SharedCounters};
 pub use udp::{DEFAULT_SEARCH_PORT, IocEndpoint, SearchResponder};
