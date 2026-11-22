@@ -1,0 +1,704 @@
+#
+# MIMUS reference catalogue - core
+#
+# Load with PVXS only:   softIocPVX -S -d catalogue.db
+# Not with softIocPVA: QSRV1 puts different bytes on the wire.
+#
+# This database makes a reference IOC emit, at least once, every shape of
+# PVAccess message MIMUS calibrates against, from EPICS base records alone.
+# It is not a simulation of anything: every record is here because it
+# produces a wire form nothing else here produces.
+#
+# catalogue-groups.db, beside this file, adds group PVs: nested structures
+# and the variant union. Load it in addition.
+#
+# Two conventions throughout:
+#
+#   Two instances per type. Calibration templates the opening message of a
+#   type by comparing the opening messages of its channels, and a second
+#   channel shows whether the server sends the type descriptor again or only
+#   a reference to it.
+#
+#   Moving and static variants per type. A facility has thousands of
+#   channels that never move - setpoints, limits, descriptions, states - and
+#   an archiver must handle both. Suffix :S marks the static variant.
+#
+# README.md lists what is covered and how to check it.
+#
+
+#=======================================================================
+# Drivers
+#
+# Everything downstream follows these. One second: calibration is about
+# coverage, not throughput.
+#=======================================================================
+
+record(calc, "MIM:DRV:COUNT") {
+    field(SCAN, "1 second")
+    field(CALC, "A<1000000?A+1:0")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    field(PREC, "0")
+}
+
+record(calc, "MIM:DRV:SINE") {
+    field(SCAN, "1 second")
+    field(CALC, "SIN(A/10)*100")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    field(PREC, "4")
+}
+
+record(calc, "MIM:DRV:MOD2") {
+    field(SCAN, "1 second")
+    field(CALC, "A%2")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+}
+
+record(calc, "MIM:DRV:MOD8") {
+    field(SCAN, "1 second")
+    field(CALC, "A%8")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+}
+
+record(calc, "MIM:DRV:MOD256") {
+    field(SCAN, "1 second")
+    field(CALC, "A%256")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+}
+
+record(calc, "MIM:DRV:MOD65536") {
+    field(SCAN, "1 second")
+    field(CALC, "A%65536")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+}
+
+# The moving arrays every typed array below copies. A circular buffer fed
+# by a scalar is an array whose contents change every scan; a waveform on a
+# Soft Channel link to a scalar would hold a single element.
+record(compress, "MIM:DRV:ARR") {
+    field(SCAN, "1 second")
+    field(ALG,  "Circular Buffer")
+    field(NSAM, "64")
+    field(INP,  "MIM:DRV:SINE.VAL NPP")
+}
+
+record(compress, "MIM:DRV:ARRINT") {
+    field(SCAN, "1 second")
+    field(ALG,  "Circular Buffer")
+    field(NSAM, "64")
+    field(INP,  "MIM:DRV:MOD256.VAL NPP")
+}
+
+#=======================================================================
+# 1. Scalar value types - moving
+#=======================================================================
+
+# ---- double (float64) -------------------------------------------------
+record(calc, "MIM:F64:0") {
+    field(SCAN, "1 second")
+    field(CALC, "SIN(A/10)*100")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    field(PREC, "4")
+    field(EGU,  "mm")
+    field(HOPR, "100")
+    field(LOPR, "-100")
+}
+record(calc, "MIM:F64:1") {
+    field(SCAN, "1 second")
+    field(CALC, "COS(A/10)*100")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    field(PREC, "4")
+    field(EGU,  "mm")
+    field(HOPR, "100")
+    field(LOPR, "-100")
+}
+
+# ---- float (float32) --------------------------------------------------
+#
+# No base record carries a float32 in VAL, but an aai carries one in its
+# elements, and QSRV2 serves an array field of one element (NELM 1) as a
+# scalar. A one-element aai with FTVL FLOAT is therefore a float scalar on
+# the wire.
+record(aai, "MIM:F32:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "FLOAT")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:SINE.VAL NPP")
+}
+record(aai, "MIM:F32:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "FLOAT")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:SINE.VAL NPP")
+}
+
+# ---- int32 ------------------------------------------------------------
+record(longin, "MIM:I32:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:DRV:COUNT.VAL NPP")
+    field(EGU,  "counts")
+}
+record(longin, "MIM:I32:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:DRV:COUNT.VAL NPP")
+    field(EGU,  "counts")
+}
+
+# ---- int64 ------------------------------------------------------------
+record(int64in, "MIM:I64:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:DRV:COUNT.VAL NPP")
+    field(EGU,  "ticks")
+}
+record(int64in, "MIM:I64:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:DRV:COUNT.VAL NPP")
+    field(EGU,  "ticks")
+}
+
+# ---- uint32 -----------------------------------------------------------
+#
+# No base record has an unsigned VAL. mbboDirect is no exception: its VAL
+# is signed so that Channel Access serves it as an integer (see the
+# mbboDirect record reference).
+#
+# The raw value RVAL of bi and mbbi is DBF_ULONG, and QSRV2 serves record
+# fields as channels of their own: MIM:MBBI:0.RVAL is a uint32 scalar.
+# MIM:MBBI:* in section 2 use "Raw Soft Channel", which writes RVAL
+# and derives VAL from it, so their RVAL moves. MIM:BI:* use "Soft
+# Channel", which writes VAL directly, so their RVAL is the static variant.
+#
+# Field channels need no records of their own, but they must be in the
+# calibration channel list, channels.txt.
+
+# ---- int8, uint8, int16, uint16, uint64 -------------------------------
+#
+# No base record carries these in VAL either. As for float above, a
+# one-element aai with the right FTVL is served as a scalar.
+#
+# The static variants of int16 and uint8 are field channels, listed in
+# channels.txt: MIM:F64:*.PREC (DBF_SHORT) and MIM:F64:*.UDF (DBF_UCHAR).
+record(aai, "MIM:I8:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "CHAR")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:MOD2.VAL NPP")
+}
+record(aai, "MIM:I8:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "CHAR")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:MOD2.VAL NPP")
+}
+
+record(aai, "MIM:U8:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "UCHAR")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:MOD256.VAL NPP")
+}
+record(aai, "MIM:U8:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "UCHAR")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:MOD256.VAL NPP")
+}
+
+record(aai, "MIM:I16:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "SHORT")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:MOD256.VAL NPP")
+}
+record(aai, "MIM:I16:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "SHORT")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:MOD256.VAL NPP")
+}
+
+record(aai, "MIM:U16:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "USHORT")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:MOD65536.VAL NPP")
+}
+record(aai, "MIM:U16:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "USHORT")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:MOD65536.VAL NPP")
+}
+
+record(aai, "MIM:U64:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "UINT64")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:COUNT.VAL NPP")
+}
+record(aai, "MIM:U64:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "UINT64")
+    field(NELM, "1")
+    field(INP,  "MIM:DRV:COUNT.VAL NPP")
+}
+
+# ---- string -----------------------------------------------------------
+#
+# "Soft Timestamp" formats the current time, so the value changes every
+# scan. Both formats are fixed width; the variable-length case is
+# MIM:STRV:* below.
+record(stringin, "MIM:STR:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Timestamp")
+    field(INP,  "@%H:%M:%S")
+}
+record(stringin, "MIM:STR:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Timestamp")
+    field(INP,  "@%Y-%m-%d %H:%M:%S")
+}
+
+# ---- variable-length string -------------------------------------------
+#
+# The hardest case for template extraction: a value whose length changes
+# between updates, so every byte after it shifts.
+#
+# A `printf` record formatting a sine with %g gives exactly that: "100",
+# "99.9848" and "-1.74524e-05" are three different lengths.
+record(printf, "MIM:STRV:0") {
+    field(SCAN, "1 second")
+    field(SIZV, "64")
+    field(FMT,  "pos=%g")
+    field(INP0, "MIM:DRV:SINE.VAL NPP")
+}
+record(printf, "MIM:STRV:1") {
+    field(SCAN, "1 second")
+    field(SIZV, "64")
+    field(FMT,  "count=%g")
+    field(INP0, "MIM:DRV:COUNT.VAL NPP")
+}
+
+# ---- long string ------------------------------------------------------
+#
+# `lsi` reads the printf records above through a Soft Channel link. It
+# cannot use "Soft Timestamp": base provides that device support for `ai`
+# and `stringin` only (devSoft.dbd).
+#
+# The `$` suffix requests the field as a long string rather than a
+# 40-character one.
+record(lsi, "MIM:LSTR:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:STRV:0.VAL$ NPP")
+    field(SIZV, "128")
+}
+record(lsi, "MIM:LSTR:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:STRV:1.VAL$ NPP")
+    field(SIZV, "128")
+}
+
+#=======================================================================
+# 2. Enumerations
+#
+# NTEnum nests an index and a choices array. Two sizes, two and eight
+# states: the choices travel in the first update, so their number changes
+# the size of that update.
+#=======================================================================
+
+record(bi, "MIM:BI:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:DRV:MOD2.VAL NPP")
+    field(ZNAM, "OFF")
+    field(ONAM, "ON")
+}
+record(bi, "MIM:BI:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:DRV:MOD2.VAL NPP")
+    field(ZNAM, "CLOSED")
+    field(ONAM, "OPEN")
+}
+
+record(mbbi, "MIM:MBBI:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Raw Soft Channel")
+    field(INP,  "MIM:DRV:MOD8.VAL NPP")
+    field(ZRVL, "0") field(ZRST, "Idle")
+    field(ONVL, "1") field(ONST, "Arming")
+    field(TWVL, "2") field(TWST, "Armed")
+    field(THVL, "3") field(THST, "Acquiring")
+    field(FRVL, "4") field(FRST, "Processing")
+    field(FVVL, "5") field(FVST, "Complete")
+    field(SXVL, "6") field(SXST, "Fault")
+    field(SVVL, "7") field(SVST, "Recovering")
+}
+record(mbbi, "MIM:MBBI:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Raw Soft Channel")
+    field(INP,  "MIM:DRV:MOD8.VAL NPP")
+    field(ZRVL, "0") field(ZRST, "Zero")
+    field(ONVL, "1") field(ONST, "One")
+    field(TWVL, "2") field(TWST, "Two")
+    field(THVL, "3") field(THST, "Three")
+    field(FRVL, "4") field(FRST, "Four")
+    field(FVVL, "5") field(FVST, "Five")
+    field(SXVL, "6") field(SXST, "Six")
+    field(SVVL, "7") field(SVST, "Seven")
+}
+
+# Static enum: a mode or configuration state that never changes.
+record(mbbi, "MIM:MBBI:S:0") {
+    field(SCAN, "Passive")
+    field(PINI, "YES")
+    field(VAL,  "2")
+    field(ZRST, "Local") field(ONST, "Remote") field(TWST, "Maintenance")
+}
+record(mbbi, "MIM:MBBI:S:1") {
+    field(SCAN, "Passive")
+    field(PINI, "YES")
+    field(VAL,  "1")
+    field(ZRST, "Local") field(ONST, "Remote") field(TWST, "Maintenance")
+}
+
+#=======================================================================
+# 3. Arrays - moving, one per element type
+#
+# MIM:AF64:* are circular buffers themselves; every other array is an aai
+# copying the whole of MIM:DRV:ARR or MIM:DRV:ARRINT. Their contents change
+# every scan. A circular buffer grows one element per scan until NSAM, so
+# these arrays change length over their first 64 scans and keep it after.
+#=======================================================================
+
+record(compress, "MIM:AF64:0") {
+    field(SCAN, "1 second")
+    field(ALG,  "Circular Buffer")
+    field(NSAM, "64")
+    field(INP,  "MIM:DRV:SINE.VAL NPP")
+    field(EGU,  "mm")
+}
+record(compress, "MIM:AF64:1") {
+    field(SCAN, "1 second")
+    field(ALG,  "Circular Buffer")
+    field(NSAM, "64")
+    field(INP,  "MIM:DRV:COUNT.VAL NPP")
+    field(EGU,  "mm")
+}
+
+record(aai, "MIM:AF32:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "FLOAT")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARR.VAL NPP")
+}
+record(aai, "MIM:AF32:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "FLOAT")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARR.VAL NPP")
+}
+
+record(aai, "MIM:AI8:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "CHAR")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+record(aai, "MIM:AI8:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "CHAR")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+
+record(aai, "MIM:AU8:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "UCHAR")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+record(aai, "MIM:AU8:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "UCHAR")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+
+record(aai, "MIM:AI16:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "SHORT")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+record(aai, "MIM:AI16:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "SHORT")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+
+record(aai, "MIM:AU16:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "USHORT")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+record(aai, "MIM:AU16:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "USHORT")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+
+record(aai, "MIM:AI32:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "LONG")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+record(aai, "MIM:AI32:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "LONG")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+
+record(aai, "MIM:AU32:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "ULONG")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+record(aai, "MIM:AU32:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "ULONG")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+
+record(aai, "MIM:AI64:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "INT64")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+record(aai, "MIM:AI64:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "INT64")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+
+record(aai, "MIM:AU64:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "UINT64")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+record(aai, "MIM:AU64:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "UINT64")
+    field(NELM, "64")
+    field(INP,  "MIM:DRV:ARRINT.VAL NPP")
+}
+
+# String arrays, static. A waveform with no input comes up empty, so a
+# JSON constant link fills these once at initialisation.
+record(waveform, "MIM:ASTR:0") {
+    field(FTVL, "STRING")
+    field(NELM, "8")
+    field(PINI, "YES")
+    field(INP,  {const:["quadrupole", "dipole", "sextupole", "corrector"]})
+}
+record(waveform, "MIM:ASTR:1") {
+    field(FTVL, "STRING")
+    field(NELM, "8")
+    field(PINI, "YES")
+    field(INP,  {const:["idle", "arming", "acquiring", "complete", "fault"]})
+}
+
+# The zero-length array: a waveform with no input and no value. An empty
+# array is a wire form in its own right, and a consumer that mishandles it
+# fails in a way no populated array reveals.
+record(waveform, "MIM:AEMPTY:0") {
+    field(FTVL, "DOUBLE")
+    field(NELM, "16")
+}
+record(waveform, "MIM:AEMPTY:1") {
+    field(FTVL, "DOUBLE")
+    field(NELM, "16")
+}
+
+#=======================================================================
+# 4. Static channels - deliberate, not a gap
+#
+# A facility has thousands of channels that never move: setpoints, limits,
+# descriptions, configuration states. An archiver subscribes to them, pays
+# their memory, receives one initial update and then nothing.
+#
+# The catalogue carries static channels as well as moving ones so that
+# calibration observes both. README.md says what a profile keeps of them.
+#=======================================================================
+
+record(ao, "MIM:F64:S:0") {
+    field(SCAN, "Passive")
+    field(PINI, "YES")
+    field(VAL,  "42.5")
+    field(PREC, "3")
+    field(EGU,  "mm")
+    field(DRVH, "100")
+    field(DRVL, "-100")
+}
+record(ao, "MIM:F64:S:1") {
+    field(SCAN, "Passive")
+    field(PINI, "YES")
+    field(VAL,  "-17.25")
+    field(PREC, "3")
+    field(EGU,  "mm")
+}
+
+record(longout, "MIM:I32:S:0") {
+    field(SCAN, "Passive")
+    field(PINI, "YES")
+    field(VAL,  "1000")
+    field(EGU,  "counts")
+}
+record(longout, "MIM:I32:S:1") {
+    field(SCAN, "Passive")
+    field(PINI, "YES")
+    field(VAL,  "2000")
+    field(EGU,  "counts")
+}
+
+record(stringout, "MIM:STR:S:0") {
+    field(SCAN, "Passive")
+    field(PINI, "YES")
+    field(VAL,  "Linac section 3")
+}
+record(stringout, "MIM:STR:S:1") {
+    field(SCAN, "Passive")
+    field(PINI, "YES")
+    field(VAL,  "Booster quadrupole")
+}
+
+record(waveform, "MIM:AF64:S:0") {
+    field(FTVL, "DOUBLE")
+    field(NELM, "64")
+    field(PINI, "YES")
+    field(INP,  {const:[0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5]})
+}
+record(waveform, "MIM:AF64:S:1") {
+    field(FTVL, "DOUBLE")
+    field(NELM, "64")
+    field(PINI, "YES")
+    field(INP,  {const:[100.0, 99.0, 98.0, 97.0]})
+}
+
+#=======================================================================
+# 5. Alarm transitions
+#
+# Every other record here sits at one alarm state, so calibration would
+# only ever see the steady-state changed-set. These sweep across their
+# limits, so alarm.severity, alarm.status and alarm.message change and the
+# update marks a different set of bits: a decode path ordinary updates
+# never reach.
+#=======================================================================
+
+record(ai, "MIM:ALM:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:DRV:SINE.VAL NPP")
+    field(PREC, "2")
+    field(EGU,  "mm")
+    field(HIHI, "80")  field(HHSV, "MAJOR")
+    field(HIGH, "50")  field(HSV,  "MINOR")
+    field(LOW,  "-50") field(LSV,  "MINOR")
+    field(LOLO, "-80") field(LLSV, "MAJOR")
+    field(HYST, "0")
+}
+record(ai, "MIM:ALM:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:DRV:SINE.VAL NPP")
+    field(PREC, "2")
+    field(EGU,  "mm")
+    field(HIHI, "90")  field(HHSV, "MAJOR")
+    field(HIGH, "20")  field(HSV,  "MINOR")
+    field(LOW,  "-20") field(LSV,  "MINOR")
+    field(LOLO, "-90") field(LLSV, "MAJOR")
+    field(HYST, "0")
+}
+
+# A link to a record that does not exist: severity INVALID with a link
+# status, an alarm shape distinct from a limit violation.
+record(ai, "MIM:INVALID:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:NO:SUCH:RECORD.VAL NPP")
+}
+record(ai, "MIM:INVALID:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(INP,  "MIM:NO:SUCH:RECORD.VAL NPP")
+}
+
+#=======================================================================
+# 6. Moving string array
+#
+# No base record copies a whole string array from a changing source. A
+# waveform on a Soft Channel link to a scalar string writes it into element
+# zero, so the array is one element long (NORD 1) and that element changes
+# every scan. That is enough for the type code: a string[] whose content
+# changes on every update.
+#=======================================================================
+
+record(waveform, "MIM:ASTRM:0") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "STRING")
+    field(NELM, "8")
+    field(INP,  "MIM:STR:0.VAL NPP")
+}
+record(waveform, "MIM:ASTRM:1") {
+    field(SCAN, "1 second")
+    field(DTYP, "Soft Channel")
+    field(FTVL, "STRING")
+    field(NELM, "8")
+    field(INP,  "MIM:STR:1.VAL NPP")
+}

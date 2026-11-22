@@ -1,0 +1,157 @@
+#
+# MIMUS reference catalogue - Group PVs
+#
+# Loaded in addition to catalogue.db:
+#   softIocPVX -S -d catalogue.db -d catalogue-groups.db
+#
+# A Group PV assembles several records into one channel, which reaches wire
+# forms no single record produces: nested structures, and the `any` mapping
+# which places a variant union.
+#
+# The QSRV2 mappings used here, and what each produces on the wire
+# (`proc` and `structure` place no value and are not used):
+#
+#   scalar   nests a whole NTScalar as a sub-structure  -> nested structure
+#   plain    places only the value, no metadata         -> bare scalar field
+#   any      places a variant union                     -> variant union code
+#   meta     places only alarm and timeStamp            -> partial structure
+#   const    places a literal from the group definition -> field with no channel
+#
+# `+trigger` is a field option, not a group option, so it sits inside each
+# field's mapping: `"*"` means a change of that member posts the whole
+# group. At group level QSRV2 rejects it (`Unknown group option`) and falls
+# back to split updates, every member posting separately.
+#
+
+record(calc, "MIM:GRP:0:X") {
+    field(SCAN, "1 second")
+    field(CALC, "SIN(A/10)*100")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    field(PREC, "3")
+    field(EGU,  "mm")
+    info(Q:group, {
+        "MIM:GRP:0": {
+            "+id": "epics:nt/NTTable:1.0",
+            "x":        {"+type": "scalar", "+channel": "VAL", "+trigger": "*"},
+            "":         {"+type": "meta",   "+channel": "VAL"}
+        }
+    })
+}
+
+record(calc, "MIM:GRP:0:Y") {
+    field(SCAN, "1 second")
+    field(CALC, "COS(A/10)*100")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    field(PREC, "3")
+    field(EGU,  "mm")
+    info(Q:group, {
+        "MIM:GRP:0": {
+            "y_plain":  {"+type": "plain", "+channel": "VAL", "+trigger": "*"},
+            "y_any":    {"+type": "any",   "+channel": "VAL"},
+            "label":    {"+type": "const", "+const": "quadrupole"}
+        }
+    })
+}
+
+record(calc, "MIM:GRP:1:X") {
+    field(SCAN, "1 second")
+    field(CALC, "SIN(A/7)*50")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    field(PREC, "3")
+    field(EGU,  "mm")
+    info(Q:group, {
+        "MIM:GRP:1": {
+            "+id": "epics:nt/NTTable:1.0",
+            "x":        {"+type": "scalar", "+channel": "VAL", "+trigger": "*"},
+            "":         {"+type": "meta",   "+channel": "VAL"}
+        }
+    })
+}
+
+record(calc, "MIM:GRP:1:Y") {
+    field(SCAN, "1 second")
+    field(CALC, "COS(A/7)*50")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    field(PREC, "3")
+    field(EGU,  "mm")
+    info(Q:group, {
+        "MIM:GRP:1": {
+            "y_plain":  {"+type": "plain", "+channel": "VAL", "+trigger": "*"},
+            "y_any":    {"+type": "any",   "+channel": "VAL"},
+            "label":    {"+type": "const", "+const": "dipole"}
+        }
+    })
+}
+
+# A group carrying an array member, so the composite case covers a nested
+# array as well as nested scalars.
+record(compress, "MIM:GRP:2:ARR") {
+    field(SCAN, "1 second")
+    field(ALG,  "Circular Buffer")
+    field(NSAM, "32")
+    field(INP,  "MIM:DRV:SINE.VAL NPP")
+    info(Q:group, {
+        "MIM:GRP:2": {
+            "+id": "epics:nt/NTTable:1.0",
+            "samples":  {"+type": "scalar", "+channel": "VAL", "+trigger": "*"},
+            "":         {"+type": "meta",   "+channel": "VAL"}
+        }
+    })
+}
+
+record(compress, "MIM:GRP:3:ARR") {
+    field(SCAN, "1 second")
+    field(ALG,  "Circular Buffer")
+    field(NSAM, "32")
+    field(INP,  "MIM:DRV:COUNT.VAL NPP")
+    info(Q:group, {
+        "MIM:GRP:3": {
+            "+id": "epics:nt/NTTable:1.0",
+            "samples":  {"+type": "scalar", "+channel": "VAL", "+trigger": "*"},
+            "":         {"+type": "meta",   "+channel": "VAL"}
+        }
+    })
+}
+
+#=======================================================================
+# Constants: a top-level bool
+#
+# No base record carries a bool in VAL; every NTScalar has one, but only
+# nested, as valueAlarm.active. The const mapping places one as a member of
+# its own, beside a const string and a const integer.
+#
+# A const is a scalar only. Given a JSON array, QSRV2 warns
+# `Unknown group field option` and serves a single element, so this
+# catalogue has no boolean[].
+#=======================================================================
+record(calc, "MIM:GRP:BOOL:0") {
+    field(SCAN, "1 second")
+    field(CALC, "A%2")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    info(Q:group, {
+        "MIM:GRP:BOOL": {
+            "+id": "epics:nt/NTTable:1.0",
+            "enabled":  {"+type": "const", "+const": true},
+            "label":    {"+type": "const", "+const": "quadrupole"},
+            "limit":    {"+type": "const", "+const": 42},
+            "state":    {"+type": "scalar", "+channel": "VAL", "+trigger": "*"},
+            "":         {"+type": "meta",   "+channel": "VAL"}
+        }
+    })
+}
+
+record(calc, "MIM:GRP:BOOL:1") {
+    field(SCAN, "1 second")
+    field(CALC, "A%2")
+    field(INPA, "MIM:DRV:COUNT.VAL NPP")
+    info(Q:group, {
+        "MIM:GRP:BOOL:B": {
+            "+id": "epics:nt/NTTable:1.0",
+            "enabled":  {"+type": "const", "+const": false},
+            "label":    {"+type": "const", "+const": "dipole"},
+            "limit":    {"+type": "const", "+const": 7},
+            "state":    {"+type": "scalar", "+channel": "VAL", "+trigger": "*"},
+            "":         {"+type": "meta",   "+channel": "VAL"}
+        }
+    })
+}
