@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!   channels.txt  →  observe a real softIocPVX
-//!                 →  analyse each channel's bodies
+//!                 →  analyze each channel's bodies
 //!                 →  build a template for each distinct type
 //!                 →  verify the templates against their source bytes
 //!                 →  write the profile, or refuse and explain why
@@ -205,7 +205,7 @@ pub fn run(args: Args) -> i32 {
         return 2;
     }
 
-    // ---- analyse and group -------------------------------------------
+    // ---- analyze and group -------------------------------------------
     //
     // Channels with identical descriptor bytes share a template. The
     // descriptor is the wire-level definition of a type: if the protocol
@@ -563,7 +563,7 @@ pub fn run(args: Args) -> i32 {
         eprintln!();
         if by_descriptor.is_empty() {
             eprintln!("  No channel carried a full type descriptor. Every monitor");
-            eprintln!("  either failed to initialise, or only ever received the");
+            eprintln!("  either failed to initialize, or only ever received the");
             eprintln!("  cached form — which names a descriptor another channel");
             eprintln!("  was supposed to receive.");
         } else if single_update > 0 && failures == 0 {
@@ -740,9 +740,8 @@ mod tests {
 
     #[test]
     fn concurrent_temp_files_do_not_collide() {
-        // Verify the property this helper is designed to provide. The
-        // previous version used only the process ID, so every test in this
-        // binary wrote to the same path.
+        // The property this helper exists for: a process ID alone would give
+        // every test in this binary the same path.
         let a = temp_file("collide", "first");
         let b = temp_file("collide", "second");
         assert_ne!(a, b);

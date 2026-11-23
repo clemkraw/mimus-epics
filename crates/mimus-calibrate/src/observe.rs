@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn a_channel_that_spoke_once_and_went_quiet_is_settled() {
-        // A setpoint that speaks once is valid behaviour, not a coverage gap.
+        // A setpoint that speaks once is valid behavior, not a coverage gap.
         let o = moving("MIM:F64:S:0", 1, 64);
         let c = Criterion::default();
         assert!(matches!(status(&o, &c, 5.0), Status::Waiting { .. }));
@@ -796,17 +796,16 @@ mod missing_tests {
     fn a_channel_the_ioc_never_answered_for_does_not_block() {
         // Waiting for a channel that does not exist would block forever.
         // It contributes no template and cannot corrupt one, so it is a
-        // coverage gap, not a reason to abort calibration. Confusing these
-        // cases previously wasted several minutes on every attempt.
+        // coverage gap, not a reason to abort calibration.
         let observers = vec![
             talker("MIM:F64:0"),
             talker("MIM:F64:1"),
-            ChannelObserver::new("MIM:SEG:0", 64),
+            ChannelObserver::new("MIM:NO:SUCH:PV", 64),
         ];
         let p = progress(&observers, &Criterion::default(), 60.0);
         assert_eq!(p.done, 2);
         assert!(p.is_complete(), "a missing channel should not block");
-        assert_eq!(p.missing, vec!["MIM:SEG:0".to_string()]);
+        assert_eq!(p.missing, vec!["MIM:NO:SUCH:PV".to_string()]);
     }
 
     #[test]
@@ -862,7 +861,7 @@ mod first_update_tests {
 
     #[test]
     fn a_channel_that_never_spoke_has_no_opening_body() {
-        let o = ChannelObserver::new("MIM:SEG:0", 8);
+        let o = ChannelObserver::new("MIM:NO:SUCH:PV", 8);
         assert!(o.first_update().is_none());
     }
 }

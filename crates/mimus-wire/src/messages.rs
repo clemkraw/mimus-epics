@@ -303,7 +303,7 @@ impl MonitorRequest {
     /// With pipelining, the client periodically tells the server how much
     /// capacity remains in its receive window. A server that ignores these
     /// updates may send data without respecting the client's available
-    /// capacity. MIMUS previously behaved this way, unlike a real PVXS server.
+    /// capacity, which a real PVXS server does not do.
     #[inline]
     pub fn is_pipeline_ack(&self) -> bool {
         self.sub_command & crate::commands::monitor::PIPELINE != 0

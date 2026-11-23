@@ -12,8 +12,9 @@
 //!   fully supported state. Differential analysis identifies changing
 //!   bytes, but does not reveal their meaning.
 //! - [`SessionRules`] captures connection-level behavior that cannot be
-//!   inferred from individual messages, especially when PVXS sends a full
-//!   type descriptor and when it sends only a cached identifier.
+//!   inferred from individual messages, especially whether the server sends
+//!   a full type descriptor every time or only a cached identifier after the
+//!   first. PVXS sends the full descriptor every time.
 //!
 //! MIMUS targets PVXS (QSRV2). See `catalogue/README.md`.
 

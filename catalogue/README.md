@@ -235,10 +235,12 @@ mimus calibrate --addr 127.0.0.1:5075 \
 
 `pvxinfo -V` prints both versions for the installation it was built from.
 
-Comparing two profiles across a PVXS upgrade is also a wire-behaviour
+Comparing two profiles across a PVXS upgrade is also a wire-behavior
 change detector for PVXS itself. `mimus inspect a.json --diff b.json` lists
 the differences, and exits nonzero when the two profiles come from the same
-environment and still differ.
+environment and still differ in their types or type descriptors. Differences
+in shape are expected between any two calibrations: which bytes are fixed
+depends on what moved while each profile was observed.
 
 ## Checking the catalogue on a new build
 

@@ -13,8 +13,7 @@
     <a href="#usage">Usage</a> •
     <a href="#performance">Performance</a> •
     <a href="#fidelity">Fidelity</a> •
-    <a href="#scope-and-limitations">Scope</a> •
-    <a href="#status">Status</a>
+    <a href="#scope-and-limitations">Scope</a>
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/language-Rust_2024-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust">
@@ -154,7 +153,7 @@ mimus demo-profile  write a hand-made profile for trying the server out
 
 ### `mimus inspect`
 
-`mimus inspect profile.json` lists the templates with the number of channels assigned to each, their body size and whether it varies, and how much of the observed traffic the dominant changed-set covers. `mimus inspect a.json --diff b.json` compares two profiles and exits nonzero when they come from the same environment and still differ.
+`mimus inspect profile.json` lists the templates with the number of channels assigned to each, their body size and whether it varies, and how much of the observed traffic the dominant changed-set covers. `mimus inspect a.json --diff b.json` compares two profiles. It exits nonzero when they come from the same environment and still differ in their types or type descriptors; differences in shape are reported but expected, since which bytes are fixed depends on what moved while each profile was observed.
 
 ### `mimus serve`
 
@@ -181,7 +180,7 @@ mimus demo-profile  write a hand-made profile for trying the server out
 | `--search-port` | `5076` | UDP port on which searches are answered. `0` turns the responder off |
 | `--search-bind` | `0.0.0.0` | Address the UDP responder listens on |
 
-**Protocol behaviour**
+**Protocol behavior**
 
 | Option | Default | What it does |
 |---|---|---|
@@ -197,7 +196,7 @@ mimus demo-profile  write a hand-made profile for trying the server out
 
 | Option | Default | What it does |
 |---|---|---|
-| `--drop-connections` | - | Drop one live connection every N seconds without warning: the consumer must reconnect and re-subscribe every channel |
+| `--drop-connections` | - | Close one live connection every N seconds without warning: the consumer must reconnect and re-subscribe every channel it had there |
 | `--duration-s` | until interrupted | Stop after this many seconds |
 | `--report` | - | Write the accounting report (JSON) here on exit |
 | `--debug` | off | Print the first message of each shape, in hex, as it goes out |
@@ -230,7 +229,7 @@ With the defaults, MIMUS answers UDP searches on port 5076 while its TCP listene
 
 ### Backpressure: two different questions
 
-When the client under test cannot keep up, TCP would normally throttle the sender which silently turns a throughput measurement into something else. A real IOC does not behave that way: its monitor queue overflows, it drops, and it keeps running at its scan rate. MIMUS makes the choice explicit:
+When the client under test cannot keep up, TCP would normally throttle the sender, which silently turns a throughput measurement into something else. A real IOC does not behave that way: its monitor queue overflows, it drops, and it keeps running at its scan rate. MIMUS makes the choice explicit:
 
 - **`--backpressure block`**: MIMUS lets TCP throttle it. What it managed to send over the window *is* the client's real absorption capacity. This is the saturation measurement.
 - **`--backpressure drop`**: MIMUS holds its nominal rate and discards what does not fit within `--high-water`, counting every discard, as an IOC would. This is the loss-under-offered-load measurement.
@@ -253,6 +252,7 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
   "flow_control_holds": 0,
   "pipeline_acks": 0,
   "sessions": 2,
+  "sessions_dropped": 0,
   "subscriptions": 1000,
   "wheel_steps": 21919,
   "profile": { "pvxs_version": "1.4.1", "epics_base_version": "7.0.8.1", "templates": 26, "synthetic": false, "...": "..." },
@@ -263,6 +263,7 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 | Field | Meaning |
 |---|---|
 | `emitted` | Updates written to the wire, opening messages included |
+| `sessions`, `sessions_dropped` | Connections accepted over the run, and those MIMUS closed under `--drop-connections` |
 | `dropped_backpressure` | Updates discarded under `--backpressure drop`. Counted, never silent |
 | `bytes` | Bytes written, headers included |
 | `achieved_eps` | `emitted / elapsed_s`, over the whole run, including any time before the consumer subscribed |
@@ -309,8 +310,7 @@ sudo cpupower frequency-set -g performance    # optional; the governor is record
 ./bench.sh --report bench-YYYYMMDD-HHMMSS      # print the report of a finished run again
 ```
 
-Every measurement is validated, retried on failure, and excluded by name if it never validates. A run writes `bench-YYYYMMDD-HHMMSS/` with `run.json` (every parameter, the profile and its hash, the hash of the script), the raw per-point data, the machine's 
-clock and load through the run, and the soak trend, so any figure can be checked without rerunning it.
+Every measurement is validated, retried on failure, and excluded by name if it never validates. A run writes `bench-YYYYMMDD-HHMMSS/` with `run.json` (every parameter, the profile and its hash, the hash of the script), the raw per-point data, the machine's clock and load through the run, and the soak trend, so any figure can be checked without rerunning it.
 
 ### Results
 
@@ -345,7 +345,7 @@ A profile is more than a bag of bytes. It also records what the reference server
 - **The monitor path, plus `GET` and `GET_FIELD`.** The monitor path dominates a long-running client's workload; the two read commands make `pvxget` and `pvxinfo` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. `PUT` and `RPC` are out of scope, and MIMUS sends no beacons.
 - **PVXS (QSRV2) only.** QSRV1 puts different bytes on the wire for the same record; a profile calibrated against one is wrong against the other.
 - **One update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape. Channels that are static on the IOC update at the serving rate (`--rate-hz` must be positive), and a channel keeps the alarm state of its opening message.
-- **Structure is replicated; IOC dynamics are not.** Scan jitter under host load and monitor-queue behavior are properties *of an IOC*, and MIMUS deliberately does not reproduce them: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client (overflow policy) it is exposed as `--backpressure`.
+- **Structure is replicated; IOC dynamics are not.** Scan jitter under host load and monitor-queue behavior are properties *of an IOC*, and MIMUS deliberately does not reproduce them: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client (overflow policy), it is exposed as `--backpressure`.
 - **A profile is bound to a version.** Its manifest records the PVXS and EPICS base versions, a checksum of the catalogue database, the host, the date and the MIMUS version. Comparing profiles across PVXS releases is, incidentally, a wire-behavior change detector.
 - **Calibrate at small scale, generate at large scale.** The shipped catalogue has fewer than a hundred channels, enough to cover every type. Replication to millions happens afterwards, without the reference IOC.
 

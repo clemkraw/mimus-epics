@@ -1,6 +1,6 @@
 //! Turns observations into a template that the emitter can serve.
 //!
-//! [`crate::layout`] produces an ordered list of pieces: bytes that remain
+//! [`crate::layout::layout`] produces an ordered list of pieces: bytes that remain
 //! constant and slots that change. This module serializes them into the
 //! profile format, attaches the type descriptor captured at monitor INIT,
 //! and assigns the resulting profile a name.
@@ -43,7 +43,7 @@ pub enum BuildError {
     NoIntrospection { pv: String },
     /// A slot has neither a recognized type nor samples to replay.
     ///
-    /// This should never occur with [`crate::layout`], which always preserves
+    /// This should never occur with [`crate::layout::layout`], which always preserves
     /// samples. The check prevents unfillable slots from being silently
     /// populated with zeroes.
     UnfillableSlot { pv: String },
