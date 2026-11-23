@@ -8,11 +8,15 @@
 //! atomic operations on every event, each session accumulates counts locally
 //! and adds them in batches when it flushes. This keeps the report up to date
 //! without adding synchronization overhead to the hot path.
+//!
+//! The one piece of state that flows the other way, from the run to its
+//! sessions, also lives here: [`Dropper`], the request to close a connection.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mimus_emit::Counters;
+use tokio::sync::Notify;
 
 /// Aggregate counters for one virtual IOC, readable while sessions are active.
 #[derive(Debug, Default)]
@@ -83,10 +87,6 @@ impl SharedCounters {
         self.sessions_open.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Records a subscription terminated by MIMUS rather than closed by the client.
-    ///
-    /// Kept separate from normal closures so this count can be compared
-    /// with the consumer's reconnection count.
     pub fn subscription_started(&self) {
         self.subscriptions.fetch_add(1, Ordering::Relaxed);
     }
@@ -99,6 +99,10 @@ impl SharedCounters {
         self.subscriptions.load(Ordering::Relaxed)
     }
 
+    /// Records a session closed by MIMUS rather than by the client.
+    ///
+    /// Kept separate from normal closures so this count can be compared
+    /// with the consumer's reconnection count.
     pub fn session_dropped(&self) {
         self.sessions_dropped.fetch_add(1, Ordering::Relaxed);
     }
@@ -128,9 +132,100 @@ impl SharedCounters {
     }
 }
 
+/// A request, shared by every session of a run, to close one live
+/// connection without warning.
+///
+/// This is how `--drop-connections` exercises a consumer's reconnection: on
+/// each request, exactly one session closes its socket, and the consumer must
+/// notice, reconnect and subscribe again to every channel it had there.
+/// Requests do not accumulate; a request that no session has claimed yet is
+/// not doubled by the next one.
+#[derive(Debug, Default)]
+pub struct Dropper {
+    requested: AtomicBool,
+    notify: Notify,
+}
+
+impl Dropper {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Asks one live session to close its connection.
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Completes once this caller has claimed a request.
+    ///
+    /// Several sessions may wait at once; each request is claimed by one of
+    /// them only.
+    pub async fn claim(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register for the wake-up before looking at the flag, so that a
+            // request made between the two is not missed.
+            notified.as_mut().enable();
+            if self
+                .requested
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_request_is_claimed_once() {
+        let d = Dropper::new();
+        let first = tokio::spawn({
+            let d = Arc::clone(&d);
+            async move { d.claim().await }
+        });
+        let second = tokio::spawn({
+            let d = Arc::clone(&d);
+            async move { d.claim().await }
+        });
+        tokio::task::yield_now().await;
+        d.request();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let done = [first.is_finished(), second.is_finished()];
+        assert_eq!(
+            done.iter().filter(|&&f| f).count(),
+            1,
+            "one request must close one session, got {done:?}"
+        );
+        first.abort();
+        second.abort();
+    }
+
+    #[tokio::test]
+    async fn a_request_made_before_anyone_waits_is_kept() {
+        let d = Dropper::new();
+        d.request();
+        tokio::time::timeout(std::time::Duration::from_millis(100), d.claim())
+            .await
+            .expect("the pending request is claimed");
+    }
+
+    #[tokio::test]
+    async fn requests_do_not_accumulate() {
+        let d = Dropper::new();
+        d.request();
+        d.request();
+        d.claim().await;
+        let again = tokio::time::timeout(std::time::Duration::from_millis(50), d.claim()).await;
+        assert!(again.is_err(), "two requests nobody claimed are still one");
+    }
 
     #[test]
     fn totals_are_visible_before_a_session_ends() {
