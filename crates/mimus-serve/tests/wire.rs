@@ -40,14 +40,14 @@ fn template(name: &str, intro_tag: u8) -> Template {
         full: vec![0xFF, 0xFD, intro_tag, 0x00, 0x80],
         id_only: Some(vec![0xFF, 0xFE, intro_tag, 0x00]),
     })
-        .push_fixed(vec![0x03, 0x83, 0x01])
-        .push_slot(
-            Slot::new(1, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::Value {
-                scalar: ScalarType::F64,
-            }),
-        )
-        .push_slot(Slot::new(2, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds))
-        .push_slot(Slot::new(3, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos));
+    .push_fixed(vec![0x03, 0x83, 0x01])
+    .push_slot(
+        Slot::new(1, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::Value {
+            scalar: ScalarType::F64,
+        }),
+    )
+    .push_slot(Slot::new(2, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds))
+    .push_slot(Slot::new(3, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos));
     t.observations = 100;
     t
 }
