@@ -93,15 +93,24 @@ fn example_pv(fleet: &Fleet) -> &str {
     fleet.names.first().map(String::as_str).unwrap_or("PV")
 }
 
+/// What the run saw of its clients.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Sessions {
+    /// Connections accepted over the whole run.
+    pub total: u64,
+    /// Connections MIMUS closed under `--drop-connections`.
+    pub dropped: u64,
+    /// Monitors still active at the end of the run. This gauge tells a low
+    /// offered load from a slow scheduler: both produce too few updates, but
+    /// they need different fixes.
+    pub subscriptions: u64,
+}
+
 pub fn finish(
     profile: &Profile,
     run: &RunSummary,
     counters: Counters,
-    sessions: u64,
-    // The number of monitors still active at the end of the run. This gauge
-    // distinguishes low offered load from a slow scheduler: both produce too
-    // few updates, but require different fixes.
-    subscriptions: u64,
+    sessions: Sessions,
     elapsed_s: f64,
     report_path: Option<&Path>,
 ) {
@@ -113,8 +122,11 @@ pub fn finish(
     let offered = run.offered_eps;
 
     println!();
-    println!("sessions           {sessions:>14}");
-    println!("subscriptions      {subscriptions:>14}");
+    println!("sessions           {:>14}", sessions.total);
+    if run.drop_connections_s.is_some() {
+        println!("dropped by MIMUS   {:>14}", sessions.dropped);
+    }
+    println!("subscriptions      {:>14}", sessions.subscriptions);
     println!("emitted            {:>14}", counters.emitted);
     println!("dropped (pressure) {:>14}", counters.dropped_backpressure);
     println!("bytes              {:>14}", counters.bytes);
@@ -139,7 +151,7 @@ pub fn finish(
     // Check for the cause before assigning blame. If no clients connected,
     // nothing was emitted because there were no subscribers. Reporting this
     // as an emitter problem would send the investigation in the wrong direction.
-    if sessions == 0 {
+    if sessions.total == 0 {
         println!();
         println!(
             "note: no client ever connected, so nothing was emitted. MIMUS only \
@@ -149,9 +161,13 @@ pub fn finish(
     } else if offered > 0.0 && achieved < offered * 0.95 {
         println!();
         println!(
-            "note: achieved {achieved:.0}/s against an offered {offered:.0}/s. Under the \
-             block policy that is the consumer's absorption limit; under drop it means \
-             MIMUS itself could not keep up, and the run is not a valid measurement."
+            "note: achieved {achieved:.0}/s against {offered:.0}/s offered across all {} \
+             channels. MIMUS only sends to subscribed channels, so the gap measures \
+             something only if every channel was subscribed for the whole run. If it \
+             was: under the block policy the gap is the consumer's absorption limit; \
+             under drop, MIMUS itself could not keep up and the run is not a valid \
+             measurement.",
+            run.pvs
         );
         if counters.late_ticks > 0 {
             println!(
@@ -166,8 +182,9 @@ pub fn finish(
         return;
     };
     let json = serde_json::json!({
-        "sessions": sessions,
-        "subscriptions": subscriptions,
+        "sessions": sessions.total,
+        "sessions_dropped": sessions.dropped,
+        "subscriptions": sessions.subscriptions,
         "late_ticks": counters.late_ticks,
         "wheel_steps": counters.wheel_steps,
         "pipeline_acks": counters.pipeline_acks,
