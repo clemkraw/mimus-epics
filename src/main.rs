@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use mimus_emit::{Backpressure, Counters, RateMix};
+use mimus_emit::{Backpressure, Counters, RateMix, Schedule};
 use mimus_profile::{DescriptorPolicy, Profile};
 use mimus_serve::fleet::{Fleet, FleetSpec, Layout};
 use mimus_serve::session::{Pipeline, SessionConfig};
-use mimus_serve::{Ioc, NameTemplate};
+use mimus_serve::{Dropper, Ioc, NameTemplate};
 
 mod calibrate;
 mod demo;
@@ -41,9 +41,11 @@ enum Command {
         profile: PathBuf,
         /// Compare against a second profile.
         ///
-        /// Useful across PVXS upgrades: if the environments match, a difference
-        /// indicates a MIMUS bug; otherwise, it indicates a change in PVXS
-        /// wire behavior.
+        /// Useful across PVXS upgrades: a different set of types or type
+        /// descriptors from the same environment is a MIMUS bug, and exits
+        /// nonzero; between environments, it is a change in PVXS wire
+        /// behavior. Shape differences are reported but expected: which bytes
+        /// are fixed depends on what moved during each observation.
         #[arg(long)]
         diff: Option<PathBuf>,
     },
@@ -51,8 +53,9 @@ enum Command {
     ///
     /// The IOC must have the reference catalogue loaded. Calibration monitors
     /// every channel in the list until each has yielded enough data to analyze,
-    /// validates the result against the bytes it was derived from, and writes
-    /// the profile only if validation succeeds.
+    /// and checks every template against the bytes it was derived from. A type
+    /// that fails the check is left out and named; if none passes, no profile
+    /// is written.
     Calibrate(Box<CalibrateArgs>),
     /// Write a hand-crafted profile for trying the server out.
     ///
@@ -93,8 +96,9 @@ struct ServeArgs {
     #[arg(long = "rate-mix")]
     rate_mix: Option<String>,
 
-    /// Pattern for channel names. Tokens: `{i}` global index, `{ioc}`,
-    /// `{n}` index within the IOC, `{t}` template name. `{i:06}` zero-pads.
+    /// Pattern for channel names. Tokens, each in braces: `i` global index,
+    /// `ioc` IOC index, `n` index within the IOC, `t` template name. A width
+    /// zero-pads, as in `{i:06}`.
     ///
     /// Real facility names can be thirty or forty characters long. At a
     /// million channels, this increases the memory used by the consumer's
@@ -102,7 +106,7 @@ struct ServeArgs {
     #[arg(long = "name-template")]
     name_template: Option<String>,
 
-    /// Whether to honour pipeline credits (`strict`) or only count them
+    /// Whether to honor pipeline credits (`strict`) or only count them
     /// (`permissive`, the default).
     ///
     /// A real PVXS server withholds updates from pipelined clients when they
@@ -126,8 +130,9 @@ struct ServeArgs {
 
     /// Select templates to serve and their relative proportions.
     ///
-    /// `double` serves a single type; `double:3,int:1` allocates three
-    /// quarters to `double` and one quarter to `int`. By default, all
+    /// `ntscalar_f64` serves a single type; `ntscalar_f64:3,ntscalar_i32:1`
+    /// allocates three quarters to `ntscalar_f64` and one quarter to
+    /// `ntscalar_i32`. Names are those `mimus inspect` lists. By default, all
     /// templates in the profile are served in equal proportions.
     ///
     /// This matters because a population consisting of a single template
@@ -176,8 +181,12 @@ struct ServeArgs {
     #[arg(long = "high-water", default_value_t = 1 << 20)]
     high_water: usize,
 
-    /// Send a full type descriptor with every monitor update instead of
-    /// caching it per connection. Only use if the reference server does so.
+    /// Send the full type descriptor in every monitor's opening reply,
+    /// whatever the profile recorded.
+    ///
+    /// By default MIMUS does what the reference server was observed doing. A
+    /// profile calibrated against PVXS already sends full descriptors; this
+    /// only matters for a profile that recorded cached identifiers.
     #[arg(long = "always-full-descriptor")]
     always_full: bool,
 
@@ -348,9 +357,9 @@ fn load(path: &std::path::Path) -> Result<Profile, String> {
 fn warn_if_synthetic(profile: &Profile) {
     if profile.manifest.synthetic {
         eprintln!("┌───────────────────────────────────────────────────────────┐");
-        eprintln!("│ SYNTHETIC PROFILE — not calibrated against a real IOC.     │");
-        eprintln!("│ Useful for trying the server out. Nothing produced from    │");
-        eprintln!("│ this run is a measurement of anything.                     │");
+        eprintln!("│ SYNTHETIC PROFILE — not calibrated against a real IOC.    │");
+        eprintln!("│ Useful for trying the server out. Nothing produced from   │");
+        eprintln!("│ this run is a measurement of anything.                    │");
         eprintln!("└───────────────────────────────────────────────────────────┘");
     }
 }
@@ -394,6 +403,29 @@ fn run_serve(args: ServeArgs) -> i32 {
             }
         },
     };
+
+    // Every session builds this schedule when a client connects. Checking it
+    // here turns a rate or a tick it cannot use into an error at start-up,
+    // instead of connections that close without a word.
+    if let Err(e) = Schedule::new(&rate_mix, args.tick_us) {
+        eprintln!("error: --rate-hz / --rate-mix / --tick-us: {e}");
+        return 1;
+    }
+    if let Some(s) = args.drop_connections
+        && !(s.is_finite() && s > 0.0)
+    {
+        eprintln!("error: --drop-connections: {s} is not a positive number of seconds");
+        return 1;
+    }
+    if args.base_port != 0
+        && u32::from(args.base_port) + u32::from(args.iocs).saturating_sub(1) > 65535
+    {
+        eprintln!(
+            "error: --base-port {} with --iocs {} runs past port 65535",
+            args.base_port, args.iocs
+        );
+        return 1;
+    }
 
     let names = match &args.name_template {
         None => NameTemplate::default_pattern(&args.prefix),
@@ -446,9 +478,7 @@ fn run_serve(args: ServeArgs) -> i32 {
         rate_mix: rate_mix.clone(),
         tick_us: args.tick_us,
         high_water: args.high_water,
-        drop_connections: args
-            .drop_connections
-            .map(std::time::Duration::from_secs_f64),
+        dropper: args.drop_connections.map(|_| Dropper::new()),
         coalesce_us: args.coalesce_us,
         debug: args.debug,
         pipeline: args.pipeline,
@@ -568,6 +598,23 @@ fn run_serve(args: ServeArgs) -> i32 {
             }
         }
 
+        // Drop one live connection per interval, whichever session claims the
+        // request first. Nothing is requested while no client is connected, so
+        // a consumer that connects late is not dropped on arrival.
+        if let (Some(dropper), Some(every)) = (cfg.dropper.clone(), args.drop_connections) {
+            let totals = totals.clone();
+            tokio::spawn(async move {
+                let mut timer = tokio::time::interval(std::time::Duration::from_secs_f64(every));
+                timer.tick().await;
+                loop {
+                    timer.tick().await;
+                    if totals.iter().any(|t| t.sessions_open() > 0) {
+                        dropper.request();
+                    }
+                }
+            });
+        }
+
         report::print_banner(&profile, &fleet, &summary, &addrs, discovery.is_some());
 
         let started = std::time::Instant::now();
@@ -584,12 +631,12 @@ fn run_serve(args: ServeArgs) -> i32 {
         // Snapshot counters while sessions are still open, rather than relying
         // on end-of-session totals.
         let mut merged = Counters::default();
-        let mut sessions = 0u64;
-        let mut subscriptions = 0u64;
+        let mut sessions = report::Sessions::default();
         for t in &totals {
             merged.merge(&t.snapshot());
-            sessions += t.sessions_total();
-            subscriptions += t.subscriptions();
+            sessions.total += t.sessions_total();
+            sessions.dropped += t.sessions_dropped();
+            sessions.subscriptions += t.subscriptions();
         }
 
         report::finish(
@@ -597,12 +644,27 @@ fn run_serve(args: ServeArgs) -> i32 {
             &summary,
             merged,
             sessions,
-            subscriptions,
             started.elapsed().as_secs_f64(),
             args.report.as_deref(),
         );
         0
     })
+}
+
+/// Whether two templates have the same shape: the same fixed bytes, and the
+/// same slots in the same places with the same widths and roles.
+///
+/// The bytes a slot replays are left out. They are values the reference IOC
+/// happened to send during calibration, so two calibrations of one IOC do not
+/// record the same ones, and comparing them would report every template as
+/// changed.
+fn same_shape(a: &mimus_profile::Template, b: &mimus_profile::Template) -> bool {
+    a.chunks == b.chunks
+        && a.slots.len() == b.slots.len()
+        && a.slots
+            .iter()
+            .zip(&b.slots)
+            .all(|(x, y)| x.id == y.id && x.width == y.width && x.role == y.role)
 }
 
 fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
@@ -658,44 +720,94 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
     println!();
     let same_env = profile.manifest.same_environment(&other.manifest);
     if same_env {
-        println!("same reference environment — any difference below is a MIMUS bug");
+        println!("same reference environment");
     } else {
-        println!("different reference environment — differences are wire-behaviour changes");
+        println!("different reference environment: differences are wire-behavior changes");
         println!("  a: {}", profile.manifest.summary());
         println!("  b: {}", other.manifest.summary());
     }
 
-    let mut differences = 0;
+    // Types are compared strictly: the same IOC and catalogue must yield the
+    // same set of types with the same descriptors. Shapes are only reported.
+    // Which bytes of a message are fixed depends on what moved while it was
+    // observed, so two calibrations of one IOC can draw different lines in a
+    // value that held still in one window and not in the other.
+    let mut type_differences = 0;
+    let mut shape_differences = 0;
     for t in &profile.templates {
         match other.template(&t.name) {
             None => {
                 println!("  - {} present in a, absent from b", t.name);
-                differences += 1;
+                type_differences += 1;
             }
-            Some(o) => {
-                if t.chunks != o.chunks || t.slots != o.slots {
-                    println!("  ~ {} differs in shape", t.name);
-                    differences += 1;
-                } else if t.introspection != o.introspection {
-                    println!("  ~ {} differs in its type descriptor", t.name);
-                    differences += 1;
-                }
+            Some(o) if t.introspection != o.introspection => {
+                println!("  ~ {} differs in its type descriptor", t.name);
+                type_differences += 1;
             }
+            Some(o) if !same_shape(t, o) => {
+                println!("  ~ {} differs in shape", t.name);
+                shape_differences += 1;
+            }
+            Some(_) => {}
         }
     }
     for t in &other.templates {
         if profile.template(&t.name).is_none() {
             println!("  + {} present in b, absent from a", t.name);
-            differences += 1;
+            type_differences += 1;
         }
     }
-    if differences == 0 {
+    if type_differences + shape_differences == 0 {
         println!("  no differences");
         return 0;
     }
-    // Differences between profiles from the same environment indicate a
-    // defect. Exit nonzero so CI can detect it without parsing the output.
+    if shape_differences > 0 {
+        println!(
+            "  {shape_differences} shape difference(s): which bytes are fixed depends on \
+             what moved while each profile was observed"
+        );
+    }
+    if type_differences == 0 {
+        return 0;
+    }
+    // A different set of types from the same environment is a defect. Exit
+    // nonzero so CI can detect it without parsing the output.
+    if same_env {
+        println!("  the same environment produced different types: this is a MIMUS bug");
+    }
     i32::from(same_env)
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::same_shape;
+    use mimus_profile::{Slot, SlotRole, SlotWidth, Template};
+
+    fn template(samples: Vec<Vec<u8>>, width: usize) -> Template {
+        let mut t = Template::new("dbl", 0x0D);
+        t.push_fixed(vec![0x03, 0x83, 0x01]).push_slot(
+            Slot::new(1, SlotWidth::Fixed { bytes: width })
+                .with_role(SlotRole::Unclassified)
+                .with_samples(samples),
+        );
+        t
+    }
+
+    #[test]
+    fn replayed_values_are_not_part_of_the_shape() {
+        // Two calibrations of one IOC record different values; that alone
+        // must not read as a change.
+        let a = template(vec![vec![1, 2], vec![3, 4]], 2);
+        let b = template(vec![vec![5, 6]], 2);
+        assert!(same_shape(&a, &b));
+    }
+
+    #[test]
+    fn a_different_slot_width_is_a_different_shape() {
+        let a = template(vec![vec![1, 2]], 2);
+        let b = template(vec![vec![1, 2, 3, 4]], 4);
+        assert!(!same_shape(&a, &b));
+    }
 }
 
 #[cfg(test)]
