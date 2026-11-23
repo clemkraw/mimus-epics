@@ -178,6 +178,10 @@ fn le_f64(bytes: &[u8]) -> f64 {
 /// POSIX timestamps between 2020-01-01 and 2100-01-01.
 const PLAUSIBLE_EPOCH: Range<i64> = 1_577_836_800..4_102_444_800;
 
+/// Longest span of seconds a calibration can observe, with a wide margin:
+/// the default deadline is ten minutes.
+const MAX_SECONDS_SPAN: i64 = 86_400;
+
 /// Maximum plausible magnitude for a decoded double.
 ///
 /// Values above this threshold are more likely to result from a
@@ -220,17 +224,25 @@ fn moves<T: PartialEq>(values: &[T]) -> bool {
 
 /// Windows that decode as POSIX seconds in every observation.
 ///
-/// Both conditions must hold, but monotonicity is the stronger signal.
-/// Integers can fall within a plausible calendar range by chance, whereas
-/// an arbitrary field that only increases throughout the observation window is unlikely.
+/// Every condition must hold. A plausible calendar range can be met by
+/// chance, and so can monotonicity: an int64 counter placed in the high
+/// byte of a window shifted three bytes to its left reads as a date that
+/// climbs by 194 days per update. A clock does not. It advances by seconds,
+/// so its low byte changes whenever it moves, and over a calibration it
+/// covers minutes, not months.
 fn seconds_proposals(run: &Range<usize>, obs: &[Vec<u8>], len: usize) -> Vec<Proposal> {
     windows_around(run, 8, len)
         .into_iter()
         .filter(|w| {
             let v: Vec<i64> = obs.iter().map(|o| le_i64(&o[w.clone()])).collect();
+            let low: Vec<u8> = obs.iter().map(|o| o[w.start]).collect();
             v.iter().all(|x| PLAUSIBLE_EPOCH.contains(x))
                 && v.windows(2).all(|p| p[1] >= p[0])
                 && moves(&v)
+                && moves(&low)
+                && v.last()
+                    .zip(v.first())
+                    .is_some_and(|(l, f)| l - f <= MAX_SECONDS_SPAN)
         })
         .map(|range| Proposal {
             range,
@@ -547,6 +559,47 @@ mod tests {
             .expect("no nanoseconds found");
         assert_eq!(nanos.range, 19..23);
         assert!(nanos.samples.iter().all(|s| le_u32(s) < 1_000_000_000));
+    }
+
+    /// Monitor updates of an NTScalar int64 whose value counts up from 101,
+    /// laid out as softIocPVX sends them: the changed-set, the value, the
+    /// seconds and nanoseconds of the time stamp, then the user tag and the
+    /// overrun bitset.
+    fn int64_counter(first: u8, count: u8) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|k| {
+                let mut b = vec![0x02, 0x82, 0x03];
+                b.extend_from_slice(&i64::from(first + k).to_le_bytes());
+                b.extend_from_slice(&(1_795_353_484 + i64::from(k)).to_le_bytes());
+                b.extend_from_slice(&(100_000_000 + u32::from(k) * 7).to_le_bytes());
+                b.extend_from_slice(&[0; 5]);
+                b
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_counter_beside_the_changed_set_is_not_a_clock() {
+        let slots = infer(&int64_counter(101, 36)).unwrap();
+        assert!(
+            slots
+                .iter()
+                .all(|s| s.kind != Kind::TimestampSeconds || s.range == (11..19)),
+            "{:?}",
+            slots
+                .iter()
+                .map(|s| (s.range.clone(), s.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            slots
+                .iter()
+                .any(|s| s.kind == Kind::TimestampSeconds && s.range == (11..19))
+        );
+        assert!(
+            slots.iter().all(|s| s.range.start >= 3),
+            "the changed-set never moves"
+        );
     }
 
     #[test]
