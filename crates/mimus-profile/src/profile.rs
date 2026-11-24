@@ -271,13 +271,14 @@ mod tests {
         Manifest {
             pvxs_version: "1.4.2".into(),
             epics_base_version: "7.0.8".into(),
-            catalogue_sha256: "b".repeat(64),
+            catalogue_checksum: "b".repeat(64),
             host: "bench01".into(),
             captured_at: "2026-08-15T12:00:00Z".into(),
             mimus_version: "0.1.0".into(),
             study_duration_s: 60.0,
             pvs_observed: 4,
             synthetic: false,
+            incomplete: false,
         }
     }
 
@@ -489,13 +490,14 @@ mod support_tests {
             Manifest {
                 pvxs_version: "1.4.2".into(),
                 epics_base_version: "7.0.8.1".into(),
-                catalogue_sha256: "x".repeat(64),
+                catalogue_checksum: "x".repeat(64),
                 host: "test".into(),
                 captured_at: "posix:0".into(),
                 mimus_version: "0.1.0".into(),
                 study_duration_s: 30.0,
                 pvs_observed: 2,
                 synthetic: false,
+                incomplete: false,
             },
             SessionRules::default(),
         );

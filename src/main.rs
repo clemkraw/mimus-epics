@@ -14,6 +14,24 @@ use mimus_serve::fleet::{Fleet, FleetSpec, Layout};
 use mimus_serve::session::{Pipeline, SessionConfig};
 use mimus_serve::{Dropper, Ioc, NameTemplate};
 
+/// `println!` for what MIMUS tells its operator, which survives a closed
+/// standard output.
+///
+/// `println!` panics when the reader has gone: `mimus serve | tee run.log`
+/// interrupted with Ctrl-C stops `tee` first, and the summary MIMUS prints
+/// on its way out would then abort it before the report file is written.
+/// What goes to standard output is informational, so a reader that left is
+/// not a reason to stop.
+macro_rules! out {
+    () => {
+        out!("")
+    };
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 mod calibrate;
 mod demo;
 mod report;
@@ -38,6 +56,7 @@ enum Command {
     Serve(Box<ServeArgs>),
     /// Print the contents of a profile without serving it.
     Inspect {
+        /// Profile to print.
         profile: PathBuf,
         /// Compare against a second profile.
         ///
@@ -56,6 +75,9 @@ enum Command {
     /// and checks every template against the bytes it was derived from. A type
     /// that fails the check is left out and named; if none passes, no profile
     /// is written.
+    ///
+    /// Exits 0 with a profile written, 3 when the completeness criterion was
+    /// not met and no profile was written, 1 on any other error.
     Calibrate(Box<CalibrateArgs>),
     /// Write a hand-crafted profile for trying the server out.
     ///
@@ -99,7 +121,8 @@ struct ServeArgs {
 
     /// Pattern for channel names. Tokens, each in braces: `i` global index,
     /// `ioc` IOC index, `n` index within the IOC, `t` template name. A width
-    /// zero-pads, as in `{i:06}`.
+    /// zero-pads, as in `{i:06}`. The default is `{prefix}:{t}:{i}`, with
+    /// the `--prefix` value.
     ///
     /// Real facility names can be thirty or forty characters long. At a
     /// million channels, this increases the memory used by the consumer's
@@ -122,8 +145,10 @@ struct ServeArgs {
     /// Drop one live connection every N seconds, without warning.
     ///
     /// The consumer must detect the disconnect, reconnect, and resubscribe
-    /// to every channel. At scale, this reconnect storm is a much harder
-    /// test than steady state, and one that cannot be run against real IOCs.
+    /// to every channel it had there. At scale, with tens of thousands of
+    /// channels per connection, that is a much harder test than steady
+    /// state, and one that is hard to stage against real IOCs without
+    /// restarting them.
     ///
     /// A PVXS client that finds MIMUS through `EPICS_PVA_NAME_SERVERS` waits
     /// several seconds before reconnecting (up to seven in testing), so a
@@ -153,7 +178,7 @@ struct ServeArgs {
     /// How channels are distributed across IOCs.
     ///
     /// `blocked` assigns contiguous ranges, as in a real facility.
-    /// `round-robin` interleaves channels, which can favour clients that
+    /// `round-robin` interleaves channels, which can favor clients that
     /// partition their work in the same way. Each IOC still gets every
     /// template and every rate of the mix, in its proportions.
     #[arg(long, default_value = "blocked")]
@@ -162,8 +187,9 @@ struct ServeArgs {
     /// How to handle backpressure when the consumer falls behind.
     ///
     /// `block` lets TCP throttle the sender, measuring the consumer's
-    /// effective capacity. `drop` maintains the nominal rate and counts
-    /// discarded updates, as an IOC does when its monitor queue overflows.
+    /// effective capacity. `drop` maintains the nominal rate and discards,
+    /// and counts, the updates that do not fit, as intermediate values are
+    /// lost when an IOC's monitor queue overflows.
     /// These modes answer different questions; published results must
     /// identify which one was used.
     #[arg(long, default_value = "block")]
@@ -174,7 +200,8 @@ struct ServeArgs {
     #[arg(long = "tick-us", default_value_t = 1000)]
     tick_us: u64,
 
-    /// Address to bind.
+    /// Address of the TCP listeners. `0.0.0.0` makes the server reachable
+    /// from the network.
     #[arg(long, default_value = "127.0.0.1")]
     bind: String,
 
@@ -182,8 +209,8 @@ struct ServeArgs {
     #[arg(long = "base-port", default_value_t = 5075)]
     base_port: u16,
 
-    /// Maximum queued bytes before the drop policy discards updates.
-    /// Models an IOC's monitor queue depth.
+    /// Bytes allowed to queue on one connection before the drop policy
+    /// discards updates: the stand-in for an IOC's monitor queue depth.
     #[arg(long = "high-water", default_value_t = 1 << 20)]
     high_water: usize,
 
@@ -237,7 +264,7 @@ struct ServeArgs {
     debug: bool,
 
     /// Stop after this many seconds. Runs until interrupted otherwise; Ctrl-C
-    /// ends a timed run early too, and the report is still written.
+    /// or SIGTERM ends a timed run early too, and the report is still written.
     #[arg(long = "duration-s")]
     duration_s: Option<f64>,
 
@@ -259,12 +286,15 @@ struct CalibrateArgs {
     #[arg(short, long, default_value = "catalogue/channels.txt")]
     channels: PathBuf,
 
+    /// Profile to write. An existing file is replaced only once the new
+    /// profile is complete and verified.
     #[arg(short, long, default_value = "profile.json")]
     out: PathBuf,
 
-    /// Catalogue database to record in the manifest for provenance.
+    /// Catalogue database to record in the manifest for provenance. Give it
+    /// once for each database the reference IOC loaded.
     #[arg(long)]
-    catalogue: Option<PathBuf>,
+    catalogue: Vec<PathBuf>,
 
     /// Number of distinct message bodies a changing channel must exhibit.
     ///
@@ -302,7 +332,8 @@ struct CalibrateArgs {
     ///
     /// Useful during development, but risky elsewhere: an incomplete profile
     /// can be served without errors while silently missing data that downstream consumers
-    /// cannot detect. Missing criteria are reported, and the run is marked accordingly.
+    /// cannot detect. Missing criteria are reported, and the profile is marked
+    /// incomplete: every command that loads it says so.
     #[arg(long = "allow-incomplete")]
     allow_incomplete: bool,
 }
@@ -391,6 +422,18 @@ fn warn_if_synthetic(profile: &Profile) {
     }
 }
 
+/// A profile written with `--allow-incomplete` before its criterion was met
+/// serves, but cannot support measurement claims either.
+fn warn_if_incomplete(profile: &Profile) {
+    if profile.manifest.incomplete {
+        eprintln!("┌───────────────────────────────────────────────────────────┐");
+        eprintln!("│ INCOMPLETE PROFILE — written with --allow-incomplete      │");
+        eprintln!("│ before every channel was observed long enough. Nothing    │");
+        eprintln!("│ produced from this run is a measurement of anything.      │");
+        eprintln!("└───────────────────────────────────────────────────────────┘");
+    }
+}
+
 /// Templates derived from few updates are not invalid, but measurements
 /// based on them warrant a caveat.
 fn warn_if_weakly_supported(profile: &Profile) {
@@ -419,6 +462,7 @@ fn run_serve(args: ServeArgs) -> i32 {
         }
     };
     warn_if_synthetic(&profile);
+    warn_if_incomplete(&profile);
 
     let rate_mix = match &args.rate_mix {
         None => RateMix::uniform(args.rate_hz),
@@ -552,11 +596,13 @@ fn run_serve(args: ServeArgs) -> i32 {
     // The mix's proportions hold only over whole cycles of its shares, so for
     // a small population the ideal figure can be far off: three channels of
     // `10:2,1:60,0.1:38` run at 10, 10 and 1 Hz, 21 updates/s, not 2.5.
+    // A channel of a static template sends its opening message only.
     let offered_eps: f64 = fleet
         .instances
         .iter()
+        .filter(|i| !fleet.templates[usize::from(i.template)].is_static())
         .map(|i| rate_mix.groups[usize::from(i.rate_group)].0)
-        .sum();
+        .fold(0.0, |sum, rate| sum + rate);
     let summary = report::RunSummary {
         mix: mix_label,
         iocs: args.iocs,
@@ -671,7 +717,12 @@ fn run_serve(args: ServeArgs) -> i32 {
             });
         }
 
-        report::print_banner(&profile, &fleet, &summary, &addrs, discovery.is_some());
+        let search_port = if discovery.is_some() {
+            args.search_port
+        } else {
+            0
+        };
+        report::print_banner(&profile, &fleet, &summary, &addrs, search_port);
 
         let started = std::time::Instant::now();
         // Ctrl-C ends a run early, timed or not, and the report is still
@@ -686,6 +737,22 @@ fn run_serve(args: ServeArgs) -> i32 {
                 std::future::pending::<()>().await;
             }
         };
+        // SIGTERM, what `kill`, systemd and container runtimes send, ends a
+        // run the same way.
+        let terminate = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                match signal(SignalKind::terminate()) {
+                    Ok(mut term) => {
+                        term.recv().await;
+                    }
+                    Err(_) => std::future::pending::<()>().await,
+                }
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        };
         let deadline = async {
             match args.duration_s {
                 Some(s) => tokio::time::sleep(std::time::Duration::from_secs_f64(s)).await,
@@ -694,6 +761,7 @@ fn run_serve(args: ServeArgs) -> i32 {
         };
         tokio::select! {
             () = interrupt => {}
+            () = terminate => {}
             () = deadline => {}
         }
 
@@ -745,12 +813,13 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
         }
     };
     warn_if_synthetic(&profile);
+    warn_if_incomplete(&profile);
     warn_if_weakly_supported(&profile);
 
-    println!("{}", profile.manifest.summary());
-    println!("{}", profile.coverage_summary());
-    println!();
-    println!("{:<24} {:>6} {:>6}  shape", "template", "PVs", "obs");
+    out!("{}", profile.manifest.summary());
+    out!("{}", profile.coverage_summary());
+    out!();
+    out!("{:<24} {:>6} {:>6}  shape", "template", "PVs", "obs");
     for (name, pvs) in profile.coverage() {
         let t = profile.template(name).expect("listed");
         let shape = if t.is_fixed_width() {
@@ -758,17 +827,17 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
         } else {
             format!("{}..{} B variable", t.min_len(), t.max_len())
         };
-        println!("{name:<24} {pvs:>6} {:>6}  {shape}", t.observations);
+        out!("{name:<24} {pvs:>6} {:>6}  {shape}", t.observations);
     }
 
     if let Some(share) = profile.session_rules.dominant_share() {
-        println!();
-        println!(
+        out!();
+        out!(
             "dominant changed-set covers {:.1}% of observed updates",
             share * 100.0
         );
         if share < 0.95 {
-            println!(
+            out!(
                 "  note: a large minority of updates use other patterns; emitting only \
                  the dominant one would leave decode paths untested"
             );
@@ -786,14 +855,18 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
         }
     };
 
-    println!();
+    out!();
     let same_env = profile.manifest.same_environment(&other.manifest);
     if same_env {
-        println!("same reference environment");
+        out!("same reference environment");
+    } else if profile.manifest.environment_known() && other.manifest.environment_known() {
+        out!("different reference environment: differences are wire-behavior changes");
+        out!("  a: {}", profile.manifest.summary());
+        out!("  b: {}", other.manifest.summary());
     } else {
-        println!("different reference environment: differences are wire-behavior changes");
-        println!("  a: {}", profile.manifest.summary());
-        println!("  b: {}", other.manifest.summary());
+        out!("reference environment not fully recorded, so differences are reported, not judged");
+        out!("  a: {}", profile.manifest.summary());
+        out!("  b: {}", other.manifest.summary());
     }
 
     // Types are compared strictly: the same IOC and catalogue must yield the
@@ -806,15 +879,15 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
     for t in &profile.templates {
         match other.template(&t.name) {
             None => {
-                println!("  - {} present in a, absent from b", t.name);
+                out!("  - {} present in a, absent from b", t.name);
                 type_differences += 1;
             }
             Some(o) if t.introspection != o.introspection => {
-                println!("  ~ {} differs in its type descriptor", t.name);
+                out!("  ~ {} differs in its type descriptor", t.name);
                 type_differences += 1;
             }
             Some(o) if !same_shape(t, o) => {
-                println!("  ~ {} differs in shape", t.name);
+                out!("  ~ {} differs in shape", t.name);
                 shape_differences += 1;
             }
             Some(_) => {}
@@ -822,16 +895,16 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
     }
     for t in &other.templates {
         if profile.template(&t.name).is_none() {
-            println!("  + {} present in b, absent from a", t.name);
+            out!("  + {} present in b, absent from a", t.name);
             type_differences += 1;
         }
     }
     if type_differences + shape_differences == 0 {
-        println!("  no differences");
+        out!("  no differences");
         return 0;
     }
     if shape_differences > 0 {
-        println!(
+        out!(
             "  {shape_differences} shape difference(s): which bytes are fixed depends on \
              what moved while each profile was observed"
         );
@@ -842,7 +915,7 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
     // A different set of types from the same environment is a defect. Exit
     // nonzero so CI can detect it without parsing the output.
     if same_env {
-        println!("  the same environment produced different types: this is a MIMUS bug");
+        out!("  the same environment produced different types: this is a MIMUS bug");
     }
     i32::from(same_env)
 }

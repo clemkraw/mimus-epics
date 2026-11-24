@@ -29,7 +29,7 @@ pub struct Args {
     pub addr: String,
     pub channels: PathBuf,
     pub out: PathBuf,
-    pub catalogue: Option<PathBuf>,
+    pub catalogue: Vec<PathBuf>,
     pub min_distinct: usize,
     pub settled_after: f64,
     pub deadline_s: f64,
@@ -61,15 +61,41 @@ pub struct Args {
 pub fn read_channels(path: &Path) -> Result<Vec<String>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let list: Vec<String> = text
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let mut list: Vec<String> = Vec::new();
+    let mut first_line: std::collections::HashMap<String, usize> = Default::default();
+    for (n, line) in text.lines().enumerate() {
+        let name = line.split('#').next().unwrap_or("").trim();
+        if name.is_empty() {
+            continue;
+        }
+        // A channel listed twice would be observed twice and assigned twice,
+        // and counted twice in the profile's coverage.
+        if let Some(first) = first_line.insert(name.to_string(), n + 1) {
+            return Err(format!(
+                "{}: {name} is listed on line {first} and again on line {}",
+                path.display(),
+                n + 1
+            ));
+        }
+        list.push(name.to_string());
+    }
     if list.is_empty() {
         return Err(format!("{} lists no channels", path.display()));
     }
     Ok(list)
+}
+
+/// The manifest's record of the catalogue: one checksum per database, in
+/// the order given, so a change to any of them shows.
+fn catalogue_checksums(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return "unspecified".to_string();
+    }
+    let sums: Vec<String> = paths.iter().map(|p| catalogue_checksum(p)).collect();
+    if sums.iter().any(|s| s == "unavailable") {
+        return "unavailable".to_string();
+    }
+    sums.join("+")
 }
 
 fn catalogue_checksum(path: &Path) -> String {
@@ -111,13 +137,16 @@ fn check_options(args: &Args) -> Result<(), String> {
             args.min_distinct
         ));
     }
-    // Read it whole, as the manifest will: opening a directory succeeds.
-    if let Some(path) = &args.catalogue
-        && let Err(e) = std::fs::read(path)
-    {
-        return Err(format!("--catalogue: cannot read {}: {e}", path.display()));
+    // Read each whole, as the manifest will: opening a directory succeeds.
+    for path in &args.catalogue {
+        if let Err(e) = std::fs::read(path) {
+            return Err(format!("--catalogue: cannot read {}: {e}", path.display()));
+        }
     }
-    crate::check_writable(&args.out).map_err(|e| format!("--out: {e}"))
+    // The profile is written beside its destination first, then moved over
+    // it, so both must be writable.
+    crate::check_writable(&args.out).map_err(|e| format!("--out: {e}"))?;
+    crate::check_writable(&partial_path(&args.out)).map_err(|e| format!("--out: {e}"))
 }
 
 pub fn run(args: Args) -> i32 {
@@ -133,13 +162,13 @@ pub fn run(args: Args) -> i32 {
         }
     };
 
-    println!("calibrating against {} ", args.addr);
-    println!(
+    out!("calibrating against {} ", args.addr);
+    out!(
         "{} channels from {}",
         channels.len(),
         args.channels.display()
     );
-    println!();
+    out!();
 
     let criterion = Criterion {
         min_distinct_updates: args.min_distinct,
@@ -166,7 +195,7 @@ pub fn run(args: Args) -> i32 {
             let p = progress(obs, &criterion, now);
             let line = format!("  {}  ({:.0}s)", p.summary(), now);
             if line != last_line {
-                println!("{line}");
+                out!("{line}");
                 last_line = line;
             }
             p.is_complete()
@@ -187,7 +216,7 @@ pub fn run(args: Args) -> i32 {
     // could make every channel appear settled, regardless of its final state.
     let elapsed = started.elapsed().as_secs_f64();
     let report = progress(&observers, &criterion, elapsed);
-    println!();
+    out!();
 
     if report.heard_nothing() {
         eprintln!(
@@ -199,18 +228,18 @@ pub fn run(args: Args) -> i32 {
     }
 
     if !report.missing.is_empty() {
-        println!(
+        out!(
             "{} channel(s) the IOC does not serve; they contribute nothing and \
              appear in no template:",
             report.missing.len()
         );
         for pv in report.missing.iter().take(10) {
-            println!("  {pv}");
+            out!("  {pv}");
         }
         if report.missing.len() > 10 {
-            println!("  ... and {} more", report.missing.len() - 10);
+            out!("  ... and {} more", report.missing.len() - 10);
         }
-        println!();
+        out!();
     }
 
     if !report.is_complete() && !args.allow_incomplete {
@@ -237,7 +266,8 @@ pub fn run(args: Args) -> i32 {
         eprintln!("A partial profile serves happily and is wrong in ways nothing");
         eprintln!("downstream can detect. Give it longer, check the IOC has the");
         eprintln!("catalogue loaded, or pass --allow-incomplete knowingly.");
-        return 2;
+        // Not 2, which is what a mistyped option exits with.
+        return 3;
     }
 
     // ---- analyze and group -------------------------------------------
@@ -248,9 +278,29 @@ pub fn run(args: Args) -> i32 {
     let mut by_descriptor: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
 
+    // A server that caches descriptors sends each type in full once per
+    // connection, and only its registry ID afterwards. The ID is what ties
+    // a channel that received the short form to its type.
+    let key_of_id: BTreeMap<[u8; 2], Vec<u8>> = observers
+        .iter()
+        .filter_map(|o| {
+            let full = o.introspection_full.as_deref()?;
+            Some((
+                mimus_calibrate::client::descriptor_id(full)?,
+                mimus_calibrate::client::descriptor_key(full),
+            ))
+        })
+        .collect();
+
     for (i, o) in observers.iter().enumerate() {
         match status(o, &criterion, elapsed) {
             Status::Complete { .. } | Status::Settled { .. } => {}
+            // Already reported above, as a channel the IOC does not serve.
+            _ if report.missing.contains(&o.pv) => continue,
+            // Asked for knowingly: a channel short of the criterion still
+            // gives what it showed, if that is enough to compare, and the
+            // profile is marked incomplete.
+            _ if args.allow_incomplete && o.updates().len() >= 2 => {}
             _ => {
                 skipped.push((o.pv.clone(), "incomplete".to_string()));
                 continue;
@@ -266,10 +316,21 @@ pub fn run(args: Args) -> i32 {
                 .or_default()
                 .push(i),
             None => {
-                // Only the cached form arrived, so the full descriptor must
-                // have been received by another channel of the same type.
-                // This channel still contributes its updates to that template.
-                skipped.push((o.pv.clone(), "cached descriptor only".to_string()));
+                // Only the cached form arrived: another channel of the same
+                // type received the full descriptor, and this one belongs
+                // to that type, its updates and opening included.
+                match o
+                    .introspection_id_only
+                    .as_deref()
+                    .and_then(mimus_calibrate::client::descriptor_id)
+                    .and_then(|id| key_of_id.get(&id))
+                {
+                    Some(key) => by_descriptor.entry(key.clone()).or_default().push(i),
+                    None => skipped.push((
+                        o.pv.clone(),
+                        "cached descriptor of a type no channel described".to_string(),
+                    )),
+                }
             }
         }
     }
@@ -305,28 +366,27 @@ pub fn run(args: Args) -> i32 {
         ..Default::default()
     };
     if !saw_cached {
-        println!(
+        out!(
             "the IOC never used the cached descriptor form; the profile records \
              AlwaysFull so MIMUS behaves the same way"
         );
-        println!();
+        out!();
     }
 
     let mut profile = Profile::new(
         Manifest {
             pvxs_version: args.pvxs_version.clone(),
             epics_base_version: args.epics_version.clone(),
-            catalogue_sha256: args
-                .catalogue
-                .as_deref()
-                .map(catalogue_checksum)
-                .unwrap_or_else(|| "unspecified".to_string()),
+            catalogue_checksum: catalogue_checksums(&args.catalogue),
             host: hostname(),
             captured_at: now_rfc3339(),
             mimus_version: env!("CARGO_PKG_VERSION").to_string(),
             study_duration_s: elapsed,
             pvs_observed: observers.len() as u32,
             synthetic: false,
+            // Only reachable with --allow-incomplete: without it, an
+            // incomplete calibration stops above.
+            incomplete: !report.is_complete(),
         },
         session_rules,
     );
@@ -348,19 +408,19 @@ pub fn run(args: Args) -> i32 {
         .filter(|o| o.total_updates() > 0 && o.updates().len() < 2)
         .count();
 
-    println!(
+    out!(
         "observed: {} channels, {with_full} with a full descriptor, \
          {with_cached} with a cached one, {silent} silent",
         observers.len()
     );
-    println!(
+    out!(
         "{} distinct type descriptor(s), {too_few} channel(s) with fewer than two updates",
         by_descriptor.len()
     );
-    println!();
+    out!();
 
     if args.debug {
-        println!("--- channels ---");
+        out!("--- channels ---");
         for o in &observers {
             let intro = match (&o.introspection_full, &o.introspection_id_only) {
                 (Some(f), _) => format!("full {} B [{}]", f.len(), head(f, 10)),
@@ -372,7 +432,7 @@ pub fn run(args: Args) -> i32 {
                 .first()
                 .map(|u| format!("{} B [{}]", u.len(), head(u, 12)))
                 .unwrap_or_else(|| "-".to_string());
-            println!(
+            out!(
                 "  {:<26} {:>4} upd {:>4} distinct  {:<28} body {body}",
                 o.pv,
                 o.total_updates(),
@@ -380,13 +440,13 @@ pub fn run(args: Args) -> i32 {
                 intro
             );
         }
-        println!();
-        println!("--- descriptor groups ---");
+        out!();
+        out!("--- descriptor groups ---");
         for (d, members) in &by_descriptor {
             let names: Vec<&str> = members.iter().map(|i| observers[*i].pv.as_str()).collect();
-            println!("  {} B [{}]  {:?}", d.len(), head(d, 12), names);
+            out!("  {} B [{}]  {:?}", d.len(), head(d, 12), names);
         }
-        println!();
+        out!();
     }
 
     let mut namer = build::Namer::new();
@@ -396,7 +456,15 @@ pub fn run(args: Args) -> i32 {
     let mut frozen_openings = 0usize;
 
     for members in by_descriptor.values() {
-        let first = &observers[members[0]];
+        // The first channel of the type that received its full descriptor:
+        // the one a caching server sent first, and the template's source.
+        let Some(first) = members
+            .iter()
+            .map(|i| &observers[*i])
+            .find(|o| o.introspection_full.is_some())
+        else {
+            continue;
+        };
 
         // Use only the steady-state message shape. A monitor's first update
         // carries the complete value; subsequent updates carry deltas.
@@ -405,13 +473,13 @@ pub fn run(args: Args) -> i32 {
         let steady = first.steady_state();
         let updates: &[Vec<u8>] = &steady;
         if args.debug && all_shapes.len() > 1 {
-            println!(
+            out!(
                 "  {:<26} {} message shape(s); templating the most common",
                 first.pv,
                 all_shapes.len()
             );
             for (bitset, group) in &all_shapes {
-                println!(
+                out!(
                     "      changed-set [{}]  {:>3} update(s)  {} B",
                     head(bitset, 8),
                     group.len(),
@@ -424,10 +492,10 @@ pub fn run(args: Args) -> i32 {
         // for setpoints, limits, and descriptions, which are common in a
         // real facility.
         //
-        // With only one observation, however, the timestamp cannot be
-        // isolated and remains frozen in the template. MIMUS posts the body
-        // once at subscription time, using the timestamp captured during
-        // calibration. Consumers that order updates by timestamp may notice.
+        // With only one observation the timestamp cannot be isolated, so
+        // the template has nothing to fill. MIMUS treats such a template as
+        // static: its channels send their opening message and then nothing,
+        // as they did on the IOC.
         let is_static = updates.len() < 2;
         if is_static {
             single_update += 1;
@@ -447,7 +515,7 @@ pub fn run(args: Args) -> i32 {
         };
         if args.debug {
             let slots = pieces.iter().filter(|p| p.as_slot().is_some()).count();
-            println!(
+            out!(
                 "  {:<26} {} piece(s), {slots} slot(s) from {} updates",
                 first.pv,
                 pieces.len(),
@@ -564,7 +632,7 @@ pub fn run(args: Args) -> i32 {
             continue;
         }
 
-        println!(
+        out!(
             "  {name:<28} {:>3} channels  {:>4} updates  {}{}",
             members.len(),
             updates.len(),
@@ -586,7 +654,7 @@ pub fn run(args: Args) -> i32 {
         profile.templates.push(template);
     }
 
-    println!();
+    out!();
     if failures > 0 {
         eprintln!(
             "{failures} type(s) failed verification and were left out. A template \
@@ -596,22 +664,25 @@ pub fn run(args: Args) -> i32 {
     if verified == 0 {
         eprintln!("error: nothing was verified; no profile written.");
         eprintln!();
-        if by_descriptor.is_empty() {
+        if by_descriptor.is_empty() && skipped.iter().any(|(_, why)| why == "incomplete") {
+            eprintln!("  Every channel that could have given a template was left out");
+            eprintln!("  as incomplete: none met the criterion, and none showed the");
+            eprintln!("  two updates a comparison needs. Give calibration longer.");
+        } else if by_descriptor.is_empty() {
             eprintln!("  No channel carried a full type descriptor. Every monitor");
             eprintln!("  either failed to initialize, or only ever received the");
             eprintln!("  cached form — which names a descriptor another channel");
             eprintln!("  was supposed to receive.");
-        } else if single_update > 0 && failures == 0 {
-            eprintln!(
-                "  {single_update} type(s) had a single update, which cannot be \
-                 diffed. Static channels are a real case and building a slotless \
-                 template for them is not implemented yet."
-            );
         } else if failures > 0 {
             eprintln!("  {failures} type(s) failed verification; see above.");
         }
         return 1;
     }
+
+    // The manifest counts the channels the profile was built from, as the
+    // coverage line does, not the channels asked for: a name the IOC does
+    // not serve was never observed.
+    profile.manifest.pvs_observed = profile.assignments.len() as u32;
 
     // Apply structural validation only. The stopping criterion has already
     // determined whether each channel had enough observations. Applying one
@@ -632,49 +703,68 @@ pub fn run(args: Args) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = std::fs::write(&args.out, json) {
+    if let Err(e) = write_replacing(&args.out, &json) {
         eprintln!("error: cannot write {}: {e}", args.out.display());
         return 1;
     }
 
     if frozen_openings > 0 {
-        println!(
+        out!(
             "{frozen_openings} type(s) are carried by a single channel, so their \
              opening message is replayed with its timestamp frozen. Two channels \
              per type gives the diff something to work with."
         );
     }
     if single_update > 0 {
-        println!(
-            "{single_update} type(s) were static: templated from a single body, \
-             with the timestamp frozen at what the calibration saw."
+        out!(
+            "{single_update} type(s) were static: their channels will send their \
+             opening message and nothing after it, as on the IOC."
         );
     }
     let weak = profile.weakly_supported(args.min_distinct as u32);
     if !weak.is_empty() {
-        println!(
+        out!(
             "{} template(s) rest on fewer than {} updates; a field that did not \
              move during the run is frozen into them:",
             weak.len(),
             args.min_distinct
         );
         for (name, n) in weak.iter().take(8) {
-            println!("  {name:<28} {n} update(s)");
+            out!("  {name:<28} {n} update(s)");
         }
     }
-    println!("{}", profile.coverage_summary());
-    println!("written to {}", args.out.display());
+    out!("{}", profile.coverage_summary());
+    out!("written to {}", args.out.display());
     if !skipped.is_empty() {
-        println!();
-        println!(
+        out!();
+        out!(
             "{} channel(s) contributed nothing of their own:",
             skipped.len()
         );
         for (pv, why) in skipped.iter().take(10) {
-            println!("  {pv:<28} {why}");
+            out!("  {pv:<28} {why}");
         }
     }
     0
+}
+
+/// Writes `text` to `path` so that the file is either the old one or the
+/// new one, never a part of the new one: the text goes to a file beside it,
+/// which then replaces it in one step. A profile from a previous calibration
+/// therefore survives a calibration interrupted while writing.
+fn write_replacing(path: &Path, text: &str) -> std::io::Result<()> {
+    let partial = partial_path(path);
+    std::fs::write(&partial, text)?;
+    std::fs::rename(&partial, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&partial);
+    })
+}
+
+/// Where [`write_replacing`] puts the text before moving it over `path`.
+fn partial_path(path: &Path) -> PathBuf {
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    PathBuf::from(partial)
 }
 
 /// Format the first `n` bytes as hexadecimal for diagnostic output.
@@ -737,6 +827,27 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_list_with_crlf_endings_reads_the_same() {
+        let p = temp_file("channels-crlf", "MIM:F64:0\r\nMIM:F64:1\r\n");
+        assert_eq!(
+            read_channels(&p).unwrap(),
+            vec!["MIM:F64:0".to_string(), "MIM:F64:1".to_string()]
+        );
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn a_channel_listed_twice_is_refused_with_both_lines() {
+        let p = temp_file("channels-dup", "MIM:F64:0\n# x\nMIM:F64:1\n  MIM:F64:0  \n");
+        let e = read_channels(&p).unwrap_err();
+        assert!(
+            e.contains("MIM:F64:0 is listed on line 1 and again on line 4"),
+            "{e}"
+        );
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
     fn an_empty_list_is_an_error_rather_than_an_empty_calibration() {
         // Calibrating an empty channel list would produce an empty profile
         // that looks valid until something tries to serve from it.
@@ -766,6 +877,40 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_is_replaced_whole_and_leaves_nothing_beside_it() {
+        let dir = std::env::temp_dir().join(format!("mimus-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("profile.json");
+        std::fs::write(&out, "old").unwrap();
+        write_replacing(&out, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no partial file left"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn every_catalogue_database_is_recorded() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("mimus-cat-a-{}.db", std::process::id()));
+        let b = dir.join(format!("mimus-cat-b-{}.db", std::process::id()));
+        std::fs::write(&a, b"record(ai, \"A\") {}").unwrap();
+        std::fs::write(&b, b"record(ai, \"B\") {}").unwrap();
+        let one = catalogue_checksums(std::slice::from_ref(&a));
+        let both = catalogue_checksums(&[a.clone(), b.clone()]);
+        // One database keeps the form a single checksum always had.
+        assert_eq!(one, catalogue_checksum(&a));
+        assert_eq!(both, format!("{one}+{}", catalogue_checksum(&b)));
+        assert_eq!(catalogue_checksums(&[]), "unspecified");
+        std::fs::remove_file(&b).ok();
+        assert_eq!(catalogue_checksums(&[a.clone(), b]), "unavailable");
+        std::fs::remove_file(a).ok();
+    }
+
+    #[test]
     fn a_missing_catalogue_is_recorded_as_unavailable_not_faked() {
         assert_eq!(
             catalogue_checksum(Path::new("/nonexistent/catalogue.db")),
@@ -778,7 +923,7 @@ mod tests {
             addr: "127.0.0.1:5075".into(),
             channels: PathBuf::from("channels.txt"),
             out,
-            catalogue: None,
+            catalogue: Vec::new(),
             min_distinct: 30,
             settled_after: 30.0,
             deadline_s: 600.0,
@@ -807,9 +952,9 @@ mod tests {
         a.min_distinct = 1;
         assert!(check_options(&a).is_err());
         let mut a = args(out.clone());
-        a.catalogue = Some(PathBuf::from("/nonexistent/catalogue.db"));
+        a.catalogue = vec![PathBuf::from("/nonexistent/catalogue.db")];
         assert!(check_options(&a).is_err());
-        a.catalogue = Some(std::env::temp_dir());
+        a.catalogue = vec![std::env::temp_dir()];
         assert!(check_options(&a).is_err(), "a directory is not a catalogue");
         assert!(check_options(&args(PathBuf::from("/nonexistent/profile.json"))).is_err());
     }

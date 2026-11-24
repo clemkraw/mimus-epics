@@ -336,17 +336,6 @@ impl Fleet {
         counts
     }
 
-    /// Returns the number of PVs assigned to each rate group.
-    pub fn rate_group_counts(&self, groups: usize) -> Vec<usize> {
-        let mut counts = vec![0usize; groups];
-        for inst in &self.instances {
-            if let Some(c) = counts.get_mut(inst.rate_group as usize) {
-                *c += 1;
-            }
-        }
-        counts
-    }
-
     /// Returns the number of PVs using each template, in template order.
     pub fn template_counts(&self) -> Vec<(&str, usize)> {
         let mut counts = vec![0usize; self.templates.len()];
@@ -405,13 +394,14 @@ mod tests {
             Manifest {
                 pvxs_version: "1.4.2".into(),
                 epics_base_version: "7.0.8".into(),
-                catalogue_sha256: "c".repeat(64),
+                catalogue_checksum: "c".repeat(64),
                 host: "test".into(),
                 captured_at: "2026-08-15T00:00:00Z".into(),
                 mimus_version: "0.1.0".into(),
                 study_duration_s: 1.0,
                 pvs_observed: 2,
                 synthetic: false,
+                incomplete: false,
             },
             SessionRules::default(),
         );

@@ -233,13 +233,14 @@ fn build() -> Profile {
     let manifest = Manifest {
         pvxs_version: "unknown".into(),
         epics_base_version: "unknown".into(),
-        catalogue_sha256: "0".repeat(64),
+        catalogue_checksum: "unspecified".to_string(),
         host: "hand-written".into(),
         captured_at: "1970-01-01T00:00:00Z".into(),
         mimus_version: env!("CARGO_PKG_VERSION").to_string(),
         study_duration_s: 0.0,
         pvs_observed: 0,
         synthetic: true,
+        incomplete: false,
     };
 
     let mut p = Profile::new(manifest, SessionRules::default());
@@ -280,15 +281,15 @@ pub fn write(path: &Path) -> i32 {
         eprintln!("error: cannot write {}: {e}", path.display());
         return 1;
     }
-    println!("wrote {}", path.display());
-    println!();
-    println!("This profile is SYNTHETIC. The bytes are hand-encoded against the");
-    println!("PVA specification, not observed from an IOC: a client will connect");
-    println!("and show moving values, but a real NTScalar from QSRV2 carries more");
-    println!("than this one does. Good for exercising the server, useless as a");
-    println!("measurement.");
-    println!();
-    println!(
+    out!("wrote {}", path.display());
+    out!();
+    out!("This profile is SYNTHETIC. The bytes are hand-encoded against the");
+    out!("PVA specification, not observed from an IOC: a client will connect");
+    out!("and show moving values, but a real NTScalar from QSRV2 carries more");
+    out!("than this one does. Good for exercising the server, useless as a");
+    out!("measurement.");
+    out!();
+    out!(
         "  mimus serve --profile {} --pvs 1000 --rate-hz 1",
         path.display()
     );

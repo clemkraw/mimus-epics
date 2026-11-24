@@ -37,56 +37,87 @@ pub fn print_banner(
     fleet: &Fleet,
     run: &RunSummary,
     addrs: &[std::net::SocketAddr],
-    discovery: bool,
+    search_port: u16,
 ) {
-    println!("mimus — {}", profile.manifest.summary());
-    println!();
-    println!(
+    out!("mimus — {}", profile.manifest.summary());
+    out!();
+    out!(
         "{} PVs across {} virtual IOCs, {} layout",
-        run.pvs, run.iocs, run.layout
+        run.pvs,
+        run.iocs,
+        run.layout
     );
-    println!("rates {} Hz, types {}", run.rate_mix, run.mix);
-    println!(
+    out!("rates {} Hz, types {}", run.rate_mix, run.mix);
+    out!(
         "offered load {:.0} updates/s, backpressure {}",
-        run.offered_eps, run.backpressure
+        run.offered_eps,
+        run.backpressure
     );
-    println!("names {}", run.name_template);
+    out!("names {}", run.name_template);
     if let Some(s) = run.drop_connections_s {
-        println!("dropping one connection every {s} s");
+        out!("dropping one connection every {s} s");
     }
-    println!("pipeline {}", run.pipeline);
+    out!("pipeline {}", run.pipeline);
     if run.coalesce_us > 0 {
-        println!(
+        out!(
             "coalescing writes for up to {} µs — timestamps stay true but \
              delivery is delayed by that much",
             run.coalesce_us
         );
     }
-    println!();
-    println!("templates in play:");
+    out!();
+    out!("templates in play:");
     for (name, n) in fleet.template_counts() {
-        println!("  {name:<24} {n:>8} PVs");
+        let fixed = fleet
+            .templates
+            .iter()
+            .find(|t| t.name == name)
+            .is_some_and(|t| t.is_static());
+        if fixed {
+            out!("  {name:<24} {n:>8} PVs  static: opening message only");
+        } else {
+            out!("  {name:<24} {n:>8} PVs");
+        }
     }
-    println!();
-    println!("listening:");
+    out!();
+    out!("listening:");
     for (i, addr) in addrs.iter().enumerate() {
-        println!("  ioc {i:<3} {addr}");
+        out!("  ioc {i:<3} {addr}");
     }
-    println!();
-    if discovery {
-        println!("answering searches over UDP: a client on this network finds these");
-        println!("channels without being told where to look.");
-        println!("  pvmonitor {}", example_pv(fleet));
+    out!();
+    let port = if search_port == 5076 {
+        String::new()
     } else {
-        println!("not answering searches, so clients must be told where to look:");
+        format!(" EPICS_PVA_BROADCAST_PORT={search_port}")
+    };
+    if search_port == 0 {
+        out!("not answering searches, so clients must be told where to look:");
         let list: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
-        println!(
-            "  EPICS_PVA_NAME_SERVERS=\"{}\" pvmonitor {}",
+        out!(
+            "  EPICS_PVA_NAME_SERVERS=\"{}\" pvxmonitor {}",
             list.join(" "),
             example_pv(fleet)
         );
+    } else if addrs.iter().all(|a| a.ip().is_loopback()) {
+        out!("answering searches over UDP, with the listeners on the loopback: a client");
+        out!("on this host that searches 127.0.0.1 finds these channels.");
+        out!(
+            "  EPICS_PVA_AUTO_ADDR_LIST=NO EPICS_PVA_ADDR_LIST=127.0.0.1{port} pvxmonitor {}",
+            example_pv(fleet)
+        );
+    } else {
+        out!("answering searches over UDP: a client on this network finds these");
+        out!("channels without being told where to look.");
+        if port.is_empty() {
+            out!("  pvxmonitor {}", example_pv(fleet));
+        } else {
+            out!(
+                "  EPICS_PVA_BROADCAST_PORT={search_port} pvxmonitor {}",
+                example_pv(fleet)
+            );
+        }
     }
-    println!();
+    out!();
 }
 
 fn example_pv(fleet: &Fleet) -> &str {
@@ -121,39 +152,83 @@ pub fn finish(
     };
     let offered = run.offered_eps;
 
-    println!();
-    println!("sessions           {:>14}", sessions.total);
+    // The file is written before anything is printed: the summary goes to a
+    // terminal or a pipe that may already be gone, and the file is the record
+    // of the run.
+    let written = report_path.map(|path| {
+        let json = serde_json::json!({
+            "sessions": sessions.total,
+            "sessions_dropped": sessions.dropped,
+            "subscriptions": sessions.subscriptions,
+            "late_ticks": counters.late_ticks,
+            "wheel_steps": counters.wheel_steps,
+            "pipeline_acks": counters.pipeline_acks,
+            "flow_control_holds": counters.flow_control_holds,
+            "emitted": counters.emitted,
+            "dropped_backpressure": counters.dropped_backpressure,
+            "bytes": counters.bytes,
+            "elapsed_s": elapsed_s,
+            "achieved_eps": achieved,
+            "offered_eps": offered,
+            "run": {
+                "iocs": run.iocs,
+                "pvs": run.pvs,
+                "rate_mix": run.rate_mix,
+                "name_template": run.name_template,
+                "drop_connections_s": run.drop_connections_s,
+                "pipeline": run.pipeline,
+                "coalesce_us": run.coalesce_us,
+                "layout": run.layout,
+                "backpressure": run.backpressure,
+                "tick_us": run.tick_us,
+                "mix": run.mix,
+            },
+            "profile": {
+                "synthetic": profile.manifest.synthetic,
+                "incomplete": profile.manifest.incomplete,
+                "pvxs_version": profile.manifest.pvxs_version,
+                "epics_base_version": profile.manifest.epics_base_version,
+                "catalogue_checksum": profile.manifest.catalogue_checksum,
+                "templates": profile.templates.len(),
+            },
+        });
+        let text = serde_json::to_string_pretty(&json).unwrap_or_default();
+        (path, std::fs::write(path, text))
+    });
+
+    out!();
+    out!("sessions           {:>14}", sessions.total);
     if run.drop_connections_s.is_some() {
-        println!("dropped by MIMUS   {:>14}", sessions.dropped);
+        out!("dropped by MIMUS   {:>14}", sessions.dropped);
     }
-    println!("subscriptions      {:>14}", sessions.subscriptions);
-    println!("emitted            {:>14}", counters.emitted);
-    println!("dropped (pressure) {:>14}", counters.dropped_backpressure);
-    println!("bytes              {:>14}", counters.bytes);
-    println!("elapsed            {elapsed_s:>14.1} s");
-    println!("achieved           {achieved:>14.0} updates/s");
+    out!("subscriptions      {:>14}", sessions.subscriptions);
+    out!("emitted            {:>14}", counters.emitted);
+    out!("dropped (pressure) {:>14}", counters.dropped_backpressure);
+    out!("bytes              {:>14}", counters.bytes);
+    out!("elapsed            {elapsed_s:>14.1} s");
+    out!("achieved           {achieved:>14.0} updates/s");
     if let Some(bpe) = counters.bytes_per_event() {
-        println!("bytes/event        {bpe:>14.1}");
+        out!("bytes/event        {bpe:>14.1}");
     }
     if let Some(ratio) = counters.delivery_ratio() {
-        println!("delivered          {:>13.2}%", ratio * 100.0);
+        out!("delivered          {:>13.2}%", ratio * 100.0);
     }
     if counters.late_ticks > 0 {
-        println!("late ticks         {:>14}", counters.late_ticks);
+        out!("late ticks         {:>14}", counters.late_ticks);
     }
     if counters.pipeline_acks > 0 {
-        println!("pipeline acks      {:>14}", counters.pipeline_acks);
+        out!("pipeline acks      {:>14}", counters.pipeline_acks);
     }
     if counters.flow_control_holds > 0 {
-        println!("flow-control holds {:>14}", counters.flow_control_holds);
+        out!("flow-control holds {:>14}", counters.flow_control_holds);
     }
 
     // Check for the cause before assigning blame. If no clients connected,
     // nothing was emitted because there were no subscribers. Reporting this
     // as an emitter problem would send the investigation in the wrong direction.
     if sessions.total == 0 {
-        println!();
-        println!(
+        out!();
+        out!(
             "note: no client ever connected, so nothing was emitted. MIMUS only \
              sends to subscribers; loading channels costs nothing on its own. Point \
              a consumer at the addresses above."
@@ -175,8 +250,8 @@ pub fn finish(
         } else {
             "the gap is the consumer's absorption limit".to_string()
         };
-        println!();
-        println!(
+        out!();
+        out!(
             "note: achieved {achieved:.0}/s against {offered:.0}/s offered across all {} \
              channels. MIMUS only sends to subscribed channels, so the gap measures \
              something only if every channel was subscribed for the whole run. If it \
@@ -184,7 +259,7 @@ pub fn finish(
             run.pvs
         );
         if counters.late_ticks > 0 {
-            println!(
+            out!(
                 "      {} ticks ran late, so the shortfall is at least partly the \
                  emitter's own scheduling.",
                 counters.late_ticks
@@ -192,49 +267,10 @@ pub fn finish(
         }
     }
 
-    let Some(path) = report_path else {
-        return;
-    };
-    let json = serde_json::json!({
-        "sessions": sessions.total,
-        "sessions_dropped": sessions.dropped,
-        "subscriptions": sessions.subscriptions,
-        "late_ticks": counters.late_ticks,
-        "wheel_steps": counters.wheel_steps,
-        "pipeline_acks": counters.pipeline_acks,
-        "flow_control_holds": counters.flow_control_holds,
-        "emitted": counters.emitted,
-        "dropped_backpressure": counters.dropped_backpressure,
-        "bytes": counters.bytes,
-        "elapsed_s": elapsed_s,
-        "achieved_eps": achieved,
-        "offered_eps": offered,
-        "run": {
-            "iocs": run.iocs,
-            "pvs": run.pvs,
-            "rate_mix": run.rate_mix,
-            "name_template": run.name_template,
-            "drop_connections_s": run.drop_connections_s,
-            "pipeline": run.pipeline,
-            "coalesce_us": run.coalesce_us,
-            "layout": run.layout,
-            "backpressure": run.backpressure,
-            "tick_us": run.tick_us,
-            "mix": run.mix,
-        },
-        "profile": {
-            "synthetic": profile.manifest.synthetic,
-            "pvxs_version": profile.manifest.pvxs_version,
-            "epics_base_version": profile.manifest.epics_base_version,
-            "catalogue_sha256": profile.manifest.catalogue_sha256,
-            "templates": profile.templates.len(),
-        },
-    });
-    match std::fs::write(
-        path,
-        serde_json::to_string_pretty(&json).unwrap_or_default(),
-    ) {
-        Ok(()) => println!("\nreport written to {}", path.display()),
-        Err(e) => eprintln!("warning: cannot write {}: {e}", path.display()),
+    if let Some((path, result)) = written {
+        match result {
+            Ok(()) => out!("\nreport written to {}", path.display()),
+            Err(e) => eprintln!("warning: cannot write {}: {e}", path.display()),
+        }
     }
 }

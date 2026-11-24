@@ -1,13 +1,16 @@
 //! End-to-end tests over real sockets.
 //!
-//! The client is hand-written rather than reused from the server code.
-//! If both sides shared an encoder, the same mistake could appear in
-//! both and go undetected, allowing every test to pass against a wire
-//! format that real clients do not accept.
+//! The client lays out every message itself rather than through the
+//! server's message code. If both sides shared the code that lays a message
+//! out, the same mistake could appear in both and go undetected, and every
+//! test would pass against a wire format real clients do not accept. It
+//! does share the low-level codec (sizes, strings, headers) and the framer
+//! with the server; those have their own unit tests.
 //!
-//! These tests verify that MIMUS can serve a peer implementing the
-//! protocol independently. Compatibility with PVXS is verified
-//! separately by the conformance suite.
+//! These tests show that MIMUS serves a peer that builds its messages
+//! independently. Compatibility with PVXS itself is checked against the
+//! PVXS tools: `pvxinfo`, `pvxget` and `pvxmonitor` read every template in
+//! phase 15 of `bench.sh`.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,13 +60,14 @@ fn profile() -> Profile {
         Manifest {
             pvxs_version: "1.4.2".into(),
             epics_base_version: "7.0.8".into(),
-            catalogue_sha256: "d".repeat(64),
+            catalogue_checksum: "d".repeat(64),
             host: "test".into(),
             captured_at: "2026-08-15T00:00:00Z".into(),
             mimus_version: "0.1.0".into(),
             study_duration_s: 1.0,
             pvs_observed: 2,
             synthetic: false,
+            incomplete: false,
         },
         SessionRules::default(),
     );
@@ -844,10 +848,10 @@ async fn a_big_endian_channel_and_monitor_work_too() {
 
 #[tokio::test]
 async fn the_first_update_arrives_immediately_after_start() {
-    // A real IOC posts the current value as soon as a monitor starts. MIMUS previously
-    // waited for the next scheduled tick, adding up to one full period of startup
-    // latency at low update rates. This delay was also visible in archiver
-    // startup profiles at scale.
+    // A real IOC posts the current value as soon as a monitor starts.
+    // Waiting for the next scheduled tick instead would add up to one full
+    // period of startup latency at low update rates, which shows in an
+    // archiver's startup profile at scale.
     let f = fleet(10, 1);
     let name = f.names[0].clone();
     // At one update per second, no scheduled update can arrive within
@@ -1369,13 +1373,14 @@ fn profile_with_initial() -> Profile {
         Manifest {
             pvxs_version: "1.4.2".into(),
             epics_base_version: "7.0.8.1".into(),
-            catalogue_sha256: "e".repeat(64),
+            catalogue_checksum: "e".repeat(64),
             host: "test".into(),
             captured_at: "posix:0".into(),
             mimus_version: "0.1.0".into(),
             study_duration_s: 30.0,
             pvs_observed: 2,
             synthetic: false,
+            incomplete: false,
         },
         SessionRules::default(),
     );
@@ -1699,13 +1704,14 @@ fn profile_with_stamped_opening() -> Profile {
         Manifest {
             pvxs_version: "1.4.2".into(),
             epics_base_version: "7.0.8.1".into(),
-            catalogue_sha256: "f".repeat(64),
+            catalogue_checksum: "f".repeat(64),
             host: "test".into(),
             captured_at: "posix:0".into(),
             mimus_version: "0.1.0".into(),
             study_duration_s: 30.0,
             pvs_observed: 2,
             synthetic: false,
+            incomplete: false,
         },
         SessionRules::default(),
     );
@@ -1922,12 +1928,11 @@ async fn a_read_carries_the_current_time_and_ends_with_the_value() {
 
 #[tokio::test]
 async fn an_idle_connection_does_not_tick() {
-    // A connection with no active subscriptions used to wake up a thousand
-    // times per second. With no data flowing, a captured profile showed
-    // Tokio's timer machinery at the top of the profile: `process_at_time`
-    // and `Sleep::poll` together accounted for more work than MIMUS itself.
-    // An archiver opening hundreds of connections incurred this overhead
-    // on every connection before receiving a single update.
+    // A connection with no active subscriptions that woke up a thousand
+    // times per second would put Tokio's timer machinery at the top of a
+    // profile with no data flowing: `process_at_time` and `Sleep::poll`
+    // together cost more than MIMUS itself. An archiver opening hundreds of
+    // connections would pay that on every one before receiving an update.
     //
     // This is observable only through the absence of activity: a connection
     // with no subscriptions should send nothing and remain alive.
@@ -2023,9 +2028,9 @@ async fn stopping_the_last_monitor_makes_a_connection_idle_again() {
 #[tokio::test]
 async fn creating_an_unknown_channel_is_refused_not_ignored() {
     // Silence and refusal are indistinguishable to a client until it times
-    // out. Previously, a load test requesting nonexistent channel names
-    // waited indefinitely for replies and reported zero bytes delivered,
-    // without any indication of the cause.
+    // out. A load test asking for names that do not exist would otherwise
+    // wait for replies indefinitely and report zero bytes delivered, with
+    // no indication of the cause.
     let f = fleet(10, 1);
     let addr = start(Arc::clone(&f), fast_config()).await;
     let mut c = Client::connect(addr).await;
@@ -2189,11 +2194,11 @@ async fn coalescing_yields_before_the_drop_policy_would_bite() {
 #[tokio::test]
 async fn the_drop_policy_keeps_its_cadence_when_a_client_stops_reading() {
     // This is the promise of `--backpressure drop`: maintain the offered rate and count
-    // updates that cannot be queued. Previously, the behavior was the opposite.
-    // Once the socket filled, `write_all` blocked the session, stopping the tick loop.
-    // In a test where the client subscribed and then stopped reading, MIMUS
-    // emitted only 2,910 updates per second out of 400,000 offered, and reported zero
-    // drops because no updates reached the point where they could be dropped.
+    // updates that cannot be queued. A session that waited in `write_all` once the
+    // socket filled would stop its own tick loop: with a client that subscribes and
+    // then stops reading, it would emit a few thousand updates per second out of
+    // 400,000 offered and report zero drops, since no update would ever reach the
+    // point where it could be dropped.
     let f = fleet(200, 1);
     let cfg = SessionConfig {
         rate_mix: RateMix::uniform(500.0),
