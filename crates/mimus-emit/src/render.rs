@@ -323,6 +323,18 @@ impl Compiled {
         self.max_len
     }
 
+    /// Whether every update would be the same bytes: a template with nothing
+    /// to fill, built from a channel that never moved during calibration.
+    ///
+    /// Such a channel sends its opening message and nothing after it, as on
+    /// the IOC. Repeating its one recorded body at the serving rate would
+    /// send the same value with the same frozen timestamp, minutes older
+    /// than the opening message, over and over.
+    #[inline]
+    pub fn is_static(&self) -> bool {
+        self.fills.is_empty()
+    }
+
     /// Returns whether the flat rendering path is used.
     #[inline]
     pub fn is_flat(&self) -> bool {
