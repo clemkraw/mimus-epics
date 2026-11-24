@@ -7,9 +7,8 @@
 //!
 //! The wheel supports two key capabilities:
 //!
-//! **Multiple updates per tick.** A channel is no longer limited to one
-//! update per tick. It can emit several updates per firing, with timestamps
-//! spread across the tick. This also reduces overhead: many updates can be
+//! **Multiple updates per tick.** A channel faster than the tick rate emits
+//! several updates per firing, with timestamps spread across the tick. This also reduces overhead: many updates can be
 //! rendered into one buffer and written in a single operation.
 //!
 //! **Multiple rates in one run.** Different facilities run at different

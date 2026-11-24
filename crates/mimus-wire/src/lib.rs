@@ -5,8 +5,8 @@
 //! not on each other: calibration decodes frames from a real IOC,
 //! while the server produces frames for clients.
 //!
-//! Keeping I/O out of this crate makes conformance tests cheap:
-//! golden-packet tests compare byte arrays and run on every commit.
+//! Keeping I/O out of this crate keeps its tests cheap: golden-packet
+//! tests compare byte arrays and run on every commit.
 //!
 //! Targets PVXS (QSRV2). See `catalogue/README.md`.
 

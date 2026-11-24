@@ -12,7 +12,7 @@
 //! change while its value stays within one decade. The high bytes of a
 //! POSIX timestamp may remain unchanged for months. Freezing these bytes
 //! into the template would produce correct output only within the
-//! observation window. Rather than guessing, we propose and validate:
+//! observation window. Rather than guessing, the analysis proposes and validates:
 //! identify a run of changing bytes, propose that it belongs to an
 //! 8-byte double or timestamp, and accept the proposal only if every
 //! observation decodes plausibly under that interpretation.
@@ -59,18 +59,7 @@ pub struct InferredSlot {
     pub samples: Vec<Vec<u8>>,
 }
 
-impl InferredSlot {
-    /// Returns whether every observation contains the same bytes here.
-    ///
-    /// Slots produced by [`infer`] cannot be constant because inference
-    /// only selects ranges where bytes change. This is useful for
-    /// validating slots constructed by other means.
-    pub fn is_constant(&self) -> bool {
-        self.samples.windows(2).all(|w| w[0] == w[1])
-    }
-}
-
-/// Why a set of observations cannot be analysed.
+/// Why a set of observations cannot be analyzed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffError {
     /// Fewer than two observations were provided, leaving nothing to compare.
@@ -326,7 +315,7 @@ fn accept(proposals: Vec<Proposal>, mask: &[bool], taken: &mut [bool], chosen: &
 ///
 /// Observations must contain the complete message body covered by the
 /// template, in order, and all must have the same length. Different
-/// lengths indicate variable-length fields, which cannot be analysed
+/// lengths indicate variable-length fields, which cannot be analyzed
 /// reliably and are rejected.
 pub fn infer(observations: &[Vec<u8>]) -> Result<Vec<InferredSlot>, DiffError> {
     let mask = changed_mask(observations)?;
@@ -499,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn the_value_is_recognised_as_a_double_despite_its_constant_high_byte() {
+    fn the_value_is_recognized_as_a_double_despite_its_constant_high_byte() {
         // Byte 10 is 0x40 in all seven observations because the value stays between 64 and 128.
         // A plain diff stops the run at byte 9, leaving the sign and exponent in the template.
         // That works for this window but fails as soon as the value becomes negative.
@@ -520,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn the_seconds_field_is_recognised_from_a_single_moving_byte() {
+    fn the_seconds_field_is_recognized_from_a_single_moving_byte() {
         // Only byte 11 changes because the timestamp advances by one second
         // per update. The upper seven bytes remain constant. The proposal is
         // accepted because every observation decodes to a plausible date
@@ -547,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn the_nanoseconds_field_is_recognised_and_not_shifted() {
+    fn the_nanoseconds_field_is_recognized_and_not_shifted() {
         // The changing run covers bytes 19..22, while byte 22 remains 0x09.
         // Two 4-byte windows overlap the run, but only one decodes to a value
         // below one billion in every observation.

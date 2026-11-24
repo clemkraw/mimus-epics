@@ -446,10 +446,10 @@ mod tests {
 
     #[test]
     fn a_slot_filled_with_something_other_than_what_was_seen_is_caught() {
-        // Previously, a generated double could overwrite a value slot that
-        // crossed a string length prefix. The message length and all bytes
-        // outside the slots still matched, so the shadow check passed.
-        // PVXS then decoded a 106-character string and closed the connection.
+        // A generated double can overwrite a value slot that crosses a
+        // string length prefix. The message length and all bytes outside the
+        // slots still match, so a check of those alone passes, and PVXS then
+        // decodes a 106-character string and closes the connection.
         //
         // Clearing the samples simulates this case by making the emitter
         // generate a value instead of replaying the captured bytes.
