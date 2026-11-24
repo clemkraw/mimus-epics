@@ -93,7 +93,10 @@ impl SearchResponder {
     /// consistent, but silently disables broadcast discovery. The socket
     /// still binds successfully and the responder appears active, yet
     /// clients receive no replies and cannot distinguish this from a
-    /// server that does not serve their channels.
+    /// server that does not serve their channels. A socket bound to one
+    /// address also takes the unicast searches sent to it away from a
+    /// server on the same host bound to the wildcard, and MIMUS does not
+    /// pass them on as a PVXS server does.
     pub async fn bind(
         bind_addr: &str,
         port: u16,
@@ -107,8 +110,10 @@ impl SearchResponder {
         if bind_addr != "0.0.0.0" {
             eprintln!(
                 "warning: the search responder is bound to {bind_addr}, which does \
-                 not receive broadcasts. Clients will find nothing. Use \
-                 --search-bind 0.0.0.0."
+                 not receive broadcasts: only clients that search {bind_addr} by \
+                 unicast will find these channels, and those searches no longer \
+                 reach another server on this host that listens on port {port}. \
+                 Use --search-bind 0.0.0.0."
             );
         }
         // Multicast support is best effort. Failure does not affect broadcast discovery,
