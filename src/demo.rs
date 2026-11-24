@@ -151,16 +151,50 @@ fn overrun_none() -> Vec<u8> {
     out
 }
 
+/// The changed-set of an opening message: bit 0, the whole structure.
+fn whole_value() -> Vec<u8> {
+    let mut out = Vec::new();
+    put_size(&mut out, 1, LE);
+    out.push(0b0000_0001);
+    out
+}
+
+/// The opening message: every field of the descriptor, in its order, with no
+/// alarm and a zero user tag.
+///
+/// A monitor starts with it and a `GET` is answered with it. Without one, a
+/// demo channel could be monitored but not read: a `GET` needs a complete
+/// value, and an update carries only the fields that changed.
+fn opening(name: &str, value: Slot) -> Template {
+    let mut alarm = Vec::new();
+    alarm.extend_from_slice(&0i32.to_le_bytes()); // severity
+    alarm.extend_from_slice(&0i32.to_le_bytes()); // status
+    put_string(&mut alarm, "", LE); // message
+    let mut t = Template::new(format!("{name}_initial"), MONITOR);
+    t.push_fixed(whole_value())
+        .push_slot(value)
+        .push_fixed(alarm)
+        .push_slot(
+            Slot::new(2, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds),
+        )
+        .push_slot(Slot::new(3, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos))
+        .push_fixed(0i32.to_le_bytes().to_vec()) // userTag
+        .push_fixed(overrun_none());
+    t.observations = 1000;
+    t
+}
+
 fn fixed_scalar(name: &str, type_id: u16, kind: u8, scalar: ScalarType, width: usize) -> Template {
+    let value =
+        || Slot::new(1, SlotWidth::Fixed { bytes: width }).with_role(SlotRole::Value { scalar });
     let mut t = Template::new(name, MONITOR);
     t.with_introspection(Introspection {
         full: ntscalar_descriptor(type_id, kind),
         id_only: Some(ntscalar_cached(type_id)),
     })
+    .with_initial(opening(name, value()))
     .push_fixed(changed_set())
-    .push_slot(
-        Slot::new(1, SlotWidth::Fixed { bytes: width }).with_role(SlotRole::Value { scalar }),
-    )
+    .push_slot(value())
     .push_slot(Slot::new(2, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds))
     .push_slot(Slot::new(3, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos))
     .push_fixed(overrun_none());
@@ -178,13 +212,16 @@ fn string_template(type_id: u16) -> Template {
         b"\x0c12:00:00.123".to_vec(),
         b"\x0812:00:01".to_vec(),
     ];
+    let value =
+        || Slot::new(1, SlotWidth::Variable { min: 9, max: 13 }).with_samples(samples.clone());
     let mut t = Template::new("string", MONITOR);
     t.with_introspection(Introspection {
         full: ntscalar_descriptor(type_id, code::STRING),
         id_only: Some(ntscalar_cached(type_id)),
     })
+    .with_initial(opening("string", value()))
     .push_fixed(changed_set())
-    .push_slot(Slot::new(1, SlotWidth::Variable { min: 9, max: 13 }).with_samples(samples))
+    .push_slot(value())
     .push_slot(Slot::new(2, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds))
     .push_slot(Slot::new(3, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos))
     .push_fixed(overrun_none());
@@ -284,6 +321,39 @@ mod tests {
             !p.template("string").unwrap().is_fixed_width(),
             "a demo that only covers fixed-width templates proves half the emitter"
         );
+    }
+
+    #[test]
+    fn every_demo_message_decodes_against_its_descriptor() {
+        // A GET is answered with the opening message, so a template without
+        // one leaves its channels monitorable but unreadable. Each message
+        // must also be a complete value for the descriptor it is sent under:
+        // the client walks it field by field and rejects a short or long one.
+        use mimus_emit::{Compiled, EpicsTime};
+        use mimus_wire::pvdata::Descriptor;
+        let now = EpicsTime {
+            seconds: 1_100_000_000,
+            nanos: 123_456_789,
+        };
+        for t in &build().templates {
+            let desc = Descriptor::from_init_reply(&t.introspection.as_ref().unwrap().full, LE)
+                .unwrap_or_else(|e| panic!("{}: descriptor: {e}", t.name));
+            let compiled = Compiled::new(t).unwrap();
+            let opening = compiled
+                .initial
+                .as_deref()
+                .unwrap_or_else(|| panic!("{} has no opening message", t.name));
+            for (what, c) in [("opening", opening), ("update", &compiled)] {
+                for step in 0..4 {
+                    let mut body = Vec::new();
+                    c.render(step, 7, now, &mut body);
+                    let at = desc
+                        .locate(&body)
+                        .unwrap_or_else(|e| panic!("{} {what} step {step}: {e}", t.name));
+                    assert!(at.stamp.is_some(), "{} {what} carries no timestamp", t.name);
+                }
+            }
+        }
     }
 
     #[test]
