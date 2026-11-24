@@ -33,7 +33,7 @@ pub enum Chunk {
     Slot { id: u16 },
 }
 
-/// The introspection payload sent by PVXS during monitor initialisation.
+/// The introspection payload sent by PVXS during monitor initialization.
 ///
 /// MIMUS replays these bytes unchanged without interpreting the type
 /// descriptor, keeping it independent of PVXS type definitions.

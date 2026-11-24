@@ -371,13 +371,14 @@ mod tests {
             Manifest {
                 pvxs_version: "test".into(),
                 epics_base_version: "test".into(),
-                catalogue_sha256: "0".repeat(64),
+                catalogue_checksum: "0".repeat(64),
                 host: "test".into(),
                 captured_at: "posix:0".into(),
                 mimus_version: "0.1.0".into(),
                 study_duration_s: 30.0,
                 pvs_observed: 2,
                 synthetic: false,
+                incomplete: false,
             },
             SessionRules::default(),
         );
@@ -429,8 +430,8 @@ mod tests {
         // Binding to a specific host address can fail silently: the responder
         // starts and reports itself active, but receives no broadcasts because
         // they target a subnet address rather than an individual host.
-        // This previously left the entire discovery group unable to find
-        // the server, with no indication that discovery was not working.
+        // Every client that discovers by broadcast is then unable to find
+        // the server, with no indication that discovery is not working.
         let fleet = Arc::new(test_fleet(4, 1));
         let iocs = vec![IocEndpoint {
             index: 0,

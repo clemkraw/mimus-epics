@@ -332,7 +332,7 @@ pub async fn observe(
                         // The descriptor form matters: an identifier-only response means
                         // this channel reuses a descriptor already sent on this connection.
                         let shape = descriptor_shape(&body);
-                        if shape == Descriptor::Unrecognised && unknown_descriptors == 0 {
+                        if shape == Descriptor::Unrecognized && unknown_descriptors == 0 {
                             // Report the bytes received rather than guessing
                             // which descriptor format they represent.
                             let head: Vec<String> =
@@ -344,7 +344,7 @@ pub async fn observe(
                                 head.join(" ")
                             );
                         }
-                        if shape == Descriptor::Unrecognised {
+                        if shape == Descriptor::Unrecognized {
                             unknown_descriptors += 1;
                         }
                         // Only the explicitly cached form omits the inline
@@ -398,8 +398,8 @@ pub enum Descriptor {
     Inline,
     /// A reference to a type descriptor already cached by the peer.
     Cached,
-    /// An unrecognised form.
-    Unrecognised,
+    /// An unrecognized form.
+    Unrecognized,
 }
 
 /// Identifies the type descriptor form in a monitor INIT reply.
@@ -421,25 +421,45 @@ pub fn descriptor_shape(body: &[u8]) -> Descriptor {
     const UNION: u8 = 0x81;
     const VARIANT_UNION: u8 = 0x82;
 
-    let Some(first) = body.first() else {
-        return Descriptor::Unrecognised;
-    };
-    let offset = if *first == 0xFF {
-        1
-    } else {
-        let mut r = Reader::new(body, ByteOrder::Little);
-        if r.u8().is_err() || r.string().is_err() || r.string().is_err() {
-            return Descriptor::Unrecognised;
-        }
-        r.position()
+    let Some(offset) = marker_offset(body) else {
+        return Descriptor::Unrecognized;
     };
 
     match body.get(offset) {
         Some(&FULL_WITH_ID) => Descriptor::FullWithId,
         Some(&ONLY_ID) => Descriptor::Cached,
         Some(&STRUCTURE) | Some(&UNION) | Some(&VARIANT_UNION) => Descriptor::Inline,
-        _ => Descriptor::Unrecognised,
+        _ => Descriptor::Unrecognized,
     }
+}
+
+/// Where the descriptor marker sits in a monitor INIT reply: just past the
+/// status, whose length varies (see [`descriptor_shape`]).
+fn marker_offset(body: &[u8]) -> Option<usize> {
+    if *body.first()? == 0xFF {
+        return Some(1);
+    }
+    let mut r = Reader::new(body, ByteOrder::Little);
+    if r.u8().is_err() || r.string().is_err() || r.string().is_err() {
+        return None;
+    }
+    Some(r.position())
+}
+
+/// The registry ID of the type in a monitor INIT reply: the two bytes after
+/// the marker, whether the descriptor is sent in full (`0xFD`) or only
+/// referred to (`0xFE`). `None` for an inline descriptor, which has no ID.
+///
+/// A server that caches descriptors sends a type in full on its first
+/// subscription over a connection and only this ID on the later ones, so
+/// the ID is what ties a channel that received the short form to its type.
+pub fn descriptor_id(body: &[u8]) -> Option<[u8; 2]> {
+    match descriptor_shape(body) {
+        Descriptor::FullWithId | Descriptor::Cached => {}
+        _ => return None,
+    }
+    let at = marker_offset(body)? + 1;
+    body.get(at..at + 2)?.try_into().ok()
 }
 
 /// Returns a descriptor key with its registry ID cleared, for grouping
@@ -458,18 +478,10 @@ pub fn descriptor_key(body: &[u8]) -> Vec<u8> {
     if descriptor_shape(body) != Descriptor::FullWithId {
         return key;
     }
-    // The two bytes after the marker contain the ID. Locate the marker
-    // using the same status parsing as descriptor_shape.
-    let offset = if body.first() == Some(&0xFF) {
-        1
-    } else {
-        let mut r = Reader::new(body, ByteOrder::Little);
-        if r.u8().is_err() || r.string().is_err() || r.string().is_err() {
-            return key;
-        }
-        r.position()
-    };
-    if let Some(slot) = key.get_mut(offset + 1..offset + 3) {
+    // The two bytes after the marker contain the ID.
+    if let Some(offset) = marker_offset(body)
+        && let Some(slot) = key.get_mut(offset + 1..offset + 3)
+    {
         slot.fill(0);
     }
     key
@@ -633,7 +645,7 @@ mod search_tests {
 
 #[cfg(test)]
 mod descriptor_tests {
-    use super::{Descriptor, descriptor_shape};
+    use super::{Descriptor, descriptor_id, descriptor_shape};
 
     #[test]
     fn a_one_byte_ok_status_is_understood() {
@@ -652,8 +664,8 @@ mod descriptor_tests {
     fn a_descriptor_written_inline_is_full_not_cached() {
         // Servers without an introspection registry write the type directly,
         // starting with the structure code. This is a complete descriptor.
-        // Previously, it was treated as unrecognized and then as cached,
-        // leaving channels that referenced a descriptor never received.
+        // Taking it for an unrecognized form, and then for a cached one,
+        // would leave channels referring to a descriptor never received.
         assert_eq!(
             descriptor_shape(&[0xFF, 0x80, 0x15, b'e', b'p', b'i']),
             Descriptor::Inline
@@ -678,6 +690,19 @@ mod descriptor_tests {
     }
 
     #[test]
+    fn the_full_and_the_cached_form_of_a_type_carry_the_same_id() {
+        // A caching server: the first channel of a type gets the descriptor
+        // in full, the next only its ID. The ID ties them together.
+        let full = [0xFF, 0xFD, 0x07, 0x00, 0x80, 0x00, 0x00];
+        let cached = [0x00, 0xFF, 0xFF, 0xFE, 0x07, 0x00];
+        assert_eq!(descriptor_id(&full), Some([0x07, 0x00]));
+        assert_eq!(descriptor_id(&cached), Some([0x07, 0x00]));
+        // An inline descriptor has no ID to tie anything to.
+        assert_eq!(descriptor_id(&[0xFF, 0x80, 0x00, 0x00]), None);
+        assert_eq!(descriptor_id(&[0xFF, 0xFE, 0x07]), None, "truncated");
+    }
+
+    #[test]
     fn a_status_carrying_text_is_skipped_correctly() {
         let mut body = vec![0x01]; // Warning status
         body.push(2);
@@ -691,8 +716,8 @@ mod descriptor_tests {
     fn only_the_cached_marker_means_cached() {
         // Unknown or malformed shapes must not be mistaken for cached
         // descriptors, which could leave the calibration without a type.
-        assert_eq!(descriptor_shape(&[]), Descriptor::Unrecognised);
-        assert_eq!(descriptor_shape(&[0xFF]), Descriptor::Unrecognised);
+        assert_eq!(descriptor_shape(&[]), Descriptor::Unrecognized);
+        assert_eq!(descriptor_shape(&[0xFF]), Descriptor::Unrecognized);
         assert_ne!(descriptor_shape(&[0xFF, 0x43]), Descriptor::Cached);
     }
 }

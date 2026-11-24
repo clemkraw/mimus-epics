@@ -8,15 +8,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How the server sends type descriptors on a new connection.
+/// How the server sends type descriptors when a monitor or a `GET` opens.
 ///
-/// PVA caches introspection data per connection. The first channel
-/// of each type carries the full descriptor; subsequent channels carry
-/// only its identifier. For 100,000 channels of one type, that means
-/// one full descriptor and 99,999 identifiers.
+/// PVAccess lets a server cache introspection data per connection: the
+/// first channel of a type carries the full descriptor, later ones only its
+/// identifier, so 100,000 channels of one type cost one full descriptor and
+/// 99,999 identifiers. PVXS does not do this and sends the full descriptor
+/// every time. Calibration records which of the two the reference server
+/// did, and MIMUS does the same: either choice made for the other server
+/// would misstate the cost of setting up subscriptions.
 ///
-/// Replaying the full descriptor for every channel would overstate
-/// connection setup costs and distort benchmark results.
+/// The default, used only by profiles built in code, is the caching form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DescriptorPolicy {
@@ -105,8 +107,16 @@ pub struct Manifest {
     pub pvxs_version: String,
     /// EPICS Base version of the reference IOC.
     pub epics_base_version: String,
-    /// SHA-256 of the catalogue database, in lowercase hex.
-    pub catalogue_sha256: String,
+    /// Checksum of the catalogue databases passed to `mimus calibrate`
+    /// with `--catalogue`, one `fnv1a64:<hash>:<size>` per database, joined
+    /// by `+` in the order given. Enough to notice a changed catalogue, not
+    /// a cryptographic digest. `unspecified` when no database was given,
+    /// `unavailable` when one could not be read.
+    ///
+    /// Profiles written before this field had its name call it
+    /// `catalogue_sha256`; they are still read.
+    #[serde(alias = "catalogue_sha256")]
+    pub catalogue_checksum: String,
     /// Host on which calibration ran.
     pub host: String,
     /// Calibration timestamp in RFC 3339 format.
@@ -124,6 +134,13 @@ pub struct Manifest {
     /// calibration results and must not be presented as measurements.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub synthetic: bool,
+    /// Whether `mimus calibrate --allow-incomplete` wrote the profile
+    /// without its completeness criterion met.
+    ///
+    /// Such a profile serves, but some channels were not observed long
+    /// enough to trust their templates, so it is not a measurement basis.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
 }
 
 impl Manifest {
@@ -133,20 +150,38 @@ impl Manifest {
             "PVXS {} / base {} / catalogue {} / {} PVs / {}",
             self.pvxs_version,
             self.epics_base_version,
-            &self.catalogue_sha256[..self.catalogue_sha256.len().min(12)],
+            &self.catalogue_checksum[..self.catalogue_checksum.len().min(12)],
             self.pvs_observed,
             self.captured_at
         )
     }
 
-    /// Returns whether both profiles were captured from the same environment.
+    /// Whether the manifest says which environment produced the profile:
+    /// both versions given, the catalogue recorded, and not hand-written.
+    ///
+    /// `mimus calibrate` writes `unknown` for a version it was not given and
+    /// `unspecified` or `unavailable` for a catalogue it could not record.
+    pub fn environment_known(&self) -> bool {
+        let given = |v: &str| !matches!(v, "" | "unknown" | "unspecified" | "unavailable");
+        !self.synthetic
+            && given(&self.pvxs_version)
+            && given(&self.epics_base_version)
+            && given(&self.catalogue_checksum)
+    }
+
+    /// Returns whether both profiles were captured from the same, known
+    /// environment.
     ///
     /// Used by `mimus inspect --diff` to distinguish MIMUS regressions
-    /// from changes in PVXS wire behavior.
+    /// from changes in PVXS wire behavior. Two profiles whose environment is
+    /// not recorded do not share one: `unknown` matching `unknown` says
+    /// nothing about the IOC behind either.
     pub fn same_environment(&self, other: &Self) -> bool {
-        self.pvxs_version == other.pvxs_version
+        self.environment_known()
+            && other.environment_known()
+            && self.pvxs_version == other.pvxs_version
             && self.epics_base_version == other.epics_base_version
-            && self.catalogue_sha256 == other.catalogue_sha256
+            && self.catalogue_checksum == other.catalogue_checksum
     }
 }
 
@@ -158,18 +193,28 @@ mod tests {
         Manifest {
             pvxs_version: "1.4.2".into(),
             epics_base_version: "7.0.8".into(),
-            catalogue_sha256: "a".repeat(64),
+            catalogue_checksum: "a".repeat(64),
             host: "bench01".into(),
             captured_at: "2026-08-15T12:00:00Z".into(),
             mimus_version: "0.1.0".into(),
             study_duration_s: 42.0,
             pvs_observed: 20,
             synthetic: false,
+            incomplete: false,
         }
     }
 
     #[test]
-    fn descriptor_policy_defaults_to_the_pvxs_behaviour() {
+    fn a_manifest_written_under_the_old_checksum_name_still_reads() {
+        let m = manifest();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"catalogue_checksum\""));
+        let old = json.replace("\"catalogue_checksum\"", "\"catalogue_sha256\"");
+        assert_eq!(serde_json::from_str::<Manifest>(&old).unwrap(), m);
+    }
+
+    #[test]
+    fn descriptor_policy_defaults_to_the_caching_form() {
         assert_eq!(
             SessionRules::default().descriptor_policy,
             DescriptorPolicy::FullThenId
@@ -211,6 +256,24 @@ mod tests {
 
         b.pvxs_version = "1.5.0".into();
         assert!(!a.same_environment(&b));
+    }
+
+    #[test]
+    fn an_unrecorded_environment_is_never_the_same_as_another() {
+        for unrecorded in [
+            |m: &mut Manifest| m.pvxs_version = "unknown".into(),
+            |m: &mut Manifest| m.epics_base_version = "unknown".into(),
+            |m: &mut Manifest| m.catalogue_checksum = "unspecified".into(),
+            |m: &mut Manifest| m.catalogue_checksum = "unavailable".into(),
+            |m: &mut Manifest| m.synthetic = true,
+        ] {
+            let mut a = manifest();
+            unrecorded(&mut a);
+            let b = a.clone();
+            assert!(!a.environment_known());
+            assert!(!a.same_environment(&b), "{a:?}");
+        }
+        assert!(manifest().environment_known());
     }
 
     #[test]
