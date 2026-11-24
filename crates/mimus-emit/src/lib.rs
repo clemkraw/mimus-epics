@@ -7,7 +7,8 @@
 //! The main components:
 //!
 //! - [`Compiled`]: a learned template compiled once for fast rendering.
-//! - [`Wheel`]: one timing wheel for the process instead of one timer per PV.
+//! - [`Wheel`]: one timing wheel per rate on each connection, instead of one
+//!   timer per PV.
 //! - [`Counters`]: emission statistics that let consumers verify the
 //!   conservation of updates.
 //!
