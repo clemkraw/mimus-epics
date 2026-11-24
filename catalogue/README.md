@@ -96,7 +96,7 @@ so they hold one element that changes every scan.
 | structure | every NTScalar, NTScalarArray and NTEnum; nested in `MIM:GRP:*` |
 | variant union (`any`) | `MIM:GRP:0`, `MIM:GRP:1`, member `y_any` |
 
-### Behaviours
+### Behaviors
 
 Type codes are not the whole story. The catalogue also makes the IOC emit
 these, because each exercises a decode path nothing else reaches:
@@ -145,7 +145,8 @@ What a profile does not reproduce:
 
 - **Static channels.** Every type here has a moving channel listed first,
   so its static channels share the moving template. A type whose channels
-  were all static would get a static template instead.
+  were all static would get a static template instead, whose channels send
+  their opening message and nothing after it.
 - **Alarm transitions.** The alarm changed-sets are recorded in the profile,
   under `session_rules.changed_sets`, and `mimus inspect` reports how much
   of the traffic the dominant one covers. Templates emit the dominant one
@@ -222,13 +223,15 @@ update carries only the ones that changed.
 ## Version pinning
 
 A profile is only meaningful alongside the environment that produced it.
-The manifest records the PVXS and EPICS base versions, a checksum of the
+The manifest records the PVXS and EPICS base versions, a checksum of each
 database passed with `--catalogue` (FNV-1a 64-bit and size, enough to
-notice a changed catalogue), the host, the date and the MIMUS version:
+notice a changed catalogue, not a cryptographic digest), the host, the date
+and the MIMUS version:
 
 ```bash
 mimus calibrate --addr 127.0.0.1:5075 \
-    --channels catalogue/channels.txt --catalogue catalogue/catalogue.db \
+    --channels catalogue/channels.txt \
+    --catalogue catalogue/catalogue.db --catalogue catalogue/catalogue-groups.db \
     --pvxs-version <PVXS version> --epics-version <EPICS base version> \
     --out profile.json
 ```
@@ -238,7 +241,8 @@ mimus calibrate --addr 127.0.0.1:5075 \
 Comparing two profiles across a PVXS upgrade is also a wire-behavior
 change detector for PVXS itself. `mimus inspect a.json --diff b.json` lists
 the differences, and exits nonzero when the two profiles come from the same
-environment and still differ in their types or type descriptors. Differences
+environment (versions and catalogue checksums recorded and equal) and still
+differ in their types or type descriptors. Differences
 in shape are expected between any two calibrations: which bytes are fixed
 depends on what moved while each profile was observed.
 
