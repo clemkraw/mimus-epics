@@ -201,13 +201,25 @@ impl Fleet {
         let per_ioc = spec.pvs.div_ceil(spec.iocs as u32);
         let mut per_ioc_seen = vec![0u32; spec.iocs as usize];
         for i in 0..spec.pvs {
-            let template = pattern[(i as usize) % pattern.len()];
             let ioc = match spec.layout {
                 Layout::RoundRobin => (i % spec.iocs as u32) as u16,
                 Layout::Blocked => ((i / per_ioc) as u16).min(spec.iocs - 1),
             };
             let index_in_ioc = per_ioc_seen[ioc as usize];
             per_ioc_seen[ioc as usize] += 1;
+
+            // Under round-robin, an IOC receives every `iocs`-th channel.
+            // Taking its template and rate from the global index would give
+            // it only the positions of the pattern that share its residue:
+            // with a 3:1 mix over four IOCs, three IOCs of one type and one
+            // of the other. Counting from the channel's place within its IOC,
+            // offset by the IOC, gives every IOC the whole mix, as the
+            // blocked layout does.
+            let position = match spec.layout {
+                Layout::RoundRobin => index_in_ioc + u32::from(ioc),
+                Layout::Blocked => i,
+            };
+            let template = pattern[(position as usize) % pattern.len()];
 
             let name = spec.names.expand(&NameContext {
                 index: i,
@@ -221,7 +233,7 @@ impl Fleet {
             // the same stream of opening-message samples.
             instances.push(
                 Instance::new(template, ioc, i as u64 + 1)
-                    .with_rate_group(spec.rate_mix.group_of(i)),
+                    .with_rate_group(spec.rate_mix.group_of(position)),
             );
         }
 
@@ -470,6 +482,42 @@ mod tests {
         assert_eq!(f.instances[0].ioc, 0);
         assert_eq!(f.instances[1].ioc, 1);
         assert_eq!(f.instances[4].ioc, 0);
+    }
+
+    #[test]
+    fn round_robin_gives_every_ioc_the_whole_mix() {
+        // With a 3:1 mix over four IOCs, taking templates from the global
+        // index put the minority template on one IOC and nowhere else.
+        let f = Fleet::build(&profile(), &spec(4, 1000, Layout::RoundRobin)).unwrap();
+        for ioc in 0..4u16 {
+            let of = |t: u16| {
+                f.instances
+                    .iter()
+                    .filter(|i| i.ioc == ioc && i.template == t)
+                    .count()
+            };
+            assert_eq!(
+                (of(0), of(1)),
+                (187 + usize::from(ioc < 2), 62 + usize::from(ioc >= 2)),
+                "IOC {ioc}"
+            );
+        }
+        assert_eq!(f.template_counts(), vec![("dbl", 750), ("int", 250)]);
+    }
+
+    #[test]
+    fn round_robin_gives_every_ioc_every_rate() {
+        let mut s = spec(2, 1000, Layout::RoundRobin);
+        s.rate_mix = RateMix::parse("10:1,1:1").unwrap();
+        let f = Fleet::build(&profile(), &s).unwrap();
+        for ioc in 0..2u16 {
+            let fast = f
+                .instances
+                .iter()
+                .filter(|i| i.ioc == ioc && i.rate_group == 0)
+                .count();
+            assert_eq!(fast, 250, "IOC {ioc} carries half its channels at 10 Hz");
+        }
     }
 
     #[test]
