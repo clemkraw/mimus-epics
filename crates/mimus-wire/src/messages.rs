@@ -826,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pipeline_ack_is_recognised_and_decoded() {
+    fn a_pipeline_ack_is_recognized_and_decoded() {
         let mut p = Vec::new();
         put_i32(&mut p, 900, LE);
         put_i32(&mut p, 5, LE);
