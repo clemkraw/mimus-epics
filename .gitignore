@@ -1,7 +1,6 @@
 /target
 .idea
 *.profile.json
-/tests/fixtures/**/*.pcap
 
 # Calibrated profile and benchmark run directories
 /profile.json

@@ -26,7 +26,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 name = "mimus-epics"
 version = "0.1.0"
 edition = "2024"
-description = "Mirrored IOC Model for Ultra-Scale Simulation : a self-calibrating PVAccess traffic generator"
+description = "Mirrored IOC Model for Ultra-Scale Simulation of EPICS control systems: a self-calibrating PVAccess traffic generator"
 license = "MIT"
 repository = "https://github.com/clemkraw/mimus-epics"
 
