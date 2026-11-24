@@ -277,11 +277,11 @@ impl Session {
         // The timer drives emission and is only needed while there are
         // subscriptions to serve.
         //
-        // Previously, idle connections still woke up a thousand times per
-        // second. Profiling an idle session showed timer processing and
-        // `Sleep::poll` among the largest costs, outweighing MIMUS's own
-        // work. An archiver opening hundreds of connections incurred this
-        // overhead on every connection, even before receiving an update.
+        // An idle connection that still woke up a thousand times per second
+        // would spend more on timer processing and `Sleep::poll` than MIMUS
+        // spends on its own work, as profiling an idle session shows, and an
+        // archiver opening hundreds of connections would pay that on every
+        // one of them before receiving a single update.
         //
         // Create the interval once and let the select guard disable polling
         // while the schedule is empty. It is not rebuilt on each tick.
@@ -394,7 +394,7 @@ impl Session {
                         && frame.command() == commands::CONNECTION_VALIDATION
                     {
                         // Decode the response using the byte order declared in its own header.
-                        // Although the only field we use is the authentication string, whose
+                        // Although the only field used is the authentication string, whose
                         // length is one byte, other fields may depend on byte order.
                         // Using a connection-wide order here would fail on later messages
                         // such as search requests.
@@ -611,15 +611,21 @@ impl Session {
         if req.is_start() {
             let mut emit_now = false;
             let mut group = 0u16;
+            let mut steady = false;
             if let Some(mon) = self.monitors.get_mut(&req.request_id)
                 && !mon.started
             {
                 mon.started = true;
-                group = self.fleet.instances[mon.instance as usize].rate_group;
+                let instance = &self.fleet.instances[mon.instance as usize];
+                group = instance.rate_group;
+                steady = !self.fleet.templates[usize::from(instance.template)].is_static();
                 emit_now = true;
             }
             if emit_now {
-                self.schedule.insert(group, req.request_id);
+                // A static template has nothing to send after its opening.
+                if steady {
+                    self.schedule.insert(group, req.request_id);
+                }
                 if let Some(shared) = &self.shared {
                     shared.subscription_started();
                 }
@@ -797,44 +803,27 @@ impl Session {
 
     /// Calculates how many scheduler steps are due based on elapsed time.
     ///
-    /// The wheel previously advanced by one step per timer wakeup, making
-    /// the delivered rate depend on timer accuracy rather than the configured
-    /// rate. In one measurement, a 1 ms interval fired at about 660 Hz, so a
-    /// fleet configured for 20 Hz delivered only 13.9 Hz. Nearly a third of
-    /// the requested load was missing, despite the machine being 93% idle.
+    /// The wheel advances by the time that has passed, not by one step per
+    /// timer wakeup. A timer does not fire as often as asked: a 1 ms interval
+    /// measured firing at about 660 Hz would turn a fleet configured for
+    /// 20 Hz into one delivering 13.9 Hz, on a machine 93% idle. For a load
+    /// generator that shortfall would be silent, and the consumer's
+    /// measurements wrong.
     ///
-    /// Advancing according to elapsed time keeps the delivered rate aligned
-    /// with the configured rate, regardless of timer granularity or jitter.
-    /// This is essential for a load generator: an unreported shortfall makes
-    /// the consumer's measurements misleading.
-    ///
-    /// Catch-up is capped to avoid emitting a large burst after a pause, such
-    /// as a debugger stop, laptop suspension, or long GC pause. Any excess
-    /// elapsed time is skipped, and the tick is counted as late.
+    /// See [`catch_up`] for what happens when the session falls far behind.
     fn steps_due(&mut self, clock: std::time::Instant) -> u32 {
-        const MAX_CATCH_UP: u32 = 16;
-
         let period = std::time::Duration::from_micros(self.cfg.tick_us.max(1));
         let Some(prev) = self.last_tick else {
             self.last_tick = Some(clock);
             return 1;
         };
-        let elapsed = clock.duration_since(prev);
-        let steps = (elapsed.as_nanos() / period.as_nanos().max(1)) as u64;
-        if steps == 0 {
-            // The timer woke before the next step was due. Do not advance
-            // the wheel, or it would run faster than the configured rate.
-            return 0;
-        }
-        let capped = steps.min(MAX_CATCH_UP as u64) as u32;
-        if steps > MAX_CATCH_UP as u64 {
+        let (steps, now, late) = catch_up(prev, clock, period);
+        if late {
             self.counters.late_ticks += 1;
             self.pending.late_ticks += 1;
         }
-        // Advance only by the steps processed. Any excess time is skipped
-        // rather than being counted again on the next tick.
-        self.last_tick = Some(prev + period * capped);
-        capped
+        self.last_tick = Some(now);
+        steps
     }
 
     fn emit_due(&mut self) {
@@ -1108,6 +1097,39 @@ fn restamp(desc: &Descriptor, body: &mut [u8], when: EpicsTime) -> Option<usize>
     Some(at.value_end)
 }
 
+/// The most steps a session runs in one wakeup to catch up.
+const MAX_CATCH_UP: u32 = 16;
+
+/// How far the wheel advances when the timer fires at `clock`, the wheel
+/// having last advanced to `prev`.
+///
+/// Returns the steps to run now, the instant they bring the wheel to, and
+/// whether the session fell so far behind that time was skipped. Up to
+/// [`MAX_CATCH_UP`] steps are run, so a short delay is made up. Past that,
+/// after a debugger stop, a suspended machine, or a session that cannot
+/// keep up, the rest is skipped rather than sent later as a burst: the
+/// wheel jumps to `clock`, and the caller counts a late tick. What was
+/// skipped is never sent, so a late tick means the offered load was not
+/// delivered in full.
+fn catch_up(
+    prev: std::time::Instant,
+    clock: std::time::Instant,
+    period: std::time::Duration,
+) -> (u32, std::time::Instant, bool) {
+    let elapsed = clock.saturating_duration_since(prev);
+    let steps = elapsed.as_nanos() / period.as_nanos().max(1);
+    if steps == 0 {
+        // The timer woke before the next step was due. Advancing anyway
+        // would run the wheel faster than the configured rate.
+        return (0, prev, false);
+    }
+    if steps > u128::from(MAX_CATCH_UP) {
+        return (MAX_CATCH_UP, clock, true);
+    }
+    let steps = steps as u32;
+    (steps, prev + period * steps, false)
+}
+
 /// Returns the last processing time for a channel, used to timestamp GET
 /// responses and monitor opening messages.
 ///
@@ -1146,4 +1168,38 @@ fn phase_of(seed: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_short_delay_is_made_up() {
+        let t0 = Instant::now();
+        let p = Duration::from_millis(1);
+        assert_eq!(catch_up(t0, t0 + p / 2, p), (0, t0, false));
+        let (steps, now, late) = catch_up(t0, t0 + p * 3 + p / 2, p);
+        assert_eq!((steps, now, late), (3, t0 + p * 3, false));
+        // The half period left over is kept for the next wakeup.
+        assert_eq!(catch_up(now, t0 + p * 4, p).0, 1);
+    }
+
+    #[test]
+    fn a_long_stall_is_skipped_not_sent_as_a_burst() {
+        // 100 steps behind: 16 are run, the rest is skipped and the tick
+        // counted late. Carrying the rest over would send it at 16 steps
+        // per wakeup until caught up, a burst that the late count would
+        // then misdescribe as load not delivered.
+        let t0 = Instant::now();
+        let p = Duration::from_millis(1);
+        let clock = t0 + p * 100;
+        assert_eq!(catch_up(t0, clock, p), (MAX_CATCH_UP, clock, true));
+        assert_eq!(
+            catch_up(clock, clock, p),
+            (0, clock, false),
+            "nothing is left over"
+        );
+    }
 }

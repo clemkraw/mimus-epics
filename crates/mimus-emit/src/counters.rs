@@ -24,8 +24,9 @@ pub struct Counters {
     /// Nonzero only under the strict policy. High values indicate that
     /// the consumer, rather than the emitter, is the bottleneck.
     pub flow_control_holds: u64,
-    /// Ticks that ran late because the emitter could not finish a bucket
-    /// on time. Nonzero values mean the configured rate was not delivered.
+    /// Times a session fell more than 16 ticks behind and skipped the rest
+    /// instead of sending it late. What was skipped is never sent, so a
+    /// nonzero value means the configured rate was not delivered in full.
     pub late_ticks: u64,
     /// Number of wheel steps taken, used as the denominator for reported rates.
     ///
