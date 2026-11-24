@@ -159,14 +159,28 @@ pub fn finish(
              a consumer at the addresses above."
         );
     } else if offered > 0.0 && achieved < offered * 0.95 {
+        // Under drop, the updates discarded for a slow consumer are part of
+        // the gap; only what remains beyond them is the emitter's.
+        let cause = if run.backpressure == "drop" {
+            let dropped = if elapsed_s > 0.0 {
+                counters.dropped_backpressure as f64 / elapsed_s
+            } else {
+                0.0
+            };
+            format!(
+                "{dropped:.0}/s of it were updates dropped because the consumer fell \
+                 behind; any shortfall beyond those means MIMUS itself could not keep up \
+                 and the run is not a valid measurement"
+            )
+        } else {
+            "the gap is the consumer's absorption limit".to_string()
+        };
         println!();
         println!(
             "note: achieved {achieved:.0}/s against {offered:.0}/s offered across all {} \
              channels. MIMUS only sends to subscribed channels, so the gap measures \
              something only if every channel was subscribed for the whole run. If it \
-             was: under the block policy the gap is the consumer's absorption limit; \
-             under drop, MIMUS itself could not keep up and the run is not a valid \
-             measurement.",
+             was, {cause}.",
             run.pvs
         );
         if counters.late_ticks > 0 {
