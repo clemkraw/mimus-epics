@@ -157,7 +157,7 @@ impl Profile {
             "observed"
         };
         format!(
-            "{} PVs {how} → {} distinct templates",
+            "{} PVs {how} -> {} distinct templates",
             self.assignments.len(),
             self.templates.len()
         )
@@ -332,7 +332,7 @@ mod tests {
         );
         assert_eq!(
             p.coverage_summary(),
-            "3 PVs observed → 2 distinct templates"
+            "3 PVs observed -> 2 distinct templates"
         );
         let mut synthetic = p.clone();
         synthetic.manifest.synthetic = true;
