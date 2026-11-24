@@ -88,7 +88,7 @@ This is what makes fidelity a verified property rather than a claim - see [Fidel
 
 ### 3 · Generate
 
-`mimus serve` loads the profile, replicates its templates across the requested number of channels and opens one listening socket per virtual IOC. Each socket behaves as an independent IOC: it validates the connection, answers searches, creates channels, serves `GET`, `GET_FIELD` and `MONITOR` (with pipelining), answers echoes, and then emits.
+`mimus serve` loads the profile, replicates its templates across the requested number of channels and opens one listening socket per virtual IOC. Each socket behaves as an independent IOC: it validates the connection, answers searches, creates channels, serves `GET`, `GET_FIELD` and `MONITOR` (with pipelining), answers echoes, and then emits. `PUT` and `RPC` are refused with an error status, as PVXS refuses an operation a channel does not implement.
 
 Emission runs on a timing wheel. At each tick, the channels due in that bucket have their compiled template copied into the connection's write buffer with the value and timestamp slots written in place.
 
@@ -165,10 +165,10 @@ mimus demo-profile  write a hand-made profile for trying the server out
 | `--pvs` | `1000` | Total channels across the fleet |
 | `--iocs` | `1` | Virtual IOCs, one listening port each. A consumer typically runs one task per connection, so this caps how far its work can spread across cores |
 | `--rate-hz` | `1` | Updates per second per channel. Offered load is `pvs × rate` |
-| `--rate-mix` | - | Several rates at once: `10:2,1:60,0.1:38` puts 2 % of channels at 10 Hz, 60 % at 1 Hz, 38 % at 0.1 Hz. Overrides `--rate-hz` |
+| `--rate-mix` | - | Several rates at once: `10:2,1:60,0.1:38` puts 2 % of channels at 10 Hz, 60 % at 1 Hz, 38 % at 0.1 Hz. Shares are relative. Overrides `--rate-hz` |
 | `--mix` | every template, equal shares | Which templates to serve and in what proportion: `ntscalar_f64:3,ntscalar_i32:1` |
-| `--layout` | `blocked` | `blocked` gives each IOC a contiguous range of channels, as a facility does; `round-robin` interleaves them |
-| `--prefix` | `MIM` | Prefix of the default names |
+| `--layout` | `blocked` | `blocked` gives each IOC a contiguous range of channels, as a facility does; `round-robin` interleaves them, each IOC still getting every template and rate of the mix |
+| `--prefix` | `MIM` | Prefix of the default names; a `--name-template` replaces it |
 | `--name-template` | `{prefix}:{t}:{i}` | Name pattern. Tokens: `{i}` global index, `{ioc}` IOC index, `{n}` index within the IOC, `{t}` template; `{i:06}` pads. Real names run to 30 or 40 characters, which drives a consumer's memory for name maps |
 
 **Network and discovery**
@@ -186,18 +186,17 @@ mimus demo-profile  write a hand-made profile for trying the server out
 |---|---|---|
 | `--backpressure` | `block` | `block` lets TCP throttle MIMUS; `drop` holds the nominal rate and counts what it discards (see below) |
 | `--high-water` | `1048576` | Bytes allowed to queue per connection before `drop` discards: the stand-in for an IOC's monitor queue |
-| `--pipeline` | `permissive` | `strict` withholds updates from a pipelined client with no credit left, as PVXS does; `permissive` only counts credits |
-| `--initial-credits` | `4` | Credits a pipelined monitor starts with |
+| `--pipeline` | `permissive` | `strict` withholds updates from a pipelined monitor with no credit left, as PVXS does: the credit starts at the client's queue size and grows with each acknowledgement. `permissive` only counts acknowledgements |
 | `--always-full-descriptor` | off | Send the full type descriptor on every monitor, whatever the profile recorded |
-| `--tick-us` | `1000` | Scheduler resolution; lower it for rates above a few hundred hertz |
+| `--tick-us` | `1000` | Scheduler resolution, from 1 µs to 1 s; lower it for rates above a few hundred hertz |
 | `--coalesce-us` | `0` | Hold updates back up to this long to write them in fewer, larger writes. Zero writes on every tick, as an IOC does; a nonzero value adds latency a consumer will see in the timestamps |
 
 **Faults and run control**
 
 | Option | Default | What it does |
 |---|---|---|
-| `--drop-connections` | - | Close one live connection every N seconds without warning: the consumer must reconnect and re-subscribe every channel it had there |
-| `--duration-s` | until interrupted | Stop after this many seconds |
+| `--drop-connections` | - | Close one live connection every N seconds without warning: the consumer must reconnect and re-subscribe every channel it had there. A PVXS client that finds MIMUS through `EPICS_PVA_NAME_SERVERS` can take several seconds to come back, so keep N well above that |
+| `--duration-s` | until interrupted | Stop after this many seconds. Ctrl-C ends a timed run early too, and the report is still written |
 | `--report` | - | Write the accounting report (JSON) here on exit |
 | `--debug` | off | Print the first message of each shape, in hex, as it goes out |
 
@@ -225,7 +224,9 @@ mimus serve -p profile.json --iocs 10 --pvs 100000 --drop-connections 30
 With the defaults, MIMUS answers UDP searches on port 5076 while its TCP listeners stay on the loopback. A client on the same host that searches by unicast (`EPICS_PVA_ADDR_LIST=127.0.0.1`) finds it. A client that broadcasts, or one on another host, is told to connect to an address where nothing listens; MIMUS warns about this at startup. Choose one of:
 
 - **`--bind 0.0.0.0`**: the server is reachable from the network, and UDP discovery works for every client.
-- **`--search-port 0`** and `EPICS_PVA_NAME_SERVERS` set to the addresses MIMUS prints: no UDP at all. This is also the way to run beside a real IOC that already holds port 5076.
+- **`--search-port 0`** and `EPICS_PVA_NAME_SERVERS` set to the addresses MIMUS prints: no UDP at all.
+
+MIMUS shares UDP port 5076 with an IOC on the same host, as PVAccess servers do, and both stay discoverable; only the TCP port must differ from the IOC's 5075 (`--base-port`).
 
 ### Backpressure: two different questions
 
@@ -266,9 +267,12 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 | `sessions`, `sessions_dropped` | Connections accepted over the run, and those MIMUS closed under `--drop-connections` |
 | `dropped_backpressure` | Updates discarded under `--backpressure drop`. Counted, never silent |
 | `bytes` | Bytes written, headers included |
+| `elapsed_s` | Seconds from the moment MIMUS is listening to the end of the run |
+| `offered_eps` | The load the fleet offers: every channel's rate, summed, whether a client subscribed to it or not |
 | `achieved_eps` | `emitted / elapsed_s`, over the whole run, including any time before the consumer subscribed |
+| `subscriptions` | Monitors still open when the run ended |
 | `late_ticks` | Ticks the emitter could not finish in time. Nonzero means the offered rate was not delivered, and any figure from the run must say so |
-| `flow_control_holds` | Updates withheld from a pipelined client with no credit left (`--pipeline strict` only) |
+| `pipeline_acks`, `flow_control_holds` | Credit acknowledgements received from pipelined monitors, and updates withheld from one with no credit left (`--pipeline strict` only) |
 | `wheel_steps` | Turns of the timing wheel, to tell a wheel turning at the wrong speed from a wrong population |
 | `profile`, `run` | The manifest: what was served, and with which options |
 
@@ -342,7 +346,7 @@ A profile is more than a bag of bytes. It also records what the reference server
 
 ## Scope and limitations
 
-- **The monitor path, plus `GET` and `GET_FIELD`.** The monitor path dominates a long-running client's workload; the two read commands make `pvxget` and `pvxinfo` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. `PUT` and `RPC` are out of scope, and MIMUS sends no beacons.
+- **The monitor path, plus `GET` and `GET_FIELD`.** The monitor path dominates a long-running client's workload; the two read commands make `pvxget` and `pvxinfo` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. `PUT` and `RPC` are out of scope and answered with an error, and MIMUS sends no beacons.
 - **PVXS (QSRV2) only.** QSRV1 puts different bytes on the wire for the same record; a profile calibrated against one is wrong against the other.
 - **One update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape. Channels that are static on the IOC update at the serving rate (`--rate-hz` must be positive), and a channel keeps the alarm state of its opening message.
 - **Structure is replicated; IOC dynamics are not.** Scan jitter under host load and monitor-queue behavior are properties *of an IOC*, and MIMUS deliberately does not reproduce them: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client (overflow policy), it is exposed as `--backpressure`.

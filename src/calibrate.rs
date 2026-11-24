@@ -72,7 +72,7 @@ pub fn read_channels(path: &Path) -> Result<Vec<String>, String> {
     Ok(list)
 }
 
-fn sha256_of(path: &Path) -> String {
+fn catalogue_checksum(path: &Path) -> String {
     // Tie a profile to the catalogue that produced it. Without a hashing
     // dependency, this records the file size and a simple checksum. It can
     // detect catalogue changes, but is not a cryptographic digest.
@@ -89,7 +89,42 @@ fn sha256_of(path: &Path) -> String {
     }
 }
 
+/// Rejects options that would otherwise surface only after the calibration:
+/// a deadline that cannot be a duration, a catalogue that cannot be read and
+/// would be recorded as unavailable, an output that cannot be written.
+fn check_options(args: &Args) -> Result<(), String> {
+    if !(args.deadline_s > 0.0 && Duration::try_from_secs_f64(args.deadline_s).is_ok()) {
+        return Err(format!(
+            "--deadline-s: {} is not a positive number of seconds",
+            args.deadline_s
+        ));
+    }
+    if !(args.settled_after > 0.0 && args.settled_after.is_finite()) {
+        return Err(format!(
+            "--settled-after: {} is not a positive number of seconds",
+            args.settled_after
+        ));
+    }
+    if args.min_distinct < 2 {
+        return Err(format!(
+            "--min-distinct: {} is too few; telling what moves takes at least 2 distinct bodies",
+            args.min_distinct
+        ));
+    }
+    // Read it whole, as the manifest will: opening a directory succeeds.
+    if let Some(path) = &args.catalogue
+        && let Err(e) = std::fs::read(path)
+    {
+        return Err(format!("--catalogue: cannot read {}: {e}", path.display()));
+    }
+    crate::check_writable(&args.out).map_err(|e| format!("--out: {e}"))
+}
+
 pub fn run(args: Args) -> i32 {
+    if let Err(e) = check_options(&args) {
+        eprintln!("error: {e}");
+        return 1;
+    }
     let channels = match read_channels(&args.channels) {
         Ok(c) => c,
         Err(e) => {
@@ -284,7 +319,7 @@ pub fn run(args: Args) -> i32 {
             catalogue_sha256: args
                 .catalogue
                 .as_deref()
-                .map(sha256_of)
+                .map(catalogue_checksum)
                 .unwrap_or_else(|| "unspecified".to_string()),
             host: hostname(),
             captured_at: now_rfc3339(),
@@ -722,8 +757,8 @@ mod tests {
         // It is not a cryptographic digest, as indicated by its prefix.
         let a = temp_file("cat", "record(calc, \"A\") {}");
         let b = temp_file("cat", "record(calc, \"B\") {}");
-        let first = sha256_of(&a);
-        let second = sha256_of(&b);
+        let first = catalogue_checksum(&a);
+        let second = catalogue_checksum(&b);
         assert!(first.starts_with("fnv1a64:"));
         assert_ne!(first, second);
         std::fs::remove_file(a).ok();
@@ -733,9 +768,50 @@ mod tests {
     #[test]
     fn a_missing_catalogue_is_recorded_as_unavailable_not_faked() {
         assert_eq!(
-            sha256_of(Path::new("/nonexistent/catalogue.db")),
+            catalogue_checksum(Path::new("/nonexistent/catalogue.db")),
             "unavailable"
         );
+    }
+
+    fn args(out: PathBuf) -> Args {
+        Args {
+            addr: "127.0.0.1:5075".into(),
+            channels: PathBuf::from("channels.txt"),
+            out,
+            catalogue: None,
+            min_distinct: 30,
+            settled_after: 30.0,
+            deadline_s: 600.0,
+            pvxs_version: "unknown".into(),
+            epics_version: "unknown".into(),
+            debug: false,
+            allow_incomplete: false,
+        }
+    }
+
+    #[test]
+    fn options_that_would_fail_late_are_refused_before_connecting() {
+        let out = std::env::temp_dir().join(format!("mimus-out-{}.json", std::process::id()));
+        assert!(check_options(&args(out.clone())).is_ok());
+        assert!(!out.exists(), "the check leaves no empty profile behind");
+
+        for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY, 1e300] {
+            let mut a = args(out.clone());
+            a.deadline_s = bad;
+            assert!(check_options(&a).is_err(), "deadline {bad}");
+            let mut a = args(out.clone());
+            a.settled_after = bad;
+            assert_eq!(check_options(&a).is_err(), bad != 1e300, "settled {bad}");
+        }
+        let mut a = args(out.clone());
+        a.min_distinct = 1;
+        assert!(check_options(&a).is_err());
+        let mut a = args(out.clone());
+        a.catalogue = Some(PathBuf::from("/nonexistent/catalogue.db"));
+        assert!(check_options(&a).is_err());
+        a.catalogue = Some(std::env::temp_dir());
+        assert!(check_options(&a).is_err(), "a directory is not a catalogue");
+        assert!(check_options(&args(PathBuf::from("/nonexistent/profile.json"))).is_err());
     }
 
     #[test]

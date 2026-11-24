@@ -71,11 +71,6 @@ pub struct SessionConfig {
     pub debug: bool,
     /// Whether to enforce pipeline credits or only count them.
     pub pipeline: Pipeline,
-    /// Initial credits for a pipelined monitor, before any acknowledgements.
-    ///
-    /// PVXS clients request a queue depth in their `pvRequest`. MIMUS does
-    /// not parse that field, so this value provides a configurable substitute.
-    pub initial_credits: i32,
 }
 
 impl Default for SessionConfig {
@@ -95,7 +90,6 @@ impl Default for SessionConfig {
             coalesce_us: 0,
             debug: false,
             pipeline: Pipeline::default(),
-            initial_credits: 4,
         }
     }
 }
@@ -105,15 +99,17 @@ impl Default for SessionConfig {
 pub enum Pipeline {
     /// Decode and count credits without withholding updates.
     ///
-    /// This is MIMUS's default behavior. It avoids disrupting clients if
-    /// the assumed credit encoding differs from the actual protocol.
+    /// This is the default: every subscription gets the offered rate,
+    /// whatever its client acknowledges. A PVXS server would not send to a
+    /// pipelined monitor with no credit left; for a monitor that is not
+    /// pipelined, the two policies are the same.
     #[default]
     Permissive,
     /// Stop emitting updates when a pipelined monitor runs out of credit,
     /// matching the behavior of a PVXS server.
     ///
-    /// This mode remains opt-in until calibration confirms that clients send
-    /// acknowledgements as expected. Incorrect credit handling can stall a subscription entirely.
+    /// The credit starts at the queue size the client gave on INIT and
+    /// grows with each acknowledgement, as in PVXS's `servermon.cpp`.
     Strict,
 }
 
@@ -455,6 +451,8 @@ impl Session {
             commands::GET_FIELD => self.on_get_field(&frame.payload, order),
             commands::DESTROY_CHANNEL => self.on_destroy_channel(&frame.payload, order),
             commands::DESTROY_REQUEST => self.on_destroy_request(&frame.payload, order),
+            commands::PUT => self.refuse(commands::PUT, "PUT", &frame.payload, order),
+            commands::RPC => self.refuse(commands::RPC, "RPC", &frame.payload, order),
             _ => Ok(()),
         }
     }
@@ -561,14 +559,18 @@ impl Session {
             }
             self.push_app(commands::MONITOR, &out);
 
+            // A pipelined subscription is declared here, not at START: the
+            // client sets the pipeline bit on INIT and appends its queue
+            // size, which PVXS takes as the first window.
+            let credit = req.initial_credit(payload, order);
             self.monitors.insert(
                 req.request_id,
                 Monitor {
                     instance,
                     request_id: req.request_id,
                     started: false,
-                    pipelined: false,
-                    credits: 0,
+                    pipelined: credit.is_some(),
+                    credits: credit.unwrap_or(0),
                     step: 0,
                 },
             );
@@ -577,12 +579,9 @@ impl Session {
 
         // A non-init monitor message can combine up to three actions:
         // granting flow-control credit, changing subscription state, and
-        // terminating the request. Process each applicable action.
-        //
-        // Returning early after handling a credit would skip the state change
-        // for pipelined monitor starts. The 0xC4 start flag combines both
-        // operations; treating them as alternatives left subscriptions
-        // connected but never started, so no updates were sent.
+        // terminating the request. PVXS accepts a credit alongside a START or
+        // a STOP, so process each applicable action rather than returning
+        // after the first.
         if req.is_pipeline_ack() {
             // Ignore undecodable credit updates rather than treating them as
             // zero. A decoding error should not stall an otherwise active
@@ -612,13 +611,10 @@ impl Session {
         if req.is_start() {
             let mut emit_now = false;
             let mut group = 0u16;
-            let initial = self.cfg.initial_credits;
             if let Some(mon) = self.monitors.get_mut(&req.request_id)
                 && !mon.started
             {
                 mon.started = true;
-                mon.pipelined = req.wants_pipeline();
-                mon.credits = if mon.pipelined { initial } else { 0 };
                 group = self.fleet.instances[mon.instance as usize].rate_group;
                 emit_now = true;
             }
@@ -639,6 +635,36 @@ impl Session {
                 self.emit_one(req.request_id, EpicsTime::now(), Shape::Initial);
             }
         }
+        Ok(())
+    }
+
+    /// Refuses an operation MIMUS does not serve, such as a PUT or an RPC.
+    ///
+    /// A PVXS server answers the INIT of an operation its channel does not
+    /// implement with an error status, and the client reports it. Ignoring
+    /// the request instead would leave the client waiting for its own timeout.
+    fn refuse(
+        &mut self,
+        command: u8,
+        what: &str,
+        payload: &[u8],
+        order: ByteOrder,
+    ) -> Result<(), ()> {
+        let Ok(req) = GetRequest::decode(payload, order) else {
+            return Err(());
+        };
+        if !req.is_init() || !self.channels.contains_key(&req.server_cid) {
+            return Ok(());
+        }
+        let mut out = Vec::with_capacity(64);
+        put_i32(&mut out, req.request_id, self.order);
+        out.push(req.sub_command);
+        put_status_error(
+            &mut out,
+            &format!("{what} not implemented: MIMUS serves GET and MONITOR only"),
+            self.order,
+        );
+        self.push_app(command, &out);
         Ok(())
     }
 

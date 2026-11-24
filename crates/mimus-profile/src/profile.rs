@@ -147,9 +147,17 @@ impl Profile {
     }
 
     /// Returns the summary printed after calibration and used in reports.
+    ///
+    /// A synthetic profile observed nothing, so its channels are said to be
+    /// assigned rather than observed.
     pub fn coverage_summary(&self) -> String {
+        let how = if self.manifest.synthetic {
+            "assigned"
+        } else {
+            "observed"
+        };
         format!(
-            "{} PVs observed → {} distinct templates",
+            "{} PVs {how} -> {} distinct templates",
             self.assignments.len(),
             self.templates.len()
         )
@@ -324,7 +332,13 @@ mod tests {
         );
         assert_eq!(
             p.coverage_summary(),
-            "3 PVs observed → 2 distinct templates"
+            "3 PVs observed -> 2 distinct templates"
+        );
+        let mut synthetic = p.clone();
+        synthetic.manifest.synthetic = true;
+        assert_eq!(
+            synthetic.coverage_summary(),
+            "3 PVs assigned -> 2 distinct templates"
         );
     }
 

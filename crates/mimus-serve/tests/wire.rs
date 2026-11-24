@@ -335,15 +335,36 @@ impl Client {
             .await;
     }
 
-    /// Starts a pipelined subscription by combining the start state bits
-    /// with the flow-control flag.
-    async fn monitor_start_pipelined(&mut self, server_cid: i32, request_id: i32) {
-        self.monitor_start_with(
-            server_cid,
-            request_id,
-            commands::monitor::START | commands::monitor::PIPELINE,
-        )
-        .await;
+    /// Opens a pipelined monitor the way a PVXS client does: INIT with the
+    /// pipeline bit, the pvRequest, then the queue size as first credit.
+    /// The START that follows is an ordinary one.
+    async fn monitor_init_pipelined(&mut self, server_cid: i32, queue_size: i32) -> i32 {
+        let request_id = self.id();
+        let mut p = Vec::new();
+        put_i32(&mut p, server_cid, LE);
+        put_i32(&mut p, request_id, LE);
+        p.push(commands::monitor::INIT | commands::monitor::PIPELINE);
+        p.push(0xFF); // empty pvRequest
+        put_i32(&mut p, queue_size, LE);
+        self.send(commands::MONITOR, &p).await;
+        let frame = self
+            .recv_command(commands::MONITOR, Duration::from_millis(500))
+            .await
+            .expect("monitor init reply");
+        let mut r = Reader::new(&frame.payload, LE);
+        assert_eq!(r.i32().unwrap(), request_id);
+        request_id
+    }
+
+    /// Returns credit to a pipelined monitor, optionally with a state change
+    /// in the same message, which PVXS accepts.
+    async fn monitor_ack(&mut self, server_cid: i32, request_id: i32, state: u8, free: i32) {
+        let mut p = Vec::new();
+        put_i32(&mut p, server_cid, LE);
+        put_i32(&mut p, request_id, LE);
+        p.push(commands::monitor::PIPELINE | state);
+        put_i32(&mut p, free, LE);
+        self.send(commands::MONITOR, &p).await;
     }
 
     async fn monitor_start_with(&mut self, server_cid: i32, request_id: i32, sub: u8) {
@@ -1074,13 +1095,12 @@ async fn names_follow_the_template() {
 async fn a_strict_pipeline_stops_when_credit_runs_out() {
     // A PVXS server withholds updates when the client has no available
     // credit. Sending regardless of credit would flood a consumer with
-    // updates it has not yet requested capacity to receive.
+    // updates it has not yet made room for.
     let f = fleet(10, 1);
     let name = f.names[0].clone();
     let cfg = SessionConfig {
         rate_mix: RateMix::uniform(200.0),
         pipeline: mimus_serve::session::Pipeline::Strict,
-        initial_credits: 3,
         ..Default::default()
     };
     let addr = start(Arc::clone(&f), cfg).await;
@@ -1088,18 +1108,17 @@ async fn a_strict_pipeline_stops_when_credit_runs_out() {
     c.handshake().await;
 
     let cid = c.create_channel(&name).await.unwrap();
-    let (request_id, _) = c.monitor_init(cid).await;
-    c.monitor_start_pipelined(cid, request_id).await;
+    let request_id = c.monitor_init_pipelined(cid, 3).await;
+    c.monitor_start(cid, request_id).await;
 
-    // The three initial credits cover the immediate START update and two subsequent updates.
-    // No more should arrive until credit is returned by the client.
+    // A queue size of three covers the opening value and two updates.
     let updates = c
         .collect_updates(request_id, 20, Duration::from_millis(1500))
         .await;
-    assert!(
-        updates.len() <= 3,
-        "expected at most the initial credit of 3, got {}",
-        updates.len()
+    assert_eq!(
+        updates.len(),
+        3,
+        "the queue size the client gave is the credit"
     );
 }
 
@@ -1110,7 +1129,6 @@ async fn credits_resume_a_stalled_pipeline() {
     let cfg = SessionConfig {
         rate_mix: RateMix::uniform(200.0),
         pipeline: mimus_serve::session::Pipeline::Strict,
-        initial_credits: 2,
         ..Default::default()
     };
     let addr = start(Arc::clone(&f), cfg).await;
@@ -1118,44 +1136,34 @@ async fn credits_resume_a_stalled_pipeline() {
     c.handshake().await;
 
     let cid = c.create_channel(&name).await.unwrap();
-    let (request_id, _) = c.monitor_init(cid).await;
-    c.monitor_start_pipelined(cid, request_id).await;
+    let request_id = c.monitor_init_pipelined(cid, 2).await;
+    c.monitor_start(cid, request_id).await;
 
     let before = c
         .collect_updates(request_id, 10, Duration::from_millis(400))
         .await;
-    assert!(before.len() <= 2);
+    assert_eq!(before.len(), 2);
 
-    // Hand back twenty more.
-    let mut p = Vec::new();
-    put_i32(&mut p, cid, LE);
-    put_i32(&mut p, request_id, LE);
-    p.push(commands::monitor::PIPELINE);
-    put_i32(&mut p, 20, LE);
-    c.send(commands::MONITOR, &p).await;
-
+    // Acknowledge five, as a client does once it has consumed a batch.
+    c.monitor_ack(cid, request_id, 0, 5).await;
     let after = c
-        .collect_updates(request_id, 20, Duration::from_millis(1500))
+        .collect_updates(request_id, 20, Duration::from_millis(600))
         .await;
-    assert!(
-        after.len() > before.len(),
-        "the subscription did not resume: {} then {}",
-        before.len(),
-        after.len()
+    assert_eq!(
+        after.len(),
+        5,
+        "each acknowledged update is sent, and no more"
     );
 }
 
 #[tokio::test]
 async fn the_permissive_policy_ignores_credit() {
-    // Permissive is the default. Incorrect credit encoding could stall
-    // subscriptions entirely, which is more disruptive than sending a few
-    // extra updates. Strict flow control therefore remains opt-in until
-    // real-client acknowledgements have been validated.
+    // Permissive is the default: the subscription keeps the offered rate
+    // whatever its client acknowledges.
     let f = fleet(10, 1);
     let name = f.names[0].clone();
     let cfg = SessionConfig {
         rate_mix: RateMix::uniform(200.0),
-        initial_credits: 1,
         ..Default::default()
     };
     assert_eq!(cfg.pipeline, mimus_serve::session::Pipeline::Permissive);
@@ -1165,8 +1173,8 @@ async fn the_permissive_policy_ignores_credit() {
     c.handshake().await;
 
     let cid = c.create_channel(&name).await.unwrap();
-    let (request_id, _) = c.monitor_init(cid).await;
-    c.monitor_start_pipelined(cid, request_id).await;
+    let request_id = c.monitor_init_pipelined(cid, 2).await;
+    c.monitor_start(cid, request_id).await;
     let updates = c
         .collect_updates(request_id, 20, Duration::from_millis(1500))
         .await;
@@ -1180,14 +1188,14 @@ async fn the_permissive_policy_ignores_credit() {
 #[tokio::test]
 async fn a_non_pipelined_monitor_is_never_flow_controlled() {
     // Credit-based flow control applies only to subscriptions that request
-    // pipelining. A regular monitor must not be affected by a policy it
-    // did not opt into.
+    // pipelining on INIT. A regular monitor must not be affected by a policy
+    // it did not opt into, even if a stray credit or a START carries the
+    // pipeline bit.
     let f = fleet(10, 1);
     let name = f.names[0].clone();
     let cfg = SessionConfig {
         rate_mix: RateMix::uniform(200.0),
         pipeline: mimus_serve::session::Pipeline::Strict,
-        initial_credits: 0,
         ..Default::default()
     };
     let addr = start(Arc::clone(&f), cfg).await;
@@ -1196,13 +1204,8 @@ async fn a_non_pipelined_monitor_is_never_flow_controlled() {
 
     let cid = c.create_channel(&name).await.unwrap();
     let (request_id, _) = c.monitor_init(cid).await;
-
-    // Send a plain START without the pipeline bit.
-    let mut p = Vec::new();
-    put_i32(&mut p, cid, LE);
-    put_i32(&mut p, request_id, LE);
-    p.push(commands::monitor::START);
-    c.send(commands::MONITOR, &p).await;
+    c.monitor_ack(cid, request_id, commands::monitor::START, 1)
+        .await;
 
     let updates = c
         .collect_updates(request_id, 10, Duration::from_millis(500))
@@ -1215,17 +1218,16 @@ async fn a_non_pipelined_monitor_is_never_flow_controlled() {
 }
 
 #[tokio::test]
-async fn a_pipelined_start_both_credits_and_starts() {
-    // 0xC4 combines START with a credit update. Handling the credit bit
-    // as a separate command, for example by returning early, can leave
-    // the subscription initialized but never started. The connection
-    // still succeeds, so the failure appears only as missing updates.
+async fn a_credit_alongside_a_start_both_credits_and_starts() {
+    // PVXS accepts a credit and a START in the same message. Handling the
+    // credit as a separate command, for example by returning early, would
+    // leave the subscription initialized but never started. The connection
+    // still succeeds, so the failure would appear only as missing updates.
     let f = fleet(10, 1);
     let name = f.names[0].clone();
     let cfg = SessionConfig {
-        rate_mix: RateMix::uniform(50.0),
+        rate_mix: RateMix::uniform(200.0),
         pipeline: mimus_serve::session::Pipeline::Strict,
-        initial_credits: 5,
         ..Default::default()
     };
     let addr = start(Arc::clone(&f), cfg).await;
@@ -1233,15 +1235,17 @@ async fn a_pipelined_start_both_credits_and_starts() {
     c.handshake().await;
 
     let cid = c.create_channel(&name).await.unwrap();
-    let (request_id, _) = c.monitor_init(cid).await;
-    c.monitor_start_pipelined(cid, request_id).await;
+    let request_id = c.monitor_init_pipelined(cid, 0).await;
+    c.monitor_ack(cid, request_id, commands::monitor::START, 3)
+        .await;
 
     let updates = c
-        .collect_updates(request_id, 3, Duration::from_secs(2))
+        .collect_updates(request_id, 10, Duration::from_millis(800))
         .await;
-    assert!(
-        !updates.is_empty(),
-        "a pipelined start produced nothing at all"
+    assert_eq!(
+        updates.len(),
+        3,
+        "started, and held to the credit given with the start"
     );
 }
 
@@ -2438,4 +2442,43 @@ async fn without_a_request_a_connection_stays_open() {
     let mut c = Client::connect(start(fleet(10, 1), cfg).await).await;
     c.handshake().await;
     assert!(!closed_within(&mut c, Duration::from_millis(300)).await);
+}
+
+#[tokio::test]
+async fn a_put_or_an_rpc_is_refused_not_left_unanswered() {
+    // MIMUS serves reads only. A PVXS server answers the INIT of an
+    // operation it does not implement with an error status; silence would
+    // leave the client waiting until its own timeout.
+    let f = fleet(4, 1);
+    let addr = start(Arc::clone(&f), fast_config()).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let cid = c.create_channel(&f.names[0].clone()).await.unwrap();
+
+    for (command, request_id) in [(commands::PUT, 61), (commands::RPC, 62)] {
+        let mut req = Vec::new();
+        put_i32(&mut req, cid, LE);
+        put_i32(&mut req, request_id, LE);
+        req.push(commands::get::INIT);
+        req.push(0xFF);
+        c.send(command, &req).await;
+
+        let frame = c
+            .recv_command(command, Duration::from_millis(500))
+            .await
+            .unwrap_or_else(|| panic!("no reply to command {command:#04x}"));
+        let mut r = Reader::new(&frame.payload, LE);
+        assert_eq!(r.i32().unwrap(), request_id);
+        assert_eq!(r.u8().unwrap(), commands::get::INIT);
+        assert_eq!(r.u8().unwrap(), 0x02, "an error status");
+        assert!(r.string().unwrap().contains("not implemented"));
+    }
+
+    // The connection is still good for what MIMUS does serve.
+    let (request_id, _) = c.subscribe(&f.names[1].clone()).await;
+    assert!(
+        !c.collect_updates(request_id, 1, Duration::from_secs(2))
+            .await
+            .is_empty()
+    );
 }

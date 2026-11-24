@@ -2,7 +2,8 @@
 //!
 //! Only commands handled by MIMUS are named here. Other PVAccess commands
 //! exist but are intentionally omitted to avoid implying unsupported
-//! functionality. This list defines the scope of MIMUS's protocol support.
+//! functionality. This list defines the scope of MIMUS's protocol support;
+//! `PUT` and `RPC` are named only so that MIMUS can refuse them.
 
 /// Application commands.
 pub const CONNECTION_VALIDATION: u8 = 0x01;
@@ -13,10 +14,14 @@ pub const CREATE_CHANNEL: u8 = 0x07;
 pub const DESTROY_CHANNEL: u8 = 0x08;
 pub const CONNECTION_VALIDATED: u8 = 0x09;
 pub const GET: u8 = 0x0A;
+/// Refused: MIMUS serves reads only.
+pub const PUT: u8 = 0x0B;
 pub const MONITOR: u8 = 0x0D;
 pub const DESTROY_REQUEST: u8 = 0x0F;
 pub const GET_FIELD: u8 = 0x11;
 pub const MESSAGE: u8 = 0x12;
+/// Refused: MIMUS serves reads only.
+pub const RPC: u8 = 0x14;
 
 /// Control commands. Their data is stored in the header; no payload follows.
 pub const CTRL_MARK_TOTAL_SENT: u8 = 0x00;
@@ -58,7 +63,9 @@ pub mod monitor {
     pub const STATE_MASK: u8 = 0x44;
     /// Terminate the subscription.
     pub const DESTROY: u8 = 0x10;
-    /// Indicates a flow-control window update.
+    /// On INIT, a pipelined subscription whose queue size follows the
+    /// `pvRequest`; on any other message, a credit that follows the
+    /// sub-command.
     pub const PIPELINE: u8 = 0x80;
 }
 
