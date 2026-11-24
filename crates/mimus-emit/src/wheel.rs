@@ -65,8 +65,12 @@ impl Instance {
 pub enum WheelError {
     /// Rate is zero, negative, or not finite.
     BadRate(String),
-    /// Tick resolution is zero.
-    BadTick,
+    /// Tick resolution is zero or longer than [`MAX_TICK_US`].
+    BadTick(u64),
+    /// One period of the rate spans more than [`MAX_BUCKETS`] ticks.
+    TooSlow { rate_hz: f64, tick_us: u64 },
+    /// The rate asks for more than [`MAX_REPEATS`] updates per channel in one tick.
+    TooFast { rate_hz: f64, tick_us: u64 },
     /// Invalid rate distribution for the channel population.
     BadMix(String),
 }
@@ -75,13 +79,45 @@ impl std::fmt::Display for WheelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadRate(r) => write!(f, "invalid rate {r}"),
-            Self::BadTick => f.write_str("tick resolution of zero"),
+            Self::BadTick(t) => write!(
+                f,
+                "a tick resolution of {t} µs is outside 1 µs to {MAX_TICK_US} µs"
+            ),
+            Self::TooSlow { rate_hz, tick_us } => write!(
+                f,
+                "a rate of {rate_hz} Hz spans more than {MAX_BUCKETS} ticks of {tick_us} µs; \
+                 use a coarser tick"
+            ),
+            Self::TooFast { rate_hz, tick_us } => write!(
+                f,
+                "a rate of {rate_hz} Hz is more than {MAX_REPEATS} updates per channel in \
+                 one tick of {tick_us} µs; use a finer tick"
+            ),
             Self::BadMix(m) => write!(f, "invalid rate mix: {m}"),
         }
     }
 }
 
 impl std::error::Error for WheelError {}
+
+/// The coarsest tick accepted: one second. A tick is the scheduler's
+/// resolution; a coarser one would only batch a second's updates together.
+pub const MAX_TICK_US: u64 = 1_000_000;
+
+/// The most buckets one wheel may have, one per tick of the slowest period.
+///
+/// Each bucket costs memory whether or not a channel uses it. Without a
+/// bound, a very slow rate at a fine tick asks for the impossible: 1e-7 Hz
+/// at 1 ms is ten billion buckets. At the default tick this allows one
+/// update every 17 minutes; a coarser tick allows slower rates.
+pub const MAX_BUCKETS: usize = 1 << 20;
+
+/// The most updates one channel may be due in a single tick.
+///
+/// A tick renders all of them before anything is written, so a rate far
+/// above the tick rate turns one tick into an unbounded burst. 65 536 per
+/// millisecond tick is 65 MHz per channel.
+pub const MAX_REPEATS: u32 = 1 << 16;
 
 /// Timing wheel for channels sharing the same update rate.
 #[derive(Debug)]
@@ -107,14 +143,22 @@ impl Wheel {
         if !rate_hz.is_finite() || rate_hz <= 0.0 {
             return Err(WheelError::BadRate(rate_hz.to_string()));
         }
-        if tick_us == 0 {
-            return Err(WheelError::BadTick);
+        if tick_us == 0 || tick_us > MAX_TICK_US {
+            return Err(WheelError::BadTick(tick_us));
         }
         let period_us = 1_000_000.0 / rate_hz;
         let (period_ticks, repeats) = if period_us >= tick_us as f64 {
-            (((period_us / tick_us as f64).round() as usize).max(1), 1)
+            let ticks = (period_us / tick_us as f64).round();
+            if ticks > MAX_BUCKETS as f64 {
+                return Err(WheelError::TooSlow { rate_hz, tick_us });
+            }
+            ((ticks as usize).max(1), 1)
         } else {
-            (1, ((tick_us as f64 / period_us).round() as u32).max(1))
+            let repeats = (tick_us as f64 / period_us).round();
+            if repeats > f64::from(MAX_REPEATS) {
+                return Err(WheelError::TooFast { rate_hz, tick_us });
+            }
+            (1, (repeats as u32).max(1))
         };
         Ok(Self {
             buckets: vec![Vec::new(); period_ticks],
@@ -286,7 +330,13 @@ impl RateMix {
         0
     }
 
-    /// Returns the aggregate update rate across the whole population.
+    /// Returns the aggregate update rate the mix's proportions imply for
+    /// `channels` channels.
+    ///
+    /// Channels are assigned to groups in cycles of the shares, so a
+    /// population that is not a whole number of cycles carries a somewhat
+    /// different load, and a small one a very different load. `mimus serve`
+    /// therefore reports the sum of the rates its channels were given.
     pub fn aggregate_rate(&self, channels: u32) -> f64 {
         let total: u32 = self.groups.iter().map(|(_, s)| *s).sum();
         self.groups
@@ -427,6 +477,41 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tick_outside_one_microsecond_to_one_second_is_refused() {
+        assert_eq!(Wheel::new(1.0, 0).unwrap_err(), WheelError::BadTick(0));
+        assert!(Wheel::new(1.0, MAX_TICK_US).is_ok());
+        assert_eq!(
+            Wheel::new(1.0, MAX_TICK_US + 1).unwrap_err(),
+            WheelError::BadTick(MAX_TICK_US + 1)
+        );
+    }
+
+    #[test]
+    fn a_rate_too_slow_for_the_tick_is_refused_not_allocated() {
+        // 1e-7 Hz at 1 ms would be ten billion buckets: 240 GB requested
+        // before a single channel is served.
+        assert!(matches!(
+            Wheel::new(1e-7, 1_000),
+            Err(WheelError::TooSlow { .. })
+        ));
+        // The same rate fits once the tick is coarse enough, and the
+        // slowest rate the default tick takes still works.
+        assert!(Wheel::new(0.001, 1_000).is_ok());
+        assert!(Wheel::new(1e-4, 1_000_000).is_ok());
+    }
+
+    #[test]
+    fn a_rate_too_fast_for_the_tick_is_refused() {
+        assert!(matches!(
+            Wheel::new(1e9, 1_000),
+            Err(WheelError::TooFast { .. })
+        ));
+        // The same rate at a finer tick is a thousand per tick.
+        assert!(Wheel::new(1e9, 1).is_ok());
+        assert!(Wheel::new(65_536_000.0, 1_000).is_ok());
+    }
 
     #[test]
     fn one_hertz_with_millisecond_ticks_is_a_thousand_buckets() {
