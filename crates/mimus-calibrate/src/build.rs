@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn the_roles_match_what_was_recognised() {
+    fn the_roles_match_what_was_recognized() {
         let (_, _, t) = built();
         let roles: Vec<SlotRole> = t.slots.iter().map(|s| s.role).collect();
         assert_eq!(

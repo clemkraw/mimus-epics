@@ -822,7 +822,7 @@ mod missing_tests {
     }
 
     #[test]
-    fn an_ioc_that_answered_nothing_is_recognisable() {
+    fn an_ioc_that_answered_nothing_is_recognizable() {
         // If every channel is silent, the address or channel catalogue may
         // be wrong. This must not be mistaken for successful calibration.
         let observers = vec![

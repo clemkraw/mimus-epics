@@ -15,7 +15,7 @@
 //! length difference is absorbed by a variable region between them:
 //!
 //! ```text
-//!   [ common prefix ][ variable region ][ tail, analysed right-aligned ]
+//!   [ common prefix ][ variable region ][ tail, analyzed right-aligned ]
 //!    positions from      absorbs the        positions from the end
 //!      the start        length change
 //! ```
