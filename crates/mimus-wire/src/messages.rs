@@ -288,25 +288,47 @@ impl MonitorRequest {
         self.sub_command & crate::commands::monitor::DESTROY != 0
     }
 
-    /// Whether this message carries a flow-control window update.
+    /// Whether this INIT opens a pipelined subscription.
     ///
-    /// The bit is `0x80`. It was previously `0x40`, which is part of
-    /// the START encoding and unrelated to pipelining. As a result,
-    /// every ordinary START was incorrectly treated as pipelined.
+    /// The bit is `0x80`, not `0x40`: `0x40` belongs to the START encoding.
+    /// PVXS and pvAccessCPP clients set it on INIT only for a pipelined
+    /// monitor, and then append their queue size after the `pvRequest`
+    /// (see [`Self::initial_credit`]).
     #[inline]
     pub fn wants_pipeline(&self) -> bool {
-        self.sub_command & crate::commands::monitor::PIPELINE != 0
+        self.is_init() && self.sub_command & crate::commands::monitor::PIPELINE != 0
     }
 
-    /// Whether this message carries a flow-control credit update.
+    /// Whether this message, other than an INIT, carries a credit update.
     ///
-    /// With pipelining, the client periodically tells the server how much
-    /// capacity remains in its receive window. A server that ignores these
-    /// updates may send data without respecting the client's available
-    /// capacity, which a real PVXS server does not do.
+    /// With pipelining, the client tells the server each time it has made
+    /// room for more updates. A PVXS server sends nothing to a pipelined
+    /// monitor that has no credit left. The client sends the credit alone
+    /// (`0x80`), but PVXS also accepts it alongside a START or a STOP.
     #[inline]
     pub fn is_pipeline_ack(&self) -> bool {
-        self.sub_command & crate::commands::monitor::PIPELINE != 0
+        !self.is_init() && self.sub_command & crate::commands::monitor::PIPELINE != 0
+    }
+
+    /// The credit a pipelined INIT starts with: the client's queue size.
+    ///
+    /// The client writes it as the last four bytes of the message, after
+    /// the `pvRequest`, so it can be read without decoding the request. A
+    /// PVXS server takes it as the subscription's first window. Returns
+    /// `None` for any other message, or for one too short to carry it.
+    pub fn initial_credit(&self, payload: &[u8], order: ByteOrder) -> Option<i32> {
+        // Server channel ID, request ID, sub-command, at least the one byte
+        // of a null pvRequest, then the credit.
+        const MIN: usize = 4 + 4 + 1 + 1 + 4;
+        if !self.wants_pipeline() || payload.len() < MIN {
+            return None;
+        }
+        let credit = Reader::new(&payload[payload.len() - 4..], order)
+            .i32()
+            .ok()?;
+        // The field is unsigned on the wire. A count past `i32::MAX` is
+        // still plenty of credit, not a negative one.
+        Some(if credit < 0 { i32::MAX } else { credit })
     }
 }
 
@@ -320,16 +342,18 @@ pub struct PipelineAck {
 impl PipelineAck {
     /// Decodes the credit count following the sub-command byte.
     ///
-    /// This layout must be confirmed by observing a real PVXS client
-    /// during calibration. Until then, strict parsing is opt-in.
-    /// A decoding failure must be treated as unknown credit, not zero:
-    /// zero credit would stall the subscription.
+    /// The layout is the one PVXS reads in `servermon.cpp` and its client
+    /// writes in `clientmon.cpp`. A decoding failure must be treated as
+    /// unknown credit, not zero: zero credit would stall the subscription.
     pub fn decode(payload: &[u8], order: ByteOrder) -> Result<Self, CodecError> {
         let mut r = Reader::new(payload, order);
         let _server_cid = r.i32()?;
         let request_id = r.i32()?;
         let _sub_command = r.u8()?;
         let free = r.i32()?;
+        // Unsigned on the wire, as in INIT: a count past `i32::MAX` is
+        // plenty of credit, not a negative one.
+        let free = if free < 0 { i32::MAX } else { free };
         Ok(Self { request_id, free })
     }
 }
@@ -747,15 +771,58 @@ mod tests {
         assert!(!m.is_start());
     }
 
+    /// A pipelined INIT as PVXS writes it: the sub-command with the
+    /// pipeline bit, a `pvRequest`, then the queue size.
+    fn pipelined_init(queue_size: i32, order: ByteOrder) -> Vec<u8> {
+        let mut p = Vec::new();
+        put_i32(&mut p, 900, order);
+        put_i32(&mut p, 5, order);
+        p.push(crate::commands::monitor::INIT | crate::commands::monitor::PIPELINE);
+        // Stand-in for the pvRequest: a structure with no fields, then its
+        // empty value. Its content does not matter here, only that the
+        // credit comes after it.
+        p.extend_from_slice(&[0xFD, 0x01, 0x00, 0x80, 0x00, 0x00]);
+        put_i32(&mut p, queue_size, order);
+        p
+    }
+
     #[test]
-    fn a_pipelined_start_is_both() {
+    fn a_pipelined_init_carries_the_queue_size_as_first_credit() {
+        for order in [LE, ByteOrder::Big] {
+            let p = pipelined_init(4, order);
+            let m = MonitorRequest::decode(&p, order).unwrap();
+            assert!(m.is_init());
+            assert!(m.wants_pipeline());
+            assert!(!m.is_pipeline_ack(), "an INIT's credit is not an ack");
+            assert_eq!(m.initial_credit(&p, order), Some(4));
+        }
+    }
+
+    #[test]
+    fn a_plain_init_has_no_credit() {
+        let mut p = Vec::new();
+        put_i32(&mut p, 900, LE);
+        put_i32(&mut p, 5, LE);
+        p.push(crate::commands::monitor::INIT);
+        p.extend_from_slice(&[0xFD, 0x01, 0x00, 0x80, 0x00, 0x00]);
+        let m = MonitorRequest::decode(&p, LE).unwrap();
+        assert!(!m.wants_pipeline());
+        assert_eq!(m.initial_credit(&p, LE), None);
+    }
+
+    #[test]
+    fn a_start_never_asks_for_pipelining() {
+        // A PVXS client starts a pipelined monitor with a plain 0x44. Only
+        // the INIT says whether the subscription is pipelined.
         let mut p = Vec::new();
         put_i32(&mut p, 1, LE);
         put_i32(&mut p, 1, LE);
         p.push(crate::commands::monitor::START | crate::commands::monitor::PIPELINE);
+        put_i32(&mut p, 2, LE);
         let m = MonitorRequest::decode(&p, LE).unwrap();
         assert!(m.is_start());
-        assert!(m.wants_pipeline());
+        assert!(!m.wants_pipeline());
+        assert!(m.is_pipeline_ack(), "a credit may ride on a START");
     }
 
     #[test]

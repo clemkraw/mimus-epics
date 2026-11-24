@@ -88,7 +88,8 @@ struct ServeArgs {
     rate_hz: f64,
 
     /// Distribute channels across several rates: `10:2,1:60,0.1:38` assigns
-    /// 2% of channels to 10 Hz, 60% to 1 Hz, and 38% to 0.1 Hz.
+    /// 2% of channels to 10 Hz, 60% to 1 Hz, and 38% to 0.1 Hz. Shares are
+    /// relative and need not add up to 100.
     ///
     /// Real facilities rarely run everything at the same frequency. The
     /// distribution shapes the offered load, not just its total volume.
@@ -109,22 +110,25 @@ struct ServeArgs {
     /// Whether to honor pipeline credits (`strict`) or only count them
     /// (`permissive`, the default).
     ///
-    /// A real PVXS server withholds updates from pipelined clients when they
-    /// run out of credits. Strict mode is opt-in because an incorrect credit
-    /// encoding can stall a subscription outright, a more severe failure than
-    /// sending slightly too fast.
+    /// A client that pipelines (`record[pipeline=true,queueSize=N]`) gives a
+    /// queue size of N updates and acknowledges each batch it has consumed.
+    /// A PVXS server sends nothing to such a monitor once that credit is
+    /// spent, and `strict` does the same. `permissive` keeps every
+    /// subscription at the offered rate. Monitors that do not pipeline are
+    /// served the same way under both.
     #[arg(long, default_value = "permissive")]
     pipeline: Pipeline,
-
-    /// Initial credits for a pipelined monitor, before any acknowledgements.
-    #[arg(long = "initial-credits", default_value_t = 4)]
-    initial_credits: i32,
 
     /// Drop one live connection every N seconds, without warning.
     ///
     /// The consumer must detect the disconnect, reconnect, and resubscribe
     /// to every channel. At scale, this reconnect storm is a much harder
     /// test than steady state, and one that cannot be run against real IOCs.
+    ///
+    /// A PVXS client that finds MIMUS through `EPICS_PVA_NAME_SERVERS` waits
+    /// several seconds before reconnecting (up to seven in testing), so a
+    /// shorter interval keeps it disconnected; one that finds MIMUS through
+    /// UDP search comes back at once.
     #[arg(long = "drop-connections")]
     drop_connections: Option<f64>,
 
@@ -142,15 +146,16 @@ struct ServeArgs {
     #[arg(long)]
     mix: Option<String>,
 
-    /// Prefix for generated PV names.
-    #[arg(long, default_value = "MIM")]
+    /// Prefix for generated PV names. A `--name-template` replaces it.
+    #[arg(long, default_value = "MIM", conflicts_with = "name_template")]
     prefix: String,
 
     /// How channels are distributed across IOCs.
     ///
     /// `blocked` assigns contiguous ranges, as in a real facility.
     /// `round-robin` interleaves channels, which can favour clients that
-    /// partition their work in the same way.
+    /// partition their work in the same way. Each IOC still gets every
+    /// template and every rate of the mix, in its proportions.
     #[arg(long, default_value = "blocked")]
     layout: Layout,
 
@@ -164,7 +169,8 @@ struct ServeArgs {
     #[arg(long, default_value = "block")]
     backpressure: Backpressure,
 
-    /// Scheduler resolution in microseconds. Reduce it for rates above a few hundred hertz.
+    /// Scheduler resolution in microseconds, from 1 to 1 000 000. Reduce it
+    /// for rates above a few hundred hertz.
     #[arg(long = "tick-us", default_value_t = 1000)]
     tick_us: u64,
 
@@ -206,11 +212,10 @@ struct ServeArgs {
     /// Respond to PVAccess searches over UDP so clients can discover MIMUS
     /// as they would discover an IOC.
     ///
-    /// Clients broadcast searches on port 5076 by default. Zero disables
-    /// the responder, which is useful when a real IOC on the same host
-    /// already occupies the port. Two programs cannot share the port, so
-    /// the second to start would fail to bind rather than silently stop
-    /// responding.
+    /// Clients broadcast searches on port 5076 by default. Like a PVAccess
+    /// server, MIMUS binds the port shared, so it can run beside an IOC on
+    /// the same host; only the TCP port must differ (`--base-port`). Zero
+    /// disables the responder.
     #[arg(long = "search-port", default_value_t = 5076)]
     search_port: u16,
 
@@ -219,7 +224,8 @@ struct ServeArgs {
     /// Unlike `--bind`, which controls the TCP listeners, this address
     /// receives UDP broadcasts addressed to a subnet rather than a host.
     /// Binding to 127.0.0.1 prevents broadcast searches from reaching
-    /// the responder, even if discovery appears enabled.
+    /// the responder, even if discovery appears enabled, and keeps the
+    /// unicast searches sent to 127.0.0.1 from an IOC on the same host.
     #[arg(long = "search-bind", default_value = "0.0.0.0")]
     search_bind: String,
 
@@ -230,7 +236,8 @@ struct ServeArgs {
     #[arg(long)]
     debug: bool,
 
-    /// Stop after this many seconds. Runs until interrupted otherwise.
+    /// Stop after this many seconds. Runs until interrupted otherwise; Ctrl-C
+    /// ends a timed run early too, and the report is still written.
     #[arg(long = "duration-s")]
     duration_s: Option<f64>,
 
@@ -338,12 +345,32 @@ fn parse_mix(spec: &str) -> Result<Vec<(String, u32)>, String> {
         if name.is_empty() {
             return Err(format!("{part:?} has no template name"));
         }
+        if out.iter().any(|(n, _)| n == name) {
+            return Err(format!("{name:?} is named twice"));
+        }
         out.push((name.to_string(), share));
     }
     if out.is_empty() {
         return Err("no templates given".into());
     }
     Ok(out)
+}
+
+/// Checks that a file can be written, before the work whose result it holds.
+///
+/// Creates the file if it is missing and removes it again, so a run that
+/// fails later leaves nothing behind.
+pub(crate) fn check_writable(path: &std::path::Path) -> Result<(), String> {
+    let existed = path.exists();
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    if !existed {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
 }
 
 fn load(path: &std::path::Path) -> Result<Profile, String> {
@@ -412,9 +439,23 @@ fn run_serve(args: ServeArgs) -> i32 {
         return 1;
     }
     if let Some(s) = args.drop_connections
-        && !(s.is_finite() && s > 0.0)
+        && !(s > 0.0 && std::time::Duration::try_from_secs_f64(s).is_ok())
     {
         eprintln!("error: --drop-connections: {s} is not a positive number of seconds");
+        return 1;
+    }
+    if let Some(s) = args.duration_s
+        && !(s > 0.0 && std::time::Duration::try_from_secs_f64(s).is_ok())
+    {
+        eprintln!("error: --duration-s: {s} is not a positive number of seconds");
+        return 1;
+    }
+    // The report is written at the end of the run. A path that cannot be
+    // written would lose the run's accounting after it has been paid for.
+    if let Some(path) = &args.report
+        && let Err(e) = check_writable(path)
+    {
+        eprintln!("error: --report: {e}");
         return 1;
     }
     if args.base_port != 0
@@ -427,6 +468,13 @@ fn run_serve(args: ServeArgs) -> i32 {
         return 1;
     }
 
+    if args.prefix.is_empty() {
+        eprintln!(
+            "error: --prefix is empty, which would start every name with a colon; \
+             use --name-template '{{t}}:{{i}}' for names without a prefix"
+        );
+        return 1;
+    }
     let names = match &args.name_template {
         None => NameTemplate::default_pattern(&args.prefix),
         Some(pattern) => match NameTemplate::new(pattern) {
@@ -482,7 +530,6 @@ fn run_serve(args: ServeArgs) -> i32 {
         coalesce_us: args.coalesce_us,
         debug: args.debug,
         pipeline: args.pipeline,
-        initial_credits: args.initial_credits,
         ..Default::default()
     };
 
@@ -501,12 +548,21 @@ fn run_serve(args: ServeArgs) -> i32 {
         .collect::<Vec<_>>()
         .join(",");
 
+    // The load the fleet really offers: each channel at its own group's rate.
+    // The mix's proportions hold only over whole cycles of its shares, so for
+    // a small population the ideal figure can be far off: three channels of
+    // `10:2,1:60,0.1:38` run at 10, 10 and 1 Hz, 21 updates/s, not 2.5.
+    let offered_eps: f64 = fleet
+        .instances
+        .iter()
+        .map(|i| rate_mix.groups[usize::from(i.rate_group)].0)
+        .sum();
     let summary = report::RunSummary {
         mix: mix_label,
         iocs: args.iocs,
         pvs: args.pvs,
         rate_mix: rate_mix.to_string(),
-        offered_eps: rate_mix.aggregate_rate(args.pvs),
+        offered_eps,
         name_template: spec.names.pattern().to_string(),
         drop_connections_s: args.drop_connections,
         pipeline: args.pipeline.to_string(),
@@ -556,10 +612,10 @@ fn run_serve(args: ServeArgs) -> i32 {
             if args.bind == "127.0.0.1" && args.search_bind == "0.0.0.0" {
                 eprintln!(
                     "warning: searches are answered on every interface but the \
-                     listeners are on 127.0.0.1, so a client elsewhere will be \
-                     told to connect where nothing is listening. Use \
-                     --bind 0.0.0.0 for a reachable server, or \
-                     --search-bind 127.0.0.1 to keep both on the loopback."
+                     listeners are on 127.0.0.1, so a client that broadcasts, or \
+                     one elsewhere, will be told to connect where nothing is \
+                     listening. Use --bind 0.0.0.0 for a reachable server, or \
+                     --search-port 0 with EPICS_PVA_NAME_SERVERS to stay off UDP."
                 );
             }
             let endpoints: Vec<mimus_serve::IocEndpoint> = addrs
@@ -618,14 +674,27 @@ fn run_serve(args: ServeArgs) -> i32 {
         report::print_banner(&profile, &fleet, &summary, &addrs, discovery.is_some());
 
         let started = std::time::Instant::now();
-        match args.duration_s {
-            Some(s) => tokio::time::sleep(std::time::Duration::from_secs_f64(s)).await,
-            None => {
-                if tokio::signal::ctrl_c().await.is_err() {
-                    eprintln!("warning: cannot listen for interrupts; running until killed");
-                    std::future::pending::<()>().await;
-                }
+        // Ctrl-C ends a run early, timed or not, and the report is still
+        // written: an interrupted timed run keeps the accounting of what it
+        // did send.
+        let interrupt = async {
+            if tokio::signal::ctrl_c().await.is_err() {
+                eprintln!(
+                    "warning: cannot listen for interrupts; Ctrl-C will end the run \
+                     without a report"
+                );
+                std::future::pending::<()>().await;
             }
+        };
+        let deadline = async {
+            match args.duration_s {
+                Some(s) => tokio::time::sleep(std::time::Duration::from_secs_f64(s)).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = interrupt => {}
+            () = deadline => {}
         }
 
         // Snapshot counters while sessions are still open, rather than relying
@@ -841,5 +910,12 @@ mod mix_tests {
         assert!(parse_mix("").is_err());
         assert!(parse_mix("double:x").is_err());
         assert!(parse_mix(":3").is_err());
+    }
+
+    #[test]
+    fn a_template_named_twice_is_refused() {
+        // Two entries for one template would serve it under two lines of
+        // the banner and the manifest, with neither share being the one meant.
+        assert!(parse_mix("double:1,int:1,double:2").is_err());
     }
 }
