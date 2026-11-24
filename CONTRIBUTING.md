@@ -115,7 +115,7 @@ test(mimus-serve): add end-to-end tests over a real socket
 1. **One concern per PR.** Don't mix a bug fix with a refactor.
 2. **Describe what and why.** The PR description should explain the change, not just list files.
 3. **Link related issues.** Use `Closes #42` or `Relates to #17`.
-4. **All CI checks must pass:** formatting, Clippy with warnings denied, and the whole test suite.
+4. **All CI checks must pass:** formatting, Clippy and the documentation with warnings denied, and the whole test suite.
 5. **Request review** from a maintainer.
 6. **Squash commits** before merging if the history is noisy. Keep meaningful commits if each one is self-contained.
 
@@ -158,6 +158,7 @@ How was this tested? New tests added? Against a reference IOC?
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
 
 # Tests for one crate
 cargo test -p mimus-wire
@@ -174,7 +175,8 @@ Changes to calibration or serving should also be checked against a reference IOC
 ### Writing Tests
 
 - Place unit tests in a `#[cfg(test)] mod tests` block at the bottom of the file
-- Tests that need a real socket go in `crates/mimus-serve/tests/`, against the hand-written client there, which shares no code with the server
+- Tests that need a real socket go in `crates/mimus-serve/tests/`, against the hand-written client there, which builds every message itself rather than through the server's message code
+- Tests of the `mimus` command itself, run as a user runs it, go in `tests/cli.rs`
 - Use descriptive test names that state the behavior: `a_truncated_search_response_is_an_error_not_a_guess`
 - Test edge cases: empty and truncated messages, both byte orders, values that change length
 
