@@ -194,7 +194,7 @@ mimus demo-profile  write a hand-made profile for trying the server out
 |---|---|---|
 | `--backpressure` | `block` | `block` lets TCP throttle MIMUS; `drop` holds the nominal rate and counts what it discards; `ioc` does what a PVXS IOC does with a client that falls behind (see below) |
 | `--high-water` | `1048576`, `268435456` under `ioc` | Bytes allowed to queue per connection before `drop` discards: the stand-in for an IOC's monitor queue. Raise it for images: MIMUS warns when it holds fewer than two updates of the largest type served. Under `ioc`, the most a connection may hold before MIMUS closes it |
-| `--conn-timeout-s` | `40` | Under `ioc`: seconds a connection may go without a message from the client, or without the client taking anything waiting for it, before MIMUS closes it, as a PVXS server does |
+| `--conn-timeout-s` | `40` | Under `ioc`: seconds a connection may go without a message from the client, or without the client taking anything waiting for it, before MIMUS closes it, as a PVXS server does. Under every policy, a connection not validated within it is closed |
 | `--put` | `apply` | What a write does. `apply` keeps the value written, and the channel's later updates, reads and RPC replies carry it; `accept` answers and changes nothing; `refuse` answers with an error (see [Writes and calls](#writes-and-calls)) |
 | `--rpc` | `value` | What an RPC gets. `value` answers with the channel's type and whole value, whatever the request; `refuse` answers with an error |
 | `--pipeline` | `permissive` | `strict` withholds updates from a pipelined monitor with no credit left, as PVXS does: the credit starts at the client's queue size and grows with each acknowledgement. `permissive` only counts acknowledgements |
@@ -243,6 +243,8 @@ With the defaults, MIMUS answers UDP searches on port 5076 while its TCP listene
 - **`--search-port 0`** and `EPICS_PVA_NAME_SERVERS` set to the addresses MIMUS prints: no UDP at all.
 
 MIMUS shares UDP port 5076 with an IOC on the same host, as PVAccess servers do, and both stay discoverable; only the TCP port must differ from the IOC's 5075 (`--base-port`).
+
+`pvxlist` finds MIMUS's virtual IOCs, but cannot list one IOC's channels (`pvxlist <server>`, `pvxlist -i`): that list comes from the `server` channel a PVXS server keeps, which MIMUS does not serve.
 
 ### Backpressure: three different questions
 
@@ -523,7 +525,7 @@ The obvious objection to any synthetic load generator is: *how do you know it is
 For every type it observed, a profile reproduces:
 
 - the exact type descriptor;
-- the **opening message** of a subscription or a `GET`, taken from the opening messages the reference IOC sent for that type, with its timestamp set to the channel's last processing time. Opening messages rotate across the served channels, so limits, units, enum choices and alarm states vary as they did on the IOC;
+- the **opening message** of a subscription or a `GET`, taken from the opening messages the reference IOC sent for that type, with its timestamp set to the channel's last processing time. Opening messages rotate across the served channels, so limits, units and enum choices vary as they did on the IOC. Those of channels in alarm, which the catalogue keeps to record alarm transitions, are left out when at least two others remain: the channels of a facility mostly open quiet;
 - a stream of **steady-state updates** in the shape the IOC used most for that type, typically value and timestamp, at the rate chosen when serving. Length changes are reproduced: a string whose length moves between updates stays variable;
 - the type's **other update shapes**, each seen in at least two bodies, as variants, among them the **alarm transitions**, which `--alarms` sends;
 - **large arrays**, an image's pixels above all, whole: the updates that fit `--sample-budget`, sent in turn, each byte for byte, with the stamps beside them current.
@@ -536,8 +538,9 @@ A profile is more than a bag of bytes. It also records what the reference server
 
 ## Scope and limitations
 
-- **The monitor path, plus `GET`, `GET_FIELD`, `PUT` and `RPC`.** The monitor path dominates a long-running client's workload; the other commands make `pvxget`, `pvxinfo`, `pvxput` and `pvxcall` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. A write changes the value the channel carries, and nothing else: no record processes, no alarm is raised by it, no update is posted for it. An RPC returns the channel's value, not the result of a service. MIMUS sends no beacons.
+- **The monitor path, plus `GET`, `GET_FIELD`, `PUT` and `RPC`.** The monitor path dominates a long-running client's workload; the other commands make `pvxget`, `pvxinfo`, `pvxput` and `pvxcall` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. A write changes the value the channel carries, and nothing else: no record processes, no alarm is raised by it, no update is posted for it. An RPC returns the channel's value, not the result of a service. A `GET` or a subscription always carries the whole structure: the field selection of a pvRequest (`pvxget -r value`) is not applied, where a PVXS IOC sends only the fields asked for. MIMUS sends no beacons.
 - **PVXS (QSRV2) only.** QSRV1 puts different bytes on the wire for the same record; a profile calibrated against one is wrong against the other.
+- **Little-endian only.** MIMUS writes little-endian, and calibration refuses a reference IOC on a big-endian host, whose templates it would serve as garbage.
 - **One ordinary update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape, a type of images the few frames its sample budget kept; the alarm variant replaces it only under `--alarms`, and the other variants are recorded but not sent. Static channels of a type that also has a moving channel update at the serving rate (`--rate-hz` must be positive); a type whose every channel was static gets a static template, whose channels send their opening message and nothing after it, as on the IOC. Without `--alarms`, a channel keeps the alarm state of its opening message.
 - **Structure is replicated; IOC dynamics are not.** Scan jitter under host load is a property *of an IOC*, and MIMUS deliberately does not reproduce it: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client, what it does with a client that falls behind, it is exposed as `--backpressure`, and `ioc` follows PVXS 1.4.1's server.
 - **A profile is bound to a version.** Its manifest records the PVXS and EPICS base versions, a checksum of each catalogue database, the host, the date and the MIMUS version. Comparing profiles across PVXS releases is, incidentally, a wire-behavior change detector.
