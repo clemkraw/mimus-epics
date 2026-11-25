@@ -30,6 +30,9 @@ pub struct RunSummary {
     pub name_template: String,
     pub drop_connections_s: Option<f64>,
     pub pipeline: String,
+    /// What a PUT does, and what an RPC gets.
+    pub put: String,
+    pub rpc: String,
     pub coalesce_us: u64,
     pub layout: String,
     pub backpressure: String,
@@ -110,7 +113,12 @@ pub fn print_banner(
     if let Some(s) = run.drop_connections_s {
         out!("dropping one connection every {s} s");
     }
-    out!("pipeline {}", run.pipeline);
+    out!(
+        "pipeline {}, put {}, rpc {}",
+        run.pipeline,
+        run.put,
+        run.rpc
+    );
     if let Some(sc) = &run.scenario {
         out!();
         let passes = if sc.repeat > 1 {
@@ -215,6 +223,8 @@ pub struct Sessions {
     /// offered load from a slow scheduler: both produce too few updates, but
     /// they need different fixes.
     pub subscriptions: u64,
+    /// Channels that hold a value a client wrote.
+    pub written: u64,
 }
 
 pub fn finish(
@@ -257,6 +267,10 @@ pub fn finish(
             "burst": counters.burst,
             "quiet": counters.quiet,
             "alarms": counters.alarms,
+            "puts": counters.puts,
+            "put_bytes": counters.put_bytes,
+            "rpcs": counters.rpcs,
+            "channels_written": sessions.written,
             "bytes": counters.bytes,
             "elapsed_s": elapsed_s,
             "achieved_eps": achieved,
@@ -270,6 +284,8 @@ pub fn finish(
                 "name_template": run.name_template,
                 "drop_connections_s": run.drop_connections_s,
                 "pipeline": run.pipeline,
+                "put": run.put,
+                "rpc": run.rpc,
                 "coalesce_us": run.coalesce_us,
                 "layout": run.layout,
                 "backpressure": run.backpressure,
@@ -312,6 +328,17 @@ pub fn finish(
     }
     if sessions.closed_down > 0 {
         out!("closed by restarts {:>14}", sessions.closed_down);
+    }
+    // Requests, not updates: none of the counts above includes them.
+    if counters.puts > 0 {
+        out!("puts               {:>14}", counters.puts);
+        out!("bytes put          {:>14}", counters.put_bytes);
+    }
+    if sessions.written > 0 {
+        out!("channels written   {:>14}", sessions.written);
+    }
+    if counters.rpcs > 0 {
+        out!("rpcs               {:>14}", counters.rpcs);
     }
     out!("bytes              {:>14}", counters.bytes);
     out!("elapsed            {elapsed_s:>14.1} s");

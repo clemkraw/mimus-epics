@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use mimus_emit::{Activity, Backpressure, Counters, RateMix, Schedule};
 use mimus_profile::{DescriptorPolicy, Profile};
 use mimus_serve::fleet::{Fleet, FleetSpec, Layout};
-use mimus_serve::session::{Pipeline, SessionConfig};
+use mimus_serve::session::{Pipeline, Put, Rpc, SessionConfig};
 use mimus_serve::{Dropper, Ioc, NameTemplate};
 
 /// `println!` for what MIMUS tells its operator, which survives a closed
@@ -165,6 +165,25 @@ struct ServeArgs {
     /// served the same way under both.
     #[arg(long, default_value = "permissive")]
     pipeline: Pipeline,
+
+    /// What a PUT does: `apply` (the default), `accept` or `refuse`.
+    ///
+    /// Under `apply`, what a client writes under a channel's `value` is what
+    /// the channel carries from then on, in its updates on every connection,
+    /// in a read and in an RPC reply, as on an IOC: an operator screen reads
+    /// back the setpoint it wrote, and an archiver subscribed elsewhere
+    /// records it. `accept` answers and counts each write and changes
+    /// nothing. `refuse` answers each with an error.
+    #[arg(long, default_value = "apply")]
+    put: Put,
+
+    /// What an RPC gets: `value` (the default), the channel's value as a
+    /// read returns it, whatever the request; or `refuse`, an error.
+    ///
+    /// MIMUS runs no service. A reply of the size and type each channel has
+    /// is what loads the RPC path of a client or a gateway.
+    #[arg(long, default_value = "value")]
+    rpc: Rpc,
 
     /// Drop one live connection every N seconds, without warning.
     ///
@@ -720,6 +739,11 @@ fn run_serve(args: ServeArgs) -> i32 {
         headroom,
         activity,
         alarms: args.alarms,
+        put: args.put,
+        rpc: args.rpc,
+        // One store for the run, so that what one connection writes, every
+        // connection carries.
+        written: (args.put == Put::Apply).then(|| mimus_serve::Written::new(fleet.instances.len())),
         ..Default::default()
     };
 
@@ -773,6 +797,8 @@ fn run_serve(args: ServeArgs) -> i32 {
         name_template: spec.names.pattern().to_string(),
         drop_connections_s: args.drop_connections,
         pipeline: args.pipeline.to_string(),
+        put: args.put.to_string(),
+        rpc: args.rpc.to_string(),
         coalesce_us: args.coalesce_us,
         layout: args.layout.to_string(),
         backpressure: args.backpressure.to_string(),
@@ -1001,6 +1027,7 @@ fn run_serve(args: ServeArgs) -> i32 {
             sessions.closed_down += t.sessions_closed_down();
             sessions.subscriptions += t.subscriptions();
         }
+        sessions.written = cfg.written.as_ref().map_or(0, |w| w.channels() as u64);
 
         report::finish(
             &profile,
