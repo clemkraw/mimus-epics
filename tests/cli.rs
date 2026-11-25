@@ -247,6 +247,42 @@ fn calibrating_mimus_against_itself_gives_back_the_types_it_served() {
     // The learned profile serves too.
     let o = mimus(&["inspect", learned.to_str().unwrap()]);
     assert!(o.status.success(), "{}", text(&o));
+    assert!(!text(&o).contains("replays the first"), "{}", text(&o));
+
+    // Within a budget of samples far too small for any type, each keeps the
+    // first two updates it was learned from, says so, and is still verified.
+    let budgeted = dir.path("budgeted.json");
+    let o = mimus(&[
+        "calibrate",
+        "-a",
+        &server.addrs[0],
+        "-c",
+        channels.to_str().unwrap(),
+        "-o",
+        budgeted.to_str().unwrap(),
+        "--min-distinct",
+        "8",
+        "--settled-after",
+        "3",
+        "--deadline-s",
+        "30",
+        "--sample-budget",
+        "1",
+    ]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert_eq!(
+        out.matches("replays the first 2 of").count(),
+        3,
+        "one line per type: {out}"
+    );
+    let o = mimus(&["inspect", budgeted.to_str().unwrap()]);
+    assert_eq!(
+        text(&o).matches(", replays the first 2").count(),
+        3,
+        "{}",
+        text(&o)
+    );
 
     assert!(server.interrupt().success());
     let r = report(&served_report);
@@ -340,7 +376,11 @@ fn a_timed_run_reports_what_it_offered() {
     // Three channels of that mix are given 10, 10 and 1 Hz: the offered load
     // is what they were given, not the mix's long-run average.
     assert_eq!(r["offered_eps"], 21.0);
+    // In bytes too, each update a whole message: more than its header.
+    assert!(r["offered_bytes_per_s"].as_f64().unwrap() > 21.0 * 13.0);
+    assert!(out.contains("offered load 21 updates/s, about "), "{out}");
     assert_eq!(r["emitted"], 0, "nothing subscribed");
+    assert_eq!(r["bytes_per_s"], 0.0);
     assert_eq!(r["run"]["rate_mix"], "10:2,1:60,0.1:38");
 }
 
@@ -416,6 +456,7 @@ fn calibrate_refuses_what_would_only_fail_at_the_end() {
             "listed on line 1 and again on line 2",
         ),
         (&["-c", c, "--min-distinct", "1"], "--min-distinct"),
+        (&["-c", c, "--array-from", "0"], "--array-from"),
         (&["-c", c, "--settled-after", "0"], "--settled-after"),
         (&["-c", c, "--deadline-s=-1"], "--deadline-s"),
         (&["-c", c, "--catalogue", "/no/such.db"], "--catalogue"),

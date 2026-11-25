@@ -19,11 +19,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use mimus_calibrate::build::Observed;
+use mimus_calibrate::build::{Kept, Observed};
 use mimus_calibrate::observe::{Criterion, Status, progress, status};
-use mimus_calibrate::{Settings, build, layout, shadow};
+use mimus_calibrate::{Kind, Settings, build, layout, shadow};
 use mimus_profile::{Assignment, Manifest, Profile, SessionRules, Template};
 use mimus_wire::header::ByteOrder;
+
+use crate::report::size;
 
 /// Everything the command needs.
 pub struct Args {
@@ -36,6 +38,10 @@ pub struct Args {
     pub deadline_s: f64,
     pub pvxs_version: String,
     pub epics_version: String,
+    /// Arrays of at least this many bytes are kept whole.
+    pub array_from: usize,
+    /// Bytes of samples a template keeps, at most.
+    pub sample_budget: usize,
     /// Print each step's observations, broken down by channel.
     ///
     /// Failures in this pipeline have often been invisible from the outside:
@@ -131,6 +137,12 @@ fn check_options(args: &Args) -> Result<(), String> {
             "--settled-after: {} is not a positive number of seconds",
             args.settled_after
         ));
+    }
+    if args.array_from == 0 {
+        return Err(
+            "--array-from: 0 bytes would keep even empty arrays whole; give a size of 1 or more"
+                .to_string(),
+        );
     }
     if args.min_distinct < 2 {
         return Err(format!(
@@ -251,7 +263,11 @@ pub fn run(args: Args) -> i32 {
                 Status::Silent => "never spoke".to_string(),
                 Status::NoIntrospection => "sent updates but no type descriptor".to_string(),
                 Status::Waiting { distinct } => {
-                    format!("{distinct} distinct updates, {} wanted", args.min_distinct)
+                    let wanted = observers
+                        .iter()
+                        .find(|o| o.pv == *pv)
+                        .map_or(args.min_distinct, |o| o.wanted(&criterion));
+                    format!("{distinct} distinct updates, {wanted} wanted")
                 }
                 _ => "unfinished".to_string(),
             };
@@ -467,6 +483,28 @@ pub fn run(args: Args) -> i32 {
             continue;
         };
 
+        // The grouping key has its registry ID blanked and must never be sent
+        // on the wire. The template uses the full descriptor received by a real subscription.
+        let descriptor_bytes = first
+            .introspection_full
+            .as_deref()
+            .expect("grouped on a full descriptor");
+        let descriptor =
+            mimus_wire::pvdata::Descriptor::from_init_reply(descriptor_bytes, ByteOrder::Little)
+                .ok();
+        // Bodies are compared byte by byte, except for their large arrays,
+        // which are kept whole where the descriptor says they lie. Without a
+        // descriptor the walker can read, everything is compared, as before.
+        let lay = |bodies: &[Vec<u8>]| {
+            let arrays: Option<Vec<_>> = descriptor
+                .as_ref()
+                .and_then(|d| bodies.iter().map(|b| d.arrays(b).ok()).collect());
+            match arrays {
+                Some(arrays) => layout::layout_with_arrays(bodies, &arrays, args.array_from),
+                None => layout::layout(bodies),
+            }
+        };
+
         // Use only the steady-state message shape. A monitor's first update
         // carries the complete value; subsequent updates carry deltas.
         // Diffing the two together would describe neither format correctly.
@@ -505,7 +543,7 @@ pub fn run(args: Args) -> i32 {
         let pieces = if is_static {
             vec![layout::Piece::Fixed(updates[0].clone())]
         } else {
-            match layout::layout(updates) {
+            match lay(updates) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("  {}: layout failed: {e}", first.pv);
@@ -529,12 +567,6 @@ pub fn run(args: Args) -> i32 {
             .iter()
             .find_map(|i| observers[*i].introspection_id_only.as_deref());
 
-        // The grouping key has its registry ID blanked and must never be sent
-        // on the wire. The template uses the full descriptor received by a real subscription.
-        let descriptor_bytes = first
-            .introspection_full
-            .as_deref()
-            .expect("grouped on a full descriptor");
         let name = namer.assign(&build::base_name(descriptor_bytes, &pieces));
         let template = match build::template(
             &Observed {
@@ -568,7 +600,7 @@ pub fn run(args: Args) -> i32 {
             .collect();
         let mut template = template;
         if openings.len() >= 2 {
-            match layout::layout(&openings) {
+            match lay(&openings) {
                 Ok(initial_pieces) => {
                     match build::template(
                         &Observed {
@@ -646,6 +678,25 @@ pub fn run(args: Args) -> i32 {
         );
         verified += 1;
 
+        // ---- what replay keeps ------------------------------------------
+        //
+        // Every template has been checked with all its samples; only now are
+        // those past the budget let go, the same for every slot, so what is
+        // kept is still exactly what was observed.
+        let kept = build::keep_samples(&mut template, args.sample_budget);
+        if let Some(initial) = template.initial.as_deref_mut() {
+            build::keep_samples(initial, args.sample_budget);
+        }
+        let arrays: Vec<usize> = pieces
+            .iter()
+            .filter_map(layout::Piece::as_slot)
+            .filter(|s| s.kind == Kind::Array)
+            .map(|s| s.samples.iter().map(Vec::len).max().unwrap_or(0))
+            .collect();
+        if let Some(line) = replay_note(&arrays, kept) {
+            out!("      {line}");
+        }
+
         // ---- the type's other updates -----------------------------------
         //
         // A channel whose alarm changes sends an update with more in its
@@ -654,9 +705,6 @@ pub fn run(args: Args) -> i32 {
         // for that. Every channel of the type is searched for such updates,
         // and each other changed set seen in at least two distinct bodies is
         // templated and checked as the ordinary update was, as a variant.
-        let descriptor =
-            mimus_wire::pvdata::Descriptor::from_init_reply(descriptor_bytes, ByteOrder::Little)
-                .ok();
         let fields = |bits: &[u8]| {
             descriptor
                 .as_ref()
@@ -696,21 +744,19 @@ pub fn run(args: Args) -> i32 {
                 }
                 continue;
             }
-            let variant = layout::layout(&group)
+            let variant = lay(&group).map_err(|e| e.to_string()).and_then(|pieces| {
+                build::template(
+                    &Observed {
+                        pv: &first.pv,
+                        pieces: &pieces,
+                        introspection_full: Some(descriptor_bytes),
+                        introspection_id_only: cached,
+                        observations: group.len() as u32,
+                    },
+                    vname.clone(),
+                )
                 .map_err(|e| e.to_string())
-                .and_then(|pieces| {
-                    build::template(
-                        &Observed {
-                            pv: &first.pv,
-                            pieces: &pieces,
-                            introspection_full: Some(descriptor_bytes),
-                            introspection_id_only: cached,
-                            observations: group.len() as u32,
-                        },
-                        vname.clone(),
-                    )
-                    .map_err(|e| e.to_string())
-                });
+            });
             let mut variant = match variant {
                 Ok(v) => v,
                 Err(e) => {
@@ -732,6 +778,9 @@ pub fn run(args: Args) -> i32 {
                 group.len(),
                 v.summary()
             );
+            if let Some(k) = build::keep_samples(&mut variant, args.sample_budget) {
+                out!("      {}", kept_note(k));
+            }
             template.with_variant(variant);
         }
 
@@ -859,6 +908,35 @@ fn variant_label(ordinary: &[String], changes: &[String], bits: &[u8]) -> String
     }
     let hex: Vec<String> = bits.iter().map(|b| format!("{b:02x}")).collect();
     format!("set-{}", hex.join(""))
+}
+
+/// Says what a type's large arrays are and how much of them replay keeps,
+/// or nothing for a type with neither.
+fn replay_note(arrays: &[usize], kept: Option<Kept>) -> Option<String> {
+    let whole = match arrays {
+        [] => None,
+        [one] => Some(format!("array of {} kept whole", size(*one))),
+        many => Some(format!(
+            "{} arrays kept whole ({})",
+            many.len(),
+            many.iter().map(|b| size(*b)).collect::<Vec<_>>().join(", ")
+        )),
+    };
+    match (whole, kept) {
+        (None, None) => None,
+        (Some(w), None) => Some(w),
+        (None, Some(k)) => Some(kept_note(k)),
+        (Some(w), Some(k)) => Some(format!("{w}; {}", kept_note(k))),
+    }
+}
+
+fn kept_note(k: Kept) -> String {
+    format!(
+        "replays the first {} of {} updates, {} each, within --sample-budget",
+        k.kept,
+        k.of,
+        size(k.per_observation)
+    )
 }
 
 /// Writes `text` to `path` so that the file is either the old one or the
@@ -1066,9 +1144,32 @@ mod tests {
             deadline_s: 600.0,
             pvxs_version: "unknown".into(),
             epics_version: "unknown".into(),
+            array_from: 4096,
+            sample_budget: 4 << 20,
             debug: false,
             allow_incomplete: false,
         }
+    }
+
+    #[test]
+    fn a_type_with_large_arrays_says_what_replay_keeps() {
+        assert_eq!(replay_note(&[], None), None);
+        assert_eq!(
+            replay_note(&[1 << 20], None).as_deref(),
+            Some("array of 1 MiB kept whole")
+        );
+        let kept = Kept {
+            kept: 4,
+            of: 30,
+            per_observation: (1 << 20) + 40,
+        };
+        assert_eq!(
+            replay_note(&[1 << 20, 131_072], Some(kept)).as_deref(),
+            Some(
+                "2 arrays kept whole (1 MiB, 128 KiB); replays the first 4 of 30 \
+                 updates, 1 MiB each, within --sample-budget"
+            )
+        );
     }
 
     #[test]
@@ -1087,6 +1188,9 @@ mod tests {
         }
         let mut a = args(out.clone());
         a.min_distinct = 1;
+        assert!(check_options(&a).is_err());
+        let mut a = args(out.clone());
+        a.array_from = 0;
         assert!(check_options(&a).is_err());
         let mut a = args(out.clone());
         a.catalogue = vec![PathBuf::from("/nonexistent/catalogue.db")];
