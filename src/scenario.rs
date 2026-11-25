@@ -316,8 +316,12 @@ fn on(iocs: &Iocs) -> String {
     }
 }
 
-/// A factor with no more decimals than it needs.
-fn factor(f: f64) -> String {
+/// A factor with no more decimals than it needs: two, or as many as a
+/// small one needs to show two digits, and an exponent for a huge one.
+pub fn factor(f: f64) -> String {
+    if f != 0.0 && (f.abs() < 0.01 || f.abs() >= 1e9) {
+        return format!("{f:.1e}");
+    }
     let s = format!("{f:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
@@ -730,5 +734,164 @@ mod tests {
             let s = parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
             s.check(4).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+    }
+
+    /// Seeded, so that a failure names the case that reproduces it.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Values that break parsers: zero, negative, huge, not a number, the
+    /// wrong type, the wrong unit.
+    const ODD: [&str; 22] = [
+        "0",
+        "-1",
+        "1e309",
+        "nan",
+        "inf",
+        "-0.0",
+        "4294967296",
+        "18446744073709551616",
+        "\"\"",
+        "\"0s\"",
+        "\"-5s\"",
+        "\"1e9h\"",
+        "\"5\"",
+        "\"5x\"",
+        "\"all\"",
+        "[]",
+        "[0, 0, 65535]",
+        "[-1]",
+        "{ from = 5, to = 0 }",
+        "{ from = 1, to = 1e300, steps = 0 }",
+        "true",
+        "{ }",
+    ];
+
+    #[test]
+    fn a_damaged_scenario_file_is_refused_never_panicked_on() {
+        let shipped = [
+            include_str!("../scenarios/beam-dump.toml"),
+            include_str!("../scenarios/ioc-restart.toml"),
+            include_str!("../scenarios/freeze.toml"),
+            include_str!("../scenarios/staircase.toml"),
+            include_str!("../scenarios/bad-day.toml"),
+            include_str!("../scenarios/slow-client.toml"),
+        ];
+        let cases: u64 = std::env::var("MIMUS_FUZZ_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
+        for seed in 0..cases {
+            let mut rng = Rng(seed);
+            let mut lines: Vec<String> = shipped[rng.below(shipped.len())]
+                .lines()
+                .map(str::to_string)
+                .collect();
+            for _ in 0..1 + rng.below(4) {
+                let i = rng.below(lines.len());
+                match rng.below(5) {
+                    // A value replaced.
+                    0 | 1 => {
+                        if let Some((key, _)) = lines[i].split_once('=') {
+                            lines[i] = format!("{key}= {}", ODD[rng.below(ODD.len())]);
+                        }
+                    }
+                    2 => {
+                        lines.remove(i);
+                    }
+                    3 => {
+                        let copy = lines[i].clone();
+                        lines.insert(rng.below(lines.len()), copy);
+                    }
+                    _ => {
+                        let keys = [
+                            "kind",
+                            "duration",
+                            "iocs",
+                            "share",
+                            "gain",
+                            "down",
+                            "resume",
+                            "label",
+                            "repeat",
+                            "subscriptions",
+                            "timeout",
+                            "on_start",
+                            "on_end",
+                        ];
+                        lines.insert(
+                            i,
+                            format!(
+                                "{} = {}",
+                                keys[rng.below(keys.len())],
+                                ODD[rng.below(ODD.len())]
+                            ),
+                        );
+                    }
+                }
+                if lines.is_empty() {
+                    break;
+                }
+            }
+            let text = lines.join("\n");
+            let outcome = std::panic::catch_unwind(|| {
+                if let Ok(s) = parse(&text) {
+                    let _ = s.check(1 + (seed % 4) as u16);
+                }
+            });
+            assert!(outcome.is_ok(), "seed {seed} panicked on:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_factor_shows_what_it_is_at_any_size() {
+        assert_eq!(factor(1.0), "1");
+        assert_eq!(factor(2.5), "2.5");
+        assert_eq!(factor(0.25), "0.25");
+        assert_eq!(factor(0.0001), "1.0e-4");
+        assert_eq!(factor(1e300), "1.0e300");
+        assert_eq!(factor(0.0), "0");
+        assert_eq!(percent(0.00001), "1.0e-3%");
+    }
+
+    #[test]
+    fn any_text_is_a_duration_or_refused() {
+        for seed in 0..20_000 {
+            let mut rng = Rng(seed);
+            let alphabet = [
+                "1",
+                "0",
+                ".",
+                "5",
+                "ms",
+                "s",
+                "m",
+                "h",
+                "min",
+                " ",
+                "e",
+                "-",
+                "9999999999999999999",
+            ];
+            let text: String = (0..rng.below(8))
+                .map(|_| alphabet[rng.below(alphabet.len())])
+                .collect();
+            let outcome = std::panic::catch_unwind(|| parse_duration(&text));
+            assert!(outcome.is_ok(), "{text:?} panicked");
+        }
+        assert_eq!(parse_duration("1m30s"), Ok(Duration::from_secs(90)));
+        assert!(parse_duration("1e400h").is_err());
     }
 }
