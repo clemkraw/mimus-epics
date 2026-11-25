@@ -32,6 +32,9 @@ pub struct SharedCounters {
     burst: AtomicU64,
     quiet: AtomicU64,
     alarms: AtomicU64,
+    puts: AtomicU64,
+    put_bytes: AtomicU64,
+    rpcs: AtomicU64,
     sessions_open: AtomicU64,
     sessions_total: AtomicU64,
     sessions_dropped: AtomicU64,
@@ -90,6 +93,13 @@ impl SharedCounters {
         }
         if batch.quiet > 0 {
             self.quiet.fetch_add(batch.quiet, Ordering::Relaxed);
+        }
+        if batch.puts > 0 {
+            self.puts.fetch_add(batch.puts, Ordering::Relaxed);
+            self.put_bytes.fetch_add(batch.put_bytes, Ordering::Relaxed);
+        }
+        if batch.rpcs > 0 {
+            self.rpcs.fetch_add(batch.rpcs, Ordering::Relaxed);
         }
         if batch.alarms > 0 {
             self.alarms.fetch_add(batch.alarms, Ordering::Relaxed);
@@ -155,6 +165,9 @@ impl SharedCounters {
             burst: self.burst.load(Ordering::Relaxed),
             quiet: self.quiet.load(Ordering::Relaxed),
             alarms: self.alarms.load(Ordering::Relaxed),
+            puts: self.puts.load(Ordering::Relaxed),
+            put_bytes: self.put_bytes.load(Ordering::Relaxed),
+            rpcs: self.rpcs.load(Ordering::Relaxed),
         }
     }
 
