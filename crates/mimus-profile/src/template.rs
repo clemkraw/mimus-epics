@@ -92,6 +92,20 @@ pub struct Template {
     /// Higher counts provide stronger evidence of the learned structure
     /// and allow coverage to be reported.
     pub observations: u32,
+    /// The top-level fields this message changes, as the type descriptor
+    /// names them: `value` and `timeStamp` for an ordinary update, with
+    /// `alarm` too for one that crosses an alarm limit. Empty when
+    /// calibration could not read the descriptor, or predates this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<String>,
+    /// Other updates of the same type, which change other fields: the update
+    /// that carries an alarm transition, above all. Each was learned and
+    /// checked against the bytes it came from as this template was, from the
+    /// channels of the type that sent it.
+    ///
+    /// A variant has neither an opening message nor variants of its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<Template>,
 }
 
 /// Errors indicating an invalid or inconsistent template.
@@ -129,6 +143,10 @@ pub enum TemplateError {
     NestedInitial {
         template: String,
     },
+    /// A variant carries an opening message or variants of its own.
+    NestedVariant {
+        template: String,
+    },
     /// Fewer observations than required.
     TooFewObservations {
         template: String,
@@ -161,6 +179,10 @@ impl std::fmt::Display for TemplateError {
                 f,
                 "template {template}: an initial update cannot itself have one"
             ),
+            Self::NestedVariant { template } => write!(
+                f,
+                "template {template}: a variant has no opening message and no variants"
+            ),
             Self::TooFewObservations {
                 template,
                 observations,
@@ -186,7 +208,38 @@ impl Template {
             chunks: Vec::new(),
             slots: Vec::new(),
             observations: 0,
+            changes: Vec::new(),
+            variants: Vec::new(),
         }
+    }
+
+    /// Adds another update of the same type, changing other fields.
+    pub fn with_variant(&mut self, mut variant: Template) -> &mut Self {
+        variant.initial = None;
+        variant.variants.clear();
+        self.variants.push(variant);
+        self
+    }
+
+    /// Returns whether this message changes the `alarm` field.
+    pub fn changes_alarm(&self) -> bool {
+        self.changes.iter().any(|f| f == "alarm")
+    }
+
+    /// Returns the variant that carries alarm transitions, if calibration
+    /// saw one: of the variants that change `alarm` where the ordinary
+    /// update does not, the one learned from the most updates.
+    ///
+    /// A type whose ordinary update already changes `alarm`, as some group
+    /// structures do on every update, has no transition to add.
+    pub fn alarm_variant(&self) -> Option<&Template> {
+        if self.changes_alarm() {
+            return None;
+        }
+        self.variants
+            .iter()
+            .filter(|v| v.changes_alarm())
+            .max_by_key(|v| v.observations)
     }
 
     pub fn push_fixed(&mut self, bytes: impl Into<Vec<u8>>) -> &mut Self {
@@ -300,6 +353,15 @@ impl Template {
             return Err(TemplateError::MissingIntrospection {
                 template: self.name.clone(),
             });
+        }
+
+        for v in &self.variants {
+            if v.initial.is_some() || !v.variants.is_empty() {
+                return Err(TemplateError::NestedVariant {
+                    template: v.name.clone(),
+                });
+            }
+            v.validate(min_observations)?;
         }
 
         // Always enforce a structural minimum, then apply the caller's threshold.
@@ -596,5 +658,81 @@ mod introspection_tests {
         let json = serde_json::to_string(&i).unwrap();
         assert!(!json.contains("id_only"), "{json}");
         assert_eq!(serde_json::from_str::<Introspection>(&json).unwrap(), i);
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+
+    const MONITOR: u8 = 0x0D;
+
+    fn message(name: &str, changes: &[&str], observations: u32) -> Template {
+        let mut t = Template::new(name, MONITOR);
+        t.with_introspection(Introspection {
+            full: vec![0xFD, 0x01, 0x00, 0x80],
+            id_only: None,
+        })
+        .push_fixed(vec![0x01]);
+        t.observations = observations;
+        t.changes = changes.iter().map(|c| c.to_string()).collect();
+        t
+    }
+
+    #[test]
+    fn the_alarm_variant_is_the_best_observed_one_that_changes_alarm() {
+        let mut t = message("dbl", &["value", "timeStamp"], 30);
+        assert!(t.alarm_variant().is_none());
+        t.with_variant(message("dbl+stamp", &["timeStamp"], 50))
+            .with_variant(message("dbl+alarm", &["value", "alarm", "timeStamp"], 4))
+            .with_variant(message("dbl+alarm2", &["alarm", "timeStamp"], 9));
+        assert_eq!(
+            t.alarm_variant().map(|v| v.name.as_str()),
+            Some("dbl+alarm2")
+        );
+        assert!(!t.changes_alarm());
+        assert!(t.validate(0).is_ok());
+
+        // A type whose every update changes `alarm` has no transition to add.
+        let mut group = message("grp", &["alarm", "timeStamp", "x"], 30);
+        group.with_variant(message("grp+other", &["alarm", "timeStamp", "x"], 60));
+        assert!(group.alarm_variant().is_none());
+    }
+
+    #[test]
+    fn a_variant_is_checked_and_cannot_nest() {
+        let mut t = message("dbl", &[], 30);
+        let mut bad = message("dbl+alarm", &["alarm"], 0);
+        bad.push_slot(Slot::new(1, SlotWidth::Fixed { bytes: 8 }).with_samples(vec![vec![0; 8]]));
+        t.with_variant(bad);
+        assert!(matches!(
+            t.validate(0),
+            Err(TemplateError::TooFewObservations { ref template, .. }) if template == "dbl+alarm"
+        ));
+
+        let mut t = message("dbl", &[], 30);
+        t.with_variant(message("v", &["alarm"], 3));
+        t.variants[0]
+            .variants
+            .push(message("deeper", &["alarm"], 3));
+        assert_eq!(
+            t.validate(0),
+            Err(TemplateError::NestedVariant {
+                template: "v".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_template_without_variants_reads_and_writes_as_before() {
+        let t = message("dbl", &[], 3);
+        let json = serde_json::to_string(&Template {
+            changes: Vec::new(),
+            ..t.clone()
+        })
+        .unwrap();
+        assert!(!json.contains("variants") && !json.contains("changes"));
+        let back: Template = serde_json::from_str(&json).unwrap();
+        assert!(back.variants.is_empty() && back.changes.is_empty());
     }
 }
