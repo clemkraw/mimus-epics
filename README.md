@@ -146,9 +146,11 @@ mimus demo-profile  write a hand-made profile for trying the server out
 | `-o, --out` | `profile.json` | Profile to write |
 | `--catalogue` | - | Database the reference IOC loaded, recorded in the manifest so a profile can be traced to what produced it. Give it once per database |
 | `--pvxs-version`, `--epics-version` | `unknown` | Versions of the reference IOC, recorded in the manifest |
-| `--min-distinct` | `30` | Distinct bodies a moving channel must show |
+| `--min-distinct` | `30` | Distinct bodies a moving channel must show, or as many as it can keep in the 128 MiB each channel retains, for a channel of large frames |
 | `--settled-after` | `30` | Seconds without anything new before a channel counts as settled |
 | `--deadline-s` | `600` | Overall limit |
+| `--array-from` | `4096` | Arrays of at least this many bytes, such as an image, are kept whole: one slot, replayed as observed, rather than compared byte by byte (see [Images and large arrays](#images-and-large-arrays)) |
+| `--sample-budget` | `4194304` | Bytes of recorded updates a template keeps for replay, at most. Past it, a type keeps the first updates that fit, two at least, and says so |
 | `--allow-incomplete` | off | Write a profile even if the criterion was not met (development only). The profile is marked incomplete, and every command that loads it says so |
 | `--debug` | off | Print what was seen, channel by channel |
 
@@ -156,7 +158,7 @@ mimus demo-profile  write a hand-made profile for trying the server out
 
 ### `mimus inspect`
 
-`mimus inspect profile.json` lists the templates with the number of channels assigned to each, their body size and whether it varies, and how much of the observed traffic the dominant changed-set covers. `mimus inspect a.json --diff b.json` compares two profiles. It exits nonzero when they come from the same environment (the same PVXS and EPICS base versions and catalogue checksums, all recorded at calibration) and still differ in their types or type descriptors; differences in shape are reported but expected, since which bytes are fixed depends on what moved while each profile was observed.
+`mimus inspect profile.json` lists the templates with the number of channels assigned to each, their body size and whether it varies, how many of their updates they replay when `--sample-budget` kept only the first, and how much of the observed traffic the dominant changed-set covers. `mimus inspect a.json --diff b.json` compares two profiles. It exits nonzero when they come from the same environment (the same PVXS and EPICS base versions and catalogue checksums, all recorded at calibration) and still differ in their types or type descriptors; differences in shape are reported but expected, since which bytes are fixed depends on what moved while each profile was observed.
 
 ### `mimus serve`
 
@@ -190,7 +192,7 @@ mimus demo-profile  write a hand-made profile for trying the server out
 | Option | Default | What it does |
 |---|---|---|
 | `--backpressure` | `block` | `block` lets TCP throttle MIMUS; `drop` holds the nominal rate and counts what it discards (see below) |
-| `--high-water` | `1048576` | Bytes allowed to queue per connection before `drop` discards: the stand-in for an IOC's monitor queue |
+| `--high-water` | `1048576` | Bytes allowed to queue per connection before `drop` discards: the stand-in for an IOC's monitor queue. Raise it for images: MIMUS warns when it holds fewer than two updates of the largest type served |
 | `--pipeline` | `permissive` | `strict` withholds updates from a pipelined monitor with no credit left, as PVXS does: the credit starts at the client's queue size and grows with each acknowledgement. `permissive` only counts acknowledgements |
 | `--always-full-descriptor` | off | Send the full type descriptor on every monitor, whatever the profile recorded |
 | `--tick-us` | `1000` | Scheduler resolution, from 1 µs to 1 s; lower it for rates above a few hundred hertz |
@@ -262,6 +264,54 @@ An update that crosses an alarm limit carries more than the ordinary one: the al
 Calibration learns these updates from the reference IOC. Besides the ordinary update of each type, it templates and checks, as **variants**, the other changed-sets the channels of that type sent; the catalogue's `MIM:ALM:*` channels cross their limits for that purpose (see the [catalogue README](catalogue/README.md#from-catalogue-to-profile)). `mimus inspect` lists the variants under their template.
 
 `--alarms N` sends the alarm variant N times per channel and per hour, on average, in place of an ordinary update, on every channel whose type has one. The transitions follow one another as the IOC sent them, a raise and later its clear, each with its own value, severity, status and message, and `pvxmonitor` shows them as it shows the IOC's. Which updates carry one comes from the channel's seed, so the same channels alarm at the same moments on every run. A profile calibrated before MIMUS learned variants has none, and `--alarms` says so.
+
+### Images and large arrays
+
+A consumer of a facility's cameras is loaded by bytes, not by updates: thirty frames a second of a megapixel at 8 bits are thirty megabytes. An NTNDArray also takes decode paths no scalar reaches: a union holding the pixels, arrays of structures for its dimensions and attributes, a variant union in each attribute, and a second stamp, `dataTimeStamp`, for when the frame was taken.
+
+No EPICS base record produces one, so the catalogue adds a small reference server, `catalogue/ndarray/mimus-ndarray`, built with PVXS's own normative-type builders: two NTNDArray images and two waveforms of doubles, posting frames that differ as a camera's do. It is calibrated as an IOC is, into a profile of its own, at the frame size, pixel depth and waveform length it was started with (see the [catalogue README](catalogue/README.md#images-and-large-waveforms-ndarray)):
+
+```bash
+make -C catalogue/ndarray        # against PVXS and EPICS base; see its Makefile
+EPICS_PVAS_SERVER_PORT=5085 catalogue/ndarray/mimus-ndarray --width 1024 --height 1024 &
+mimus calibrate -a 127.0.0.1:5085 -c catalogue/ndarray/channels.txt -o images.json \
+    --catalogue catalogue/ndarray/mimus-ndarray.cpp \
+    --pvxs-version <PVXS version> --epics-version <EPICS base version>
+kill %1
+```
+
+Compared byte by byte, a frame of a megapixel would be a million one-byte fields. The type descriptor says where a value's arrays lie, and calibration keeps any array of `--array-from` bytes or more (4096) whole: one slot, replayed as observed, with the bytes around it analysed as before, so both stamps beside the pixels are still found and filled with the current time. A template carries the updates it was learned from, and `--sample-budget` (4 MiB) bounds how many: past it, a type keeps the first updates that fit, two at least, each still reproduced byte for byte. From that run:
+
+```
+  ntndarray_union                2 channels    31 updates  31 observations reproduced exactly, 0% of each message pinned to fixed bytes
+      array of 1 MiB kept whole; replays the first 3 of 31 updates, 1 MiB each, within --sample-budget
+  ntscalararray_f64a             2 channels    30 updates  30 observations reproduced exactly, 0% of each message pinned to fixed bytes
+      array of 128 KiB kept whole
+```
+
+None of a frame is fixed bytes, so none is checked as fixed; all of it is checked against the frame it came from.
+
+Served, each channel sends the frames kept in turn, each with the `uniqueId` recorded with it and both stamps current, its opening message included. The banner gives the offered load in bytes as well as in updates, and the report the throughput:
+
+```bash
+mimus serve -p images.json --pvs 8 --mix ntndarray_union --rate-hz 30 \
+    --backpressure drop --high-water 8388608
+# offered load 240 updates/s, about 251.7 MB/s, backpressure drop
+```
+
+Under `--backpressure drop`, `--high-water` is a connection's queue, counted in bytes: the default megabyte holds thousands of scalar updates and not one frame. A PVXS monitor queues four updates; MIMUS warns when the mark holds fewer than two of the largest type served, and gives the size that holds four.
+
+Larger frames weigh on calibration and on the profile. Each channel retains up to 128 MiB of updates while it is observed: a channel of 8 MiB frames keeps fifteen, its opening message among them, and the criterion asks no more of it than the fourteen others. The profile carries two frames for the steady state and the opening frame of each channel, in hexadecimal: 75 MB for two channels of 2048 × 2048 frames at 16 bits.
+
+A run serves one profile. To put a facility's scalars and its cameras in front of one consumer, run two, each on its own ports and with its own prefix, and give the consumer both search addresses:
+
+```bash
+mimus serve -p profile.json --pvs 100000 --rate-hz 1 &
+mimus serve -p images.json --pvs 8 --rate-hz 10 --prefix CAM \
+    --base-port 5175 --search-port 5176 --high-water 8388608 &
+EPICS_PVA_AUTO_ADDR_LIST=NO EPICS_PVA_ADDR_LIST="127.0.0.1:5076 127.0.0.1:5176" \
+    pvxget MIM:ntscalar_f64:0 CAM:ntndarray_union:0
+```
 
 ### Scenarios
 
@@ -350,6 +400,7 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 | `elapsed_s` | Seconds from the moment MIMUS is listening to the end of the run |
 | `offered_eps` | The load the fleet offers: every channel's rate, summed, whether a client subscribed to it or not |
 | `achieved_eps` | `emitted / elapsed_s`, over the whole run, including any time before the consumer subscribed |
+| `offered_bytes_per_s`, `bytes_per_s` | The same two in bytes, headers included: what the fleet offers, each message at its longest, and `bytes / elapsed_s` |
 | `subscriptions` | Monitors still open when the run ended |
 | `late_ticks` | Times a connection fell more than 16 ticks behind. Up to 16 missed ticks are made up; beyond that the rest is skipped, never sent, so nonzero means the offered rate was not delivered in full, and any figure from the run must say so |
 | `pipeline_acks`, `flow_control_holds` | Credit acknowledgements received from pipelined monitors, and updates withheld from one with no credit left (`--pipeline strict` only) |
@@ -419,7 +470,8 @@ For every type it observed, a profile reproduces:
 - the exact type descriptor;
 - the **opening message** of a subscription or a `GET`, taken from the opening messages the reference IOC sent for that type, with its timestamp set to the channel's last processing time. Opening messages rotate across the served channels, so limits, units, enum choices and alarm states vary as they did on the IOC;
 - a stream of **steady-state updates** in the shape the IOC used most for that type, typically value and timestamp, at the rate chosen when serving. Length changes are reproduced: a string whose length moves between updates stays variable;
-- the type's **other update shapes**, each seen in at least two bodies, as variants, among them the **alarm transitions**, which `--alarms` sends.
+- the type's **other update shapes**, each seen in at least two bodies, as variants, among them the **alarm transitions**, which `--alarms` sends;
+- **large arrays**, an image's pixels above all, whole: the updates that fit `--sample-budget`, sent in turn, each byte for byte, with the stamps beside them current.
 
 What it does not reproduce: channels that stay static, and the update shapes seen only once. [The catalogue README](catalogue/README.md#from-catalogue-to-profile) gives the detail.
 
@@ -431,7 +483,7 @@ A profile is more than a bag of bytes. It also records what the reference server
 
 - **The monitor path, plus `GET` and `GET_FIELD`.** The monitor path dominates a long-running client's workload; the two read commands make `pvxget` and `pvxinfo` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. `PUT` and `RPC` are out of scope and answered with an error, and MIMUS sends no beacons.
 - **PVXS (QSRV2) only.** QSRV1 puts different bytes on the wire for the same record; a profile calibrated against one is wrong against the other.
-- **One ordinary update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape; the alarm variant replaces it only under `--alarms`, and the other variants are recorded but not sent. Static channels of a type that also has a moving channel update at the serving rate (`--rate-hz` must be positive); a type whose every channel was static gets a static template, whose channels send their opening message and nothing after it, as on the IOC. Without `--alarms`, a channel keeps the alarm state of its opening message.
+- **One ordinary update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape, a type of images the few frames its sample budget kept; the alarm variant replaces it only under `--alarms`, and the other variants are recorded but not sent. Static channels of a type that also has a moving channel update at the serving rate (`--rate-hz` must be positive); a type whose every channel was static gets a static template, whose channels send their opening message and nothing after it, as on the IOC. Without `--alarms`, a channel keeps the alarm state of its opening message.
 - **Structure is replicated; IOC dynamics are not.** Scan jitter under host load and monitor-queue behavior are properties *of an IOC*, and MIMUS deliberately does not reproduce them: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client (overflow policy), it is exposed as `--backpressure`.
 - **A profile is bound to a version.** Its manifest records the PVXS and EPICS base versions, a checksum of each catalogue database, the host, the date and the MIMUS version. Comparing profiles across PVXS releases is, incidentally, a wire-behavior change detector.
 - **Calibrate at small scale, generate at large scale.** The shipped catalogue has fewer than a hundred channels, enough to cover every type. Replication to millions happens afterwards, without the reference IOC.
@@ -446,7 +498,7 @@ A profile is more than a bag of bytes. It also records what the reference server
 | [`crates/mimus-calibrate`](crates/mimus-calibrate) | Client mode: observation, differential analysis, template building, shadow verification |
 | [`crates/mimus-serve`](crates/mimus-serve) | Server mode: fleet and naming, listeners, sessions, the per-connection type registry, UDP search responder |
 | [`src`](src) | The `mimus` command line |
-| [`catalogue`](catalogue) | The reference database and channel list calibration runs against |
+| [`catalogue`](catalogue) | The reference database and channel list calibration runs against, and in [`catalogue/ndarray`](catalogue/ndarray) a reference server for images and large waveforms |
 | [`scenarios`](scenarios) | Example scenarios for `--scenario` |
 | `bench.sh`, `bench-selftest.sh`, `repro-pvxs-stall.sh` | The benchmark and its companions |
 
@@ -457,7 +509,7 @@ cargo build --release
 cargo test --workspace
 ```
 
-No EPICS base, no PVXS, no C++ toolchain. The Rust version is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). Continuous integration checks formatting, Clippy and the documentation with warnings denied, and runs the whole test suite, in a Debian 13 container. A `softIocPVX` is needed only for `mimus calibrate` and the benchmark; see the [PVXS documentation](https://epics-base.github.io/pvxs/). Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
+No EPICS base, no PVXS, no C++ toolchain. The Rust version is pinned in [`rust-toolchain.toml`](rust-toolchain.toml). Continuous integration checks formatting, Clippy and the documentation with warnings denied, and runs the whole test suite, in a Debian 13 container. A `softIocPVX` is needed only for `mimus calibrate` and the benchmark, and a C++ compiler only for the reference server for images; see the [PVXS documentation](https://epics-base.github.io/pvxs/). Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Related work
 
