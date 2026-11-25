@@ -14,13 +14,11 @@ pub const CREATE_CHANNEL: u8 = 0x07;
 pub const DESTROY_CHANNEL: u8 = 0x08;
 pub const CONNECTION_VALIDATED: u8 = 0x09;
 pub const GET: u8 = 0x0A;
-/// Refused: MIMUS serves reads only.
 pub const PUT: u8 = 0x0B;
 pub const MONITOR: u8 = 0x0D;
 pub const DESTROY_REQUEST: u8 = 0x0F;
 pub const GET_FIELD: u8 = 0x11;
 pub const MESSAGE: u8 = 0x12;
-/// Refused: MIMUS serves reads only.
 pub const RPC: u8 = 0x14;
 
 /// Control commands. Their data is stored in the header; no payload follows.
@@ -39,6 +37,15 @@ pub const CTRL_ECHO_RESPONSE: u8 = 0x04;
 pub mod get {
     pub const INIT: u8 = 0x08;
     pub const DESTROY: u8 = 0x10;
+}
+
+/// Put sub-command bits: those of [`get`], and one of its own. A PUT and
+/// an RPC share the INIT and DESTROY of a GET.
+pub mod put {
+    /// Without INIT: asks for the value about to be written over, rather
+    /// than writing one. A PVXS client asks before it builds its value from
+    /// the one present.
+    pub const GET: u8 = 0x40;
 }
 
 /// Monitor sub-command bits. The first byte after the request ID.
