@@ -1,0 +1,47 @@
+# The consumer under test stops reading for a while, as in a long garbage
+# collection pause or a stopped process, then resumes. MIMUS cannot stop it
+# itself: two phases run commands that do, given the consumer's process ID.
+#
+#   CONSUMER_PID=4242 mimus serve -p profile.json --pvs 100000 \
+#       --backpressure ioc --scenario scenarios/slow-client.toml
+#
+# Under --backpressure ioc, MIMUS treats the paused consumer as a PVXS IOC
+# does: it keeps what the consumer does not read, and closes a connection
+# silent for 40 s. The first pause is shorter than that, the second longer:
+# after it, the consumer has to reconnect and subscribe again. The report
+# gives, for each pause, how long MIMUS's connections took to catch up.
+
+name = "slow client"
+
+[start]
+subscriptions = "all"
+timeout = "10m"
+
+[[phase]]
+kind = "steady"
+duration = "60s"
+label = "before"
+
+[[phase]]
+kind = "steady"
+duration = "15s"
+label = "paused 15 s"
+on_start = "kill -STOP $CONSUMER_PID"
+on_end = "kill -CONT $CONSUMER_PID"
+
+[[phase]]
+kind = "steady"
+duration = "60s"
+label = "after the pause"
+
+[[phase]]
+kind = "steady"
+duration = "50s"
+label = "paused 50 s"
+on_start = "kill -STOP $CONSUMER_PID"
+on_end = "kill -CONT $CONSUMER_PID"
+
+[[phase]]
+kind = "steady"
+duration = "60s"
+label = "after the timeout"

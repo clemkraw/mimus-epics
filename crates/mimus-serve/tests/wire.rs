@@ -3410,3 +3410,322 @@ async fn an_rpc_gets_the_channel_s_value_in_full_whatever_it_asks() {
     let counted = totals.snapshot();
     assert_eq!((counted.puts, counted.rpcs), (1, 1));
 }
+
+// ------------------------------------------------ an IOC's back-pressure
+
+/// Serves an IOC on an ephemeral port, every connection it accepts, and
+/// returns its address and the counters its sessions publish.
+async fn serve_counted(
+    fleet: Arc<Fleet>,
+    cfg: SessionConfig,
+) -> (std::net::SocketAddr, Arc<mimus_serve::SharedCounters>) {
+    let ioc = mimus_serve::Ioc::bind(0, "127.0.0.1:0", cfg, fleet)
+        .await
+        .unwrap();
+    let addr = ioc.addr;
+    let totals = ioc.totals();
+    tokio::spawn(ioc.serve());
+    (addr, totals)
+}
+
+/// The IOC policy, with a rate high enough, and a send buffer small
+/// enough, that a client that stops reading leaves the session holding
+/// what follows within a few milliseconds.
+fn ioc_config() -> SessionConfig {
+    SessionConfig {
+        rate_mix: RateMix::uniform(1000.0),
+        backpressure: Backpressure::Ioc,
+        send_buffer: Some(16 * 1024),
+        high_water: 256 << 20,
+        ..Default::default()
+    }
+}
+
+impl Client {
+    /// Connects with a receive buffer of about `window` bytes, so that a
+    /// client that stops reading leaves the server holding what follows.
+    async fn connect_with_window(addr: std::net::SocketAddr, window: u32) -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(window).unwrap();
+        let stream = socket.connect(addr).await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        Self {
+            stream,
+            framer: Framer::new(),
+            inbox: BytesMut::with_capacity(64 * 1024),
+            next_id: 1,
+        }
+    }
+
+    /// Asks for a monitor without waiting for the reply.
+    async fn monitor_init_unread(&mut self, server_cid: i32) -> i32 {
+        let request_id = self.id();
+        let mut p = Vec::new();
+        put_i32(&mut p, server_cid, LE);
+        put_i32(&mut p, request_id, LE);
+        p.push(commands::monitor::INIT);
+        p.push(0xFF);
+        self.send(commands::MONITOR, &p).await;
+        request_id
+    }
+
+    /// Reads to the end of the connection and counts the monitor updates
+    /// that arrive, opening values included.
+    async fn count_updates_to_the_end(&mut self, within: Duration) -> u64 {
+        let mut n = 0;
+        while let Some(frame) = self.recv_command(commands::MONITOR, within).await {
+            let mut r = Reader::new(&frame.payload, LE);
+            let _ = r.i32().unwrap();
+            if r.u8().unwrap() & commands::monitor::INIT == 0 {
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+/// When an update of the fixture's templates was stamped, in nanoseconds.
+fn update_ns(body: &[u8]) -> i128 {
+    let s = stamp(body);
+    i128::from(i64::from_le_bytes(s[..8].try_into().unwrap())) * 1_000_000_000
+        + i128::from(i32::from_le_bytes(s[8..].try_into().unwrap()))
+}
+
+/// The widest gap between the stamps of consecutive updates, in
+/// milliseconds.
+fn widest_gap_ms(updates: &[Vec<u8>]) -> i128 {
+    updates
+        .windows(2)
+        .map(|w| update_ns(&w[1]) - update_ns(&w[0]))
+        .max()
+        .unwrap_or(0)
+        / 1_000_000
+}
+
+/// Waits until no connection is behind, for at most `within`.
+async fn caught_up(totals: &mimus_serve::SharedCounters, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while totals.behind() > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
+#[tokio::test]
+async fn the_ioc_policy_keeps_what_a_frozen_client_does_not_read() {
+    // A client stopped, or in a long pause, reads nothing and sends
+    // nothing. A PVXS IOC keeps what it has for it, with no limit, until
+    // the connection times out: when the client comes back, every update
+    // is there. Nothing is dropped or written over, and the session keeps
+    // its own cadence meanwhile.
+    let f = fleet(80, 1);
+    let (addr, totals) = serve_counted(Arc::clone(&f), ioc_config()).await;
+    let mut c = Client::connect_with_window(addr, 4096).await;
+    c.handshake().await;
+    let ids = c.subscribe_all(&f.names[..40]).await;
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(totals.behind(), 1, "the session holds what is not read");
+    assert!(
+        totals.backlog_peak() > 64 * 1024,
+        "{} bytes waited",
+        totals.backlog_peak()
+    );
+
+    let updates = c
+        .collect_updates(ids[0], 100_000, Duration::from_millis(2500))
+        .await;
+    assert!(updates.len() > 2000, "{} updates", updates.len());
+    assert!(
+        widest_gap_ms(&updates) < 100,
+        "an update went missing: a gap of {} ms",
+        widest_gap_ms(&updates)
+    );
+    assert!(caught_up(&totals, Duration::from_secs(2)).await);
+    let counted = totals.snapshot();
+    assert_eq!(counted.dropped_backpressure, 0);
+    assert_eq!((counted.squashed, counted.suspensions), (0, 0));
+    assert!(counted.behind_us >= 500_000, "{} µs", counted.behind_us);
+}
+
+#[tokio::test]
+async fn a_slow_client_still_talking_suspends_the_connection_and_its_queues_write_over() {
+    // A client that falls behind but still sends, as an echo every fifteen
+    // seconds does, finds the IOC's send buffer over its limit: the IOC then
+    // stops reading, and each subscription keeps four updates, the newest
+    // written over the last, until the client has taken half of what waited.
+    let f = fleet(80, 1);
+    let cfg = SessionConfig {
+        send_limit: Some(8 * 1024),
+        ..ioc_config()
+    };
+    let (addr, totals) = serve_counted(Arc::clone(&f), cfg).await;
+    let mut c = Client::connect_with_window(addr, 4096).await;
+    c.handshake().await;
+    let ids = c.subscribe_all(&f.names[..40]).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.send(commands::ECHO, b"still here").await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let counted = totals.snapshot();
+    assert_eq!(counted.suspensions, 1, "the echo found too much waiting");
+    assert!(counted.squashed > 1000, "{} written over", counted.squashed);
+
+    let updates = c
+        .collect_updates(ids[0], 100_000, Duration::from_millis(2500))
+        .await;
+    assert!(
+        widest_gap_ms(&updates) > 300,
+        "the updates written over leave a gap: {} ms",
+        widest_gap_ms(&updates)
+    );
+    assert!(caught_up(&totals, Duration::from_secs(2)).await);
+    // The echo is answered once the client has caught up.
+    c.send(commands::ECHO, b"and now").await;
+    assert!(
+        c.recv_command(commands::ECHO, Duration::from_secs(2))
+            .await
+            .is_some()
+    );
+    assert_eq!(totals.snapshot().dropped_backpressure, 0);
+}
+
+#[tokio::test]
+async fn a_monitor_without_credit_queues_and_writes_over_under_the_ioc_policy() {
+    // Out of credit, a PVXS subscription holds its updates rather than
+    // dropping them: four, the newest over the last. The credit that comes
+    // back takes the four first, then what falls due.
+    let f = fleet(10, 1);
+    let cfg = SessionConfig {
+        rate_mix: RateMix::uniform(200.0),
+        pipeline: mimus_serve::session::Pipeline::Strict,
+        backpressure: Backpressure::Ioc,
+        ..Default::default()
+    };
+    let (addr, totals) = serve_counted(Arc::clone(&f), cfg).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let cid = c.create_channel(&f.names[0]).await.unwrap();
+    let request_id = c.monitor_init_pipelined(cid, 2).await;
+    c.monitor_start(cid, request_id).await;
+
+    let before = c
+        .collect_updates(request_id, 10, Duration::from_millis(400))
+        .await;
+    assert_eq!(before.len(), 2, "the opening value and one update");
+
+    c.monitor_ack(cid, request_id, 0, 10).await;
+    let after = c
+        .collect_updates(request_id, 20, Duration::from_millis(300))
+        .await;
+    assert_eq!(after.len(), 10, "ten credits, ten updates");
+    // The fourth held is the newest due before the credit came back.
+    let held_gap = (update_ns(&after[3]) - update_ns(&after[2])) / 1_000_000;
+    assert!(held_gap > 200, "{held_gap} ms between the third and fourth");
+    let counted = totals.snapshot();
+    assert_eq!(counted.flow_control_holds, 0);
+    assert!(counted.squashed > 50, "{} written over", counted.squashed);
+}
+
+#[tokio::test]
+async fn the_ioc_policy_closes_a_connection_silent_for_the_timeout() {
+    // A PVXS IOC closes a connection that has sent nothing for its timeout;
+    // a client sends an echo well within it, and keeps its connection.
+    let f = fleet(10, 1);
+    let cfg = SessionConfig {
+        rate_mix: RateMix::uniform(50.0),
+        conn_timeout: Duration::from_millis(400),
+        ..ioc_config()
+    };
+    let (addr, totals) = serve_counted(Arc::clone(&f), cfg).await;
+    let mut talking = Client::connect(addr).await;
+    talking.handshake().await;
+    talking.subscribe(&f.names[0]).await;
+    let mut silent = Client::connect(addr).await;
+    silent.handshake().await;
+    silent.subscribe(&f.names[1]).await;
+
+    for _ in 0..10 {
+        talking.send(commands::ECHO, b"here").await;
+        let _ = talking.collect_any(Duration::from_millis(100)).await;
+    }
+    assert_eq!(totals.sessions_timed_out(), 1);
+    assert_eq!(
+        silent
+            .count_updates_to_the_end(Duration::from_millis(500))
+            .await
+            .min(1),
+        1,
+        "what was sent before the close still arrives"
+    );
+    assert!(
+        silent.recv(Duration::from_millis(200)).await.is_none(),
+        "closed"
+    );
+    talking.send(commands::ECHO, b"still").await;
+    assert!(
+        talking
+            .recv_command(commands::ECHO, Duration::from_secs(1))
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn the_ioc_policy_closes_a_connection_past_the_high_water_mark() {
+    // An IOC keeps what a client does not read until it runs out of memory;
+    // MIMUS stops at the high-water mark, closes, and counts what it never
+    // sent.
+    let f = fleet(80, 1);
+    let cfg = SessionConfig {
+        high_water: 64 * 1024,
+        ..ioc_config()
+    };
+    let (addr, totals) = serve_counted(Arc::clone(&f), cfg).await;
+    let mut c = Client::connect_with_window(addr, 4096).await;
+    c.handshake().await;
+    c.subscribe_all(&f.names[..40]).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(totals.sessions_overflowed(), 1);
+    assert!(totals.snapshot().unsent > 0);
+}
+
+#[tokio::test]
+async fn what_reaches_the_client_is_what_was_emitted_less_what_was_never_sent() {
+    // A connection closed with updates still in MIMUS's send buffer: those
+    // were emitted, and never written. What the client reads to the end is
+    // the difference, exactly.
+    let f = fleet(80, 1);
+    let dropper = Dropper::new();
+    let cfg = SessionConfig {
+        rate_mix: RateMix::uniform(1000.0),
+        backpressure: Backpressure::Drop,
+        dropper: Some(Arc::clone(&dropper)),
+        send_buffer: Some(16 * 1024),
+        ..Default::default()
+    };
+    let (addr, totals) = serve_counted(Arc::clone(&f), cfg).await;
+    let mut c = Client::connect_with_window(addr, 4096).await;
+    c.handshake().await;
+    // Channels first, then monitors, without reading between: every update
+    // stays unread until the count.
+    let mut cids = Vec::new();
+    for name in &f.names[..40] {
+        cids.push(c.create_channel(name).await.unwrap());
+    }
+    for &cid in &cids {
+        let rid = c.monitor_init_unread(cid).await;
+        c.monitor_start(cid, rid).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    dropper.request();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let read = c.count_updates_to_the_end(Duration::from_millis(500)).await;
+    let counted = totals.snapshot();
+    assert!(counted.unsent > 0, "the drop policy's buffer held some");
+    assert_eq!(read, counted.emitted - counted.unsent);
+}

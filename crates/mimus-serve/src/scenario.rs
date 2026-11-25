@@ -10,6 +10,11 @@
 //!
 //! Phases follow one another. Each starts from the configured rates, and
 //! what a phase changes lasts as long as the phase.
+//!
+//! A phase can also run a command as it starts, and another as it ends, to
+//! act where MIMUS cannot: stop the consumer under test and resume it,
+//! slow its disk or its network. A phase with a command at its end records
+//! how long the connections behind their client then took to catch up.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,6 +63,10 @@ pub struct Phase {
     pub label: String,
     pub duration: Duration,
     pub action: Action,
+    /// A command run, through the shell, as the phase starts.
+    pub on_start: Option<String>,
+    /// A command run as the phase ends.
+    pub on_end: Option<String>,
 }
 
 /// What a phase does.
@@ -175,6 +184,11 @@ impl Scenario {
         }
         for (n, phase) in self.phases.iter().enumerate() {
             let at = |why: String| format!("phase {} ({}): {why}", n + 1, phase.label);
+            for (key, command) in [("on_start", &phase.on_start), ("on_end", &phase.on_end)] {
+                if command.as_ref().is_some_and(|c| c.trim().is_empty()) {
+                    return Err(at(format!("{key} is an empty command")));
+                }
+            }
             match &phase.action {
                 Action::Burst { .. } => {}
                 Action::Restart { down, .. } => {
@@ -284,8 +298,17 @@ impl Target {
     fn closed(&self) -> u64 {
         self.totals
             .iter()
-            .map(|t| t.sessions_dropped() + t.sessions_closed_down())
+            .map(|t| {
+                t.sessions_dropped()
+                    + t.sessions_closed_down()
+                    + t.sessions_timed_out()
+                    + t.sessions_overflowed()
+            })
             .sum()
+    }
+
+    fn behind(&self) -> u64 {
+        self.totals.iter().map(|t| t.behind()).sum()
     }
 
     fn subscriptions(&self) -> u64 {
@@ -323,8 +346,9 @@ pub struct PhaseRecord {
     pub offered: f64,
     /// What the fleet counted during the phase.
     pub counters: Counters,
-    /// Connections MIMUS closed during the phase, under `--drop-connections`
-    /// or because their IOC went down.
+    /// Connections MIMUS closed during the phase: under
+    /// `--drop-connections`, because their IOC went down, or, under the IOC
+    /// policy, because their client timed out or let too much wait.
     pub closed: u64,
     /// Subscriptions the consumer held when the phase ended.
     pub subscriptions: u64,
@@ -349,6 +373,50 @@ pub struct Recovery {
     pub after: u64,
 }
 
+/// How the connections behind their client caught up after a phase with a
+/// command at its end, such as one that resumes the consumer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchUp {
+    /// The label of the phase.
+    pub phase: String,
+    pub cycle: u32,
+    /// Connections behind as the phase ended.
+    pub behind: u64,
+    /// From the end of the phase to the moment no connection was behind,
+    /// if it came before the run ended.
+    pub caught_up: Option<Duration>,
+}
+
+/// When a phase runs a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moment {
+    Start,
+    End,
+}
+
+impl Moment {
+    /// The key a scenario file gives the command under.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Start => "on_start",
+            Self::End => "on_end",
+        }
+    }
+}
+
+/// A command a phase ran.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandRun {
+    /// The label of the phase.
+    pub phase: String,
+    pub cycle: u32,
+    pub at: Moment,
+    pub command: String,
+    /// Its exit status, or why it has none: it could not start, or a signal
+    /// ended it. `None` while it runs.
+    pub outcome: Option<Result<i32, String>>,
+}
+
 /// How long the scenario waited for the consumer before its first phase.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Wait {
@@ -365,6 +433,8 @@ pub struct Played {
     pub wait: Option<Wait>,
     pub phases: Vec<PhaseRecord>,
     pub recoveries: Vec<Recovery>,
+    pub catch_ups: Vec<CatchUp>,
+    pub commands: Vec<CommandRun>,
 }
 
 /// The record of a scenario being played, readable at any time.
@@ -528,7 +598,14 @@ pub async fn play(scenario: &Scenario, target: &Target, record: &Arc<Record>) {
             let begin = t0 + at;
             let end = begin + phase.duration;
             record.open(phase, cycle, at, target);
+            if let Some(command) = &phase.on_start {
+                run(command, Moment::Start, &phase.label, cycle, record);
+            }
             perform(phase, begin, end, target, record).await;
+            if let Some(command) = &phase.on_end {
+                run(command, Moment::End, &phase.label, cycle, record);
+                track_catch_up(&phase.label, cycle, target, record);
+            }
             record.close(target, false);
             at += phase.duration;
         }
@@ -660,6 +737,96 @@ async fn settle(target: &Target, before: u64) {
     }
 }
 
+/// Runs a phase's command through the shell, without waiting for it: the
+/// phase keeps its time. The command inherits MIMUS's environment, with
+/// `MIMUS_PHASE` and `MIMUS_CYCLE` naming the phase. What it returns is
+/// recorded when it ends; a command that cannot start or that fails is
+/// also reported at once, since the phase then likely measures nothing.
+fn run(command: &str, at: Moment, label: &str, cycle: u32, record: &Arc<Record>) {
+    let slot = {
+        let mut inner = record.lock();
+        inner.played.commands.push(CommandRun {
+            phase: label.to_string(),
+            cycle,
+            at,
+            command: command.to_string(),
+            outcome: None,
+        });
+        inner.played.commands.len() - 1
+    };
+    let mut shell = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C");
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c");
+        c
+    };
+    shell
+        .arg(command)
+        .env("MIMUS_PHASE", label)
+        .env("MIMUS_CYCLE", cycle.to_string())
+        .stdin(std::process::Stdio::null());
+    let record = Arc::clone(record);
+    let label = label.to_string();
+    let command = command.to_string();
+    tokio::spawn(async move {
+        let outcome = match shell.status().await {
+            Ok(status) => match status.code() {
+                Some(code) => Ok(code),
+                None => Err("ended by a signal".to_string()),
+            },
+            Err(e) => Err(format!("could not start: {e}")),
+        };
+        match &outcome {
+            Ok(0) => {}
+            Ok(code) => eprintln!(
+                "warning: phase {label}, {}: `{command}` exited with status {code}",
+                at.key()
+            ),
+            Err(why) => eprintln!("warning: phase {label}, {}: `{command}` {why}", at.key()),
+        }
+        record.lock().played.commands[slot].outcome = Some(outcome);
+    });
+}
+
+/// Follows the connections behind their client from the end of a phase
+/// until none is, or the run ends, and records how long that took.
+fn track_catch_up(label: &str, cycle: u32, target: &Target, record: &Arc<Record>) {
+    let slot = {
+        let mut inner = record.lock();
+        inner.played.catch_ups.push(CatchUp {
+            phase: label.to_string(),
+            cycle,
+            behind: target.behind(),
+            caught_up: None,
+        });
+        inner.played.catch_ups.len() - 1
+    };
+    let target = target.clone();
+    let record = Arc::clone(record);
+    let ended_at = tokio::time::Instant::now();
+    tokio::spawn(async move {
+        // Polled every 10 ms: the resolution of the times recorded.
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            let behind = target.behind();
+            {
+                let mut inner = record.lock();
+                if inner.ended {
+                    return;
+                }
+                if behind == 0 {
+                    inner.played.catch_ups[slot].caught_up = Some(ended_at.elapsed());
+                    return;
+                }
+            }
+            poll.tick().await;
+        }
+    });
+}
+
 /// Follows IOC `ioc` from its return until it holds `before` subscriptions
 /// again, or the run ends, and records how long that took.
 fn track_recovery(
@@ -721,6 +888,8 @@ mod tests {
             label: label.into(),
             duration: Duration::from_millis(ms),
             action,
+            on_start: None,
+            on_end: None,
         }
     }
 
@@ -1032,5 +1201,82 @@ mod tests {
         let w = record.finish(&t).wait.expect("waited");
         assert_eq!((w.wanted, w.held), (2, 2));
         assert!(w.waited >= Duration::from_millis(100));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_phase_runs_its_commands_as_it_starts_and_ends() {
+        let t = target(1, 0.0);
+        let dir = std::env::temp_dir().join(format!("mimus-commands-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log");
+        let mut first = phase("frozen", 100, Action::Steady);
+        first.on_start = Some(format!(
+            "echo \"start $MIMUS_PHASE $MIMUS_CYCLE\" >> {}",
+            log.display()
+        ));
+        first.on_end = Some(format!("echo end >> {}; exit 3", log.display()));
+        let mut second = phase("after", 100, Action::Steady);
+        second.on_start = Some("/nonexistent/command".into());
+        let s = scenario(vec![first, second]);
+        assert!(s.check(1).is_ok());
+        let record = Record::new();
+        play(&s, &t, &record).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let played = record.finish(&t);
+
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "start frozen 0\nend\n"
+        );
+        let outcomes: Vec<_> = played
+            .commands
+            .iter()
+            .map(|c| (c.phase.as_str(), c.at, c.outcome.clone()))
+            .collect();
+        assert_eq!(outcomes[0], ("frozen", Moment::Start, Some(Ok(0))));
+        assert_eq!(outcomes[1], ("frozen", Moment::End, Some(Ok(3))));
+        assert_eq!(outcomes[2].0, "after");
+        assert_eq!(
+            outcomes[2].2,
+            Some(Ok(127)),
+            "the shell found nothing to run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_command_is_refused() {
+        let mut p = phase("frozen", 100, Action::Steady);
+        p.on_end = Some("  ".into());
+        let e = scenario(vec![p]).check(1).unwrap_err();
+        assert!(e.contains("on_end is an empty command"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_phase_ending_with_a_command_records_how_long_the_connections_took_to_catch_up() {
+        let t = target(2, 0.0);
+        t.totals[0].set_behind(true);
+        t.totals[1].set_behind(true);
+        let mut p = phase("frozen", 50, Action::Steady);
+        p.on_end = Some(if cfg!(windows) { "exit 0" } else { "true" }.into());
+        let s = scenario(vec![p, phase("after", 400, Action::Steady)]);
+        let record = Record::new();
+        let play = tokio::spawn({
+            let (s, t, record) = (s.clone(), t.clone(), Arc::clone(&record));
+            async move { play(&s, &t, &record).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        t.totals[0].set_behind(false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        t.totals[1].set_behind(false);
+        play.await.unwrap();
+        let c = &record.finish(&t).catch_ups[0];
+        assert_eq!((c.phase.as_str(), c.behind), ("frozen", 2));
+        let took = c.caught_up.expect("caught up within the run");
+        assert!(
+            took >= Duration::from_millis(150) && took < Duration::from_millis(400),
+            "{took:?}"
+        );
     }
 }

@@ -35,11 +35,28 @@ pub struct SharedCounters {
     puts: AtomicU64,
     put_bytes: AtomicU64,
     rpcs: AtomicU64,
+    squashed: AtomicU64,
+    queued_at_close: AtomicU64,
+    unsent: AtomicU64,
+    behind_us: AtomicU64,
+    suspensions: AtomicU64,
     sessions_open: AtomicU64,
     sessions_total: AtomicU64,
     sessions_dropped: AtomicU64,
     /// Sessions closed because a scenario took their virtual IOC down.
     sessions_closed_down: AtomicU64,
+    /// Sessions closed, under `--backpressure ioc`, because the client sent
+    /// nothing, or took nothing MIMUS had for it, for the timeout.
+    sessions_timed_out: AtomicU64,
+    /// Sessions closed, under `--backpressure ioc`, because more than the
+    /// high-water mark waited for the client: MIMUS's own limit, where an
+    /// IOC has none.
+    sessions_overflowed: AtomicU64,
+    /// Connections currently behind: holding what the client's socket would
+    /// not take yet, or suspended. A gauge.
+    behind: AtomicU64,
+    /// The most bytes one connection had waiting in its send buffer.
+    backlog_peak: AtomicU64,
     /// Number of monitors currently started across all sessions.
     ///
     /// This is a gauge, not a cumulative count. It distinguishes an offered
@@ -104,6 +121,17 @@ impl SharedCounters {
         if batch.alarms > 0 {
             self.alarms.fetch_add(batch.alarms, Ordering::Relaxed);
         }
+        for (shared, n) in [
+            (&self.squashed, batch.squashed),
+            (&self.queued_at_close, batch.queued_at_close),
+            (&self.unsent, batch.unsent),
+            (&self.behind_us, batch.behind_us),
+            (&self.suspensions, batch.suspensions),
+        ] {
+            if n > 0 {
+                shared.fetch_add(n, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn session_opened(&self) {
@@ -152,6 +180,49 @@ impl SharedCounters {
         self.sessions_closed_down.load(Ordering::Relaxed)
     }
 
+    /// Records a session closed as a PVXS IOC closes a connection that
+    /// sent nothing, or took nothing, for its timeout.
+    pub fn session_timed_out(&self) {
+        self.sessions_timed_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn sessions_timed_out(&self) -> u64 {
+        self.sessions_timed_out.load(Ordering::Relaxed)
+    }
+
+    /// Records a session closed because more waited for its client than
+    /// MIMUS allows a connection.
+    pub fn session_overflowed(&self) {
+        self.sessions_overflowed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn sessions_overflowed(&self) -> u64 {
+        self.sessions_overflowed.load(Ordering::Relaxed)
+    }
+
+    /// Records a connection falling behind its client, or catching up.
+    pub fn set_behind(&self, behind: bool) {
+        if behind {
+            self.behind.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.behind.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Connections behind their client right now.
+    pub fn behind(&self) -> u64 {
+        self.behind.load(Ordering::Relaxed)
+    }
+
+    /// Records how many bytes a connection has waiting, keeping the most.
+    pub fn note_backlog(&self, bytes: usize) {
+        self.backlog_peak.fetch_max(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn backlog_peak(&self) -> u64 {
+        self.backlog_peak.load(Ordering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> Counters {
         Counters {
             emitted: self.emitted.load(Ordering::Relaxed),
@@ -168,6 +239,11 @@ impl SharedCounters {
             puts: self.puts.load(Ordering::Relaxed),
             put_bytes: self.put_bytes.load(Ordering::Relaxed),
             rpcs: self.rpcs.load(Ordering::Relaxed),
+            squashed: self.squashed.load(Ordering::Relaxed),
+            queued_at_close: self.queued_at_close.load(Ordering::Relaxed),
+            unsent: self.unsent.load(Ordering::Relaxed),
+            behind_us: self.behind_us.load(Ordering::Relaxed),
+            suspensions: self.suspensions.load(Ordering::Relaxed),
         }
     }
 
@@ -305,6 +381,42 @@ mod tests {
         assert_eq!(s.emitted, 70);
         assert_eq!(s.dropped_backpressure, 10);
         assert_eq!(s.offered(), 80);
+    }
+
+    #[test]
+    fn the_slow_client_counts_add_up_and_the_gauges_follow() {
+        let c = SharedCounters::new();
+        for _ in 0..3 {
+            c.add(&Counters {
+                squashed: 4,
+                queued_at_close: 1,
+                unsent: 2,
+                behind_us: 500,
+                suspensions: 1,
+                ..Default::default()
+            });
+        }
+        let s = c.snapshot();
+        assert_eq!(
+            (
+                s.squashed,
+                s.queued_at_close,
+                s.unsent,
+                s.behind_us,
+                s.suspensions
+            ),
+            (12, 3, 6, 1500, 3)
+        );
+        c.set_behind(true);
+        c.set_behind(true);
+        c.set_behind(false);
+        assert_eq!(c.behind(), 1);
+        c.note_backlog(4096);
+        c.note_backlog(1024);
+        assert_eq!(c.backlog_peak(), 4096, "the most, not the last");
+        c.session_timed_out();
+        c.session_overflowed();
+        assert_eq!((c.sessions_timed_out(), c.sessions_overflowed()), (1, 1));
     }
 
     #[test]
