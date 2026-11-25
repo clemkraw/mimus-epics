@@ -1,0 +1,28 @@
+# A beam dump: every channel changes at the same instant.
+#
+# Thousands of updates arrive in one burst, all with the same timestamp, on
+# top of the steady load. A consumer that buffers per channel takes it in
+# its stride; one that serializes its writes falls behind, and the phases
+# after the burst show how long it takes to catch up.
+
+name = "beam dump"
+
+# Play nothing until the consumer has subscribed to every channel: a burst
+# sent to a consumer still subscribing measures its start-up instead.
+[start]
+subscriptions = "all"
+timeout = "10m"
+
+[[phase]]
+kind = "steady"
+duration = "60s"
+label = "before"
+
+[[phase]]
+kind = "burst"
+share = 1.0
+
+[[phase]]
+kind = "steady"
+duration = "60s"
+label = "after"

@@ -57,25 +57,96 @@ impl Ioc {
     }
 
     /// Accepts connections indefinitely, spawning one task per connection.
+    ///
+    /// While a scenario holds the IOC down, its listening socket is closed,
+    /// so a client trying to connect is refused, as it is by a host whose IOC
+    /// process has exited, rather than left waiting in the accept queue. The
+    /// socket is bound again, on the same address, when the IOC comes back.
     pub async fn serve(self) {
+        let Self {
+            index,
+            addr,
+            listener,
+            cfg,
+            fleet,
+            totals,
+        } = self;
+        let mut listener = Some(listener);
+        let mut stage = cfg.stages.as_ref().and_then(|s| s.watch(index));
         loop {
-            let Ok((stream, _peer)) = self.listener.accept().await else {
+            if stage.as_ref().is_some_and(|r| r.borrow().down) {
+                listener = None;
+                if let Some(r) = stage.as_mut()
+                    && r.changed().await.is_err()
+                {
+                    // The scenario is over and left the IOC down.
+                    return;
+                }
+                continue;
+            }
+            let Some(open) = &listener else {
+                match rebind(addr).await {
+                    Ok(l) => listener = Some(l),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: IOC {index} cannot listen on {addr} again ({e}); retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
                 continue;
             };
-            let cfg = self.cfg.clone();
-            let fleet = Arc::clone(&self.fleet);
-            let totals = Arc::clone(&self.totals);
-            tokio::spawn(async move {
-                let Ok(session) = Session::new(cfg, fleet) else {
-                    return;
-                };
-                totals.session_opened();
-                let session = session.with_shared(Arc::clone(&totals));
-                let _ = session.run(stream).await;
-                totals.session_closed();
-            });
+            tokio::select! {
+                accepted = open.accept() => {
+                    let Ok((stream, _peer)) = accepted else {
+                        continue;
+                    };
+                    let cfg = cfg.clone();
+                    let fleet = Arc::clone(&fleet);
+                    let totals = Arc::clone(&totals);
+                    tokio::spawn(async move {
+                        let Ok(session) = Session::new(cfg, fleet) else {
+                            return;
+                        };
+                        totals.session_opened();
+                        let session = session.with_shared(Arc::clone(&totals));
+                        let _ = session.run(stream).await;
+                        totals.session_closed();
+                    });
+                }
+                changed = changed(&mut stage) => {
+                    if !changed {
+                        // The scenario is over: follow nothing from now on.
+                        stage = None;
+                    }
+                }
+            }
         }
     }
+}
+
+/// Completes with `true` when the stage changes, with `false` when the
+/// scenario has ended, and never when there is none.
+async fn changed(stage: &mut Option<tokio::sync::watch::Receiver<crate::stage::Stage>>) -> bool {
+    match stage {
+        Some(r) => r.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Binds a listener again on the address the IOC had.
+///
+/// The address is reused at once, as a restarted IOC does: the connections
+/// closed when it went down may still be in TIME_WAIT on this side.
+async fn rebind(addr: std::net::SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
 }
 
 /// Returns a stable GUID for a virtual IOC.

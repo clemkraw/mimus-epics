@@ -1,0 +1,22 @@
+# The load climbs in steps until the consumer falls behind.
+#
+# Ten steps of thirty seconds, from the configured rates to ten times them,
+# each reported apart. With --backpressure drop, the step where `dropped`
+# stops being zero is the consumer's limit; with block, it is the step where
+# `emitted` falls short of `offered`.
+
+name = "staircase"
+
+[start]
+subscriptions = "all"
+timeout = "10m"
+
+[[phase]]
+kind = "steady"
+duration = "30s"
+label = "baseline"
+
+[[phase]]
+kind = "gain"
+duration = "5m"
+gain = { from = 1, to = 10, steps = 10 }

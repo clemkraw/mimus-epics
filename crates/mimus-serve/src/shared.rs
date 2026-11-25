@@ -28,9 +28,13 @@ pub struct SharedCounters {
     wheel_steps: AtomicU64,
     pipeline_acks: AtomicU64,
     flow_control_holds: AtomicU64,
+    held: AtomicU64,
+    burst: AtomicU64,
     sessions_open: AtomicU64,
     sessions_total: AtomicU64,
     sessions_dropped: AtomicU64,
+    /// Sessions closed because a scenario took their virtual IOC down.
+    sessions_closed_down: AtomicU64,
     /// Number of monitors currently started across all sessions.
     ///
     /// This is a gauge, not a cumulative count. It distinguishes an offered
@@ -76,6 +80,12 @@ impl SharedCounters {
             self.flow_control_holds
                 .fetch_add(batch.flow_control_holds, Ordering::Relaxed);
         }
+        if batch.held > 0 {
+            self.held.fetch_add(batch.held, Ordering::Relaxed);
+        }
+        if batch.burst > 0 {
+            self.burst.fetch_add(batch.burst, Ordering::Relaxed);
+        }
     }
 
     pub fn session_opened(&self) {
@@ -111,6 +121,19 @@ impl SharedCounters {
         self.sessions_dropped.load(Ordering::Relaxed)
     }
 
+    /// Records a session closed because a scenario took its IOC down.
+    ///
+    /// Counted apart from [`Self::session_dropped`]: one is a single
+    /// connection lost at random, the other every connection of an IOC that
+    /// restarts, and a consumer recovers from them differently.
+    pub fn session_closed_down(&self) {
+        self.sessions_closed_down.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn sessions_closed_down(&self) -> u64 {
+        self.sessions_closed_down.load(Ordering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> Counters {
         Counters {
             emitted: self.emitted.load(Ordering::Relaxed),
@@ -120,6 +143,8 @@ impl SharedCounters {
             wheel_steps: self.wheel_steps.load(Ordering::Relaxed),
             pipeline_acks: self.pipeline_acks.load(Ordering::Relaxed),
             flow_control_holds: self.flow_control_holds.load(Ordering::Relaxed),
+            held: self.held.load(Ordering::Relaxed),
+            burst: self.burst.load(Ordering::Relaxed),
         }
     }
 

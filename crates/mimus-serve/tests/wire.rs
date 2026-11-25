@@ -2487,3 +2487,259 @@ async fn a_put_or_an_rpc_is_refused_not_left_unanswered() {
             .is_empty()
     );
 }
+
+// ------------------------------------------------------------- scenarios
+
+/// Starts a session that follows the scenario stages of IOC 0, and returns
+/// its address and the counters it publishes.
+async fn start_staged(
+    fleet: Arc<Fleet>,
+    mut cfg: SessionConfig,
+    stages: &Arc<mimus_serve::Stages>,
+) -> (std::net::SocketAddr, Arc<mimus_serve::SharedCounters>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    cfg.port = addr.port();
+    cfg.stages = Some(Arc::clone(stages));
+    let totals = mimus_serve::SharedCounters::new();
+    let shared = Arc::clone(&totals);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let session = Session::new(cfg, fleet).unwrap().with_shared(shared);
+        session.run(stream).await;
+    });
+    (addr, totals)
+}
+
+impl Client {
+    /// Collects every monitor update arriving within `within`, with the
+    /// request it belongs to.
+    async fn collect_any(&mut self, within: Duration) -> Vec<(i32, Vec<u8>)> {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut out = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return out;
+            }
+            let Some(frame) = self.recv_command(commands::MONITOR, left).await else {
+                return out;
+            };
+            let mut r = Reader::new(&frame.payload, LE);
+            let request_id = r.i32().unwrap();
+            if r.u8().unwrap() & commands::monitor::INIT == 0 {
+                out.push((request_id, r.rest().to_vec()));
+            }
+        }
+    }
+
+    /// Subscribes to every channel named, and drains their opening values.
+    async fn subscribe_all(&mut self, names: &[String]) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for name in names {
+            ids.push(self.subscribe(name).await.0);
+        }
+        let _ = self.collect_any(Duration::from_millis(100)).await;
+        ids
+    }
+}
+
+/// The timestamp of an update of the fixture's templates: the seconds and
+/// nanoseconds after the changed-set and the value.
+fn stamp(body: &[u8]) -> &[u8] {
+    &body[11..23]
+}
+
+#[tokio::test]
+async fn a_burst_sends_one_update_per_subscribed_channel_at_one_instant() {
+    // One update every hundred seconds: within the test, every update with
+    // the burst's timestamp comes from the burst.
+    let f = fleet(6, 1);
+    let stages = mimus_serve::Stages::new(1);
+    let cfg = SessionConfig {
+        rate_mix: RateMix::uniform(0.01),
+        ..Default::default()
+    };
+    let (addr, _) = start_staged(Arc::clone(&f), cfg, &stages).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let ids = c.subscribe_all(&f.names).await;
+
+    stages.burst(0, 1.0);
+    let got = c.collect_any(Duration::from_millis(300)).await;
+    let mut burst: Vec<i32> = got
+        .iter()
+        .filter(|(_, b)| stamp(b) == stamp(&got[0].1))
+        .map(|(id, _)| *id)
+        .collect();
+    burst.sort_unstable();
+    let mut want = ids.clone();
+    want.sort_unstable();
+    assert_eq!(
+        burst, want,
+        "one update from every channel, all at one instant"
+    );
+
+    // A burst of half the channels picks some of them, and no channel twice.
+    stages.burst(0, 0.5);
+    let got = c.collect_any(Duration::from_millis(300)).await;
+    let mut half: Vec<i32> = got.iter().map(|(id, _)| *id).collect();
+    half.sort_unstable();
+    half.dedup();
+    assert_eq!(half.len(), got.len(), "no channel twice");
+    assert!(half.len() < ids.len(), "{} of {}", half.len(), ids.len());
+}
+
+#[tokio::test]
+async fn a_frozen_ioc_holds_its_updates_and_resumes_with_one_per_channel() {
+    let f = fleet(4, 1);
+    let stages = mimus_serve::Stages::new(1);
+    let (addr, totals) = start_staged(Arc::clone(&f), fast_config(), &stages).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let ids = c.subscribe_all(&f.names).await;
+    assert!(!c.collect_any(Duration::from_millis(100)).await.is_empty());
+
+    stages.modify(0, |s| s.frozen = true);
+    let _ = c.collect_any(Duration::from_millis(50)).await;
+    let during = c.collect_any(Duration::from_millis(300)).await;
+    assert!(
+        during.is_empty(),
+        "{} updates from a frozen IOC",
+        during.len()
+    );
+    assert!(
+        totals.snapshot().held > 0,
+        "what fell due is counted as held"
+    );
+
+    stages.modify(0, |s| {
+        *s = s.normal();
+        s.bursts += 1;
+        s.burst_share = 1.0;
+    });
+    let after = c.collect_any(Duration::from_millis(15)).await;
+    let mut first: Vec<i32> = after
+        .iter()
+        .filter(|(_, b)| stamp(b) == stamp(&after[0].1))
+        .map(|(id, _)| *id)
+        .collect();
+    first.sort_unstable();
+    let mut want = ids.clone();
+    want.sort_unstable();
+    assert_eq!(first, want, "the resume sends every channel at once");
+    let flowing = c.collect_any(Duration::from_millis(200)).await;
+    assert!(
+        flowing.len() >= ids.len() * 5,
+        "and the rates resume: {}",
+        flowing.len()
+    );
+}
+
+#[tokio::test]
+async fn a_gain_multiplies_the_rate_and_thinning_gives_it_back() {
+    // Built for a gain of up to 4, run at 1, then at 4.
+    let f = fleet(1, 1);
+    let stages = mimus_serve::Stages::new(1);
+    let cfg = SessionConfig {
+        headroom: 4.0,
+        ..fast_config()
+    };
+    let (addr, _) = start_staged(Arc::clone(&f), cfg, &stages).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let ids = c.subscribe_all(&f.names).await;
+    let window = Duration::from_millis(1000);
+
+    let base = c.collect_updates(ids[0], 1000, window).await.len();
+    assert!(
+        (40..=60).contains(&base),
+        "50 Hz with a headroom of 4: {base}"
+    );
+
+    stages.modify(0, |s| s.gain = 4.0);
+    let _ = c.collect_any(Duration::from_millis(20)).await;
+    let fast = c.collect_updates(ids[0], 1000, window).await;
+    assert!(
+        (160..=240).contains(&fast.len()),
+        "four times 50 Hz: {}",
+        fast.len()
+    );
+    let mut stamps: Vec<&[u8]> = fast.iter().map(|b| stamp(b)).collect();
+    stamps.dedup();
+    assert_eq!(stamps.len(), fast.len(), "no two updates share a timestamp");
+}
+
+#[tokio::test]
+async fn an_ioc_going_down_closes_its_connections() {
+    let f = fleet(2, 1);
+    let stages = mimus_serve::Stages::new(1);
+    let (addr, totals) = start_staged(Arc::clone(&f), fast_config(), &stages).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let _ = c.subscribe_all(&f.names).await;
+
+    stages.modify(0, |s| s.down = true);
+    let mut buf = [0u8; 4096];
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match c.stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the connection was not closed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(totals.sessions_closed_down(), 1);
+    assert_eq!(totals.subscriptions(), 0, "its subscriptions are released");
+}
+
+#[tokio::test]
+async fn a_down_ioc_refuses_connections_and_comes_back_on_the_same_port() {
+    let f = fleet(2, 1);
+    let stages = mimus_serve::Stages::new(1);
+    let cfg = SessionConfig {
+        stages: Some(Arc::clone(&stages)),
+        ..fast_config()
+    };
+    let ioc = mimus_serve::Ioc::bind(0, "127.0.0.1:0", cfg, Arc::clone(&f))
+        .await
+        .unwrap();
+    let addr = ioc.addr;
+    tokio::spawn(ioc.serve());
+
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let _ = c.subscribe_all(&f.names).await;
+
+    stages.modify(0, |s| s.down = true);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        TcpStream::connect(addr).await.is_err(),
+        "a down IOC refuses connections"
+    );
+
+    stages.normal(0);
+    let back = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(s) = TcpStream::connect(addr).await {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the IOC came back");
+    drop(back);
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let ids = c.subscribe_all(&f.names).await;
+    assert!(
+        !c.collect_updates(ids[0], 1, Duration::from_secs(1))
+            .await
+            .is_empty(),
+        "and serves again"
+    );
+}

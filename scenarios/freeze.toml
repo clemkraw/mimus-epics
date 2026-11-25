@@ -1,0 +1,27 @@
+# Every IOC stalls, then resumes.
+#
+# For five seconds nothing is sent: what falls due is counted as held, and
+# never sent. On resuming, each subscription gets its latest value at once,
+# as a monitor queue delivers it, and the rates carry on. The consumer sees
+# a gap, then a burst.
+
+name = "freeze"
+
+[start]
+subscriptions = "all"
+timeout = "10m"
+
+[[phase]]
+kind = "steady"
+duration = "30s"
+label = "before"
+
+[[phase]]
+kind = "freeze"
+duration = "5s"
+resume = "burst"     # or "silent": the rates resume, with no catch-up
+
+[[phase]]
+kind = "steady"
+duration = "30s"
+label = "after"

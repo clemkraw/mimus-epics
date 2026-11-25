@@ -199,6 +199,7 @@ mimus demo-profile  write a hand-made profile for trying the server out
 | Option | Default | What it does |
 |---|---|---|
 | `--drop-connections` | - | Close one live connection every N seconds without warning: the consumer must reconnect and re-subscribe every channel it had there. A PVXS client that finds MIMUS through `EPICS_PVA_NAME_SERVERS` can take several seconds to come back, so keep N well above that |
+| `--scenario` | - | Play a scenario: phases of steady load, raised rates, bursts, freezes and IOC restarts, one after the other, each accounted apart. The run ends with the last phase (see [Scenarios](#scenarios)) |
 | `--duration-s` | until interrupted | Stop after this many seconds. Ctrl-C or SIGTERM ends a timed run early too, and the report is still written |
 | `--report` | - | Write the accounting report (JSON) here on exit |
 | `--debug` | off | Print the first message of each shape, in hex, as it goes out |
@@ -220,6 +221,10 @@ mimus serve -p profile.json --iocs 16 --pvs 500000 --rate-hz 7 --backpressure dr
 
 # one connection dropped without warning every 30 s
 mimus serve -p profile.json --iocs 10 --pvs 100000 --drop-connections 30
+
+# an IOC restarts once the consumer has subscribed to everything
+mimus serve -p profile.json --iocs 8 --pvs 200000 \
+    --scenario scenarios/ioc-restart.toml --report restart.json
 ```
 
 ### Discovery
@@ -239,6 +244,60 @@ When the client under test cannot keep up, TCP would normally throttle the sende
 - **`--backpressure drop`**: MIMUS holds its nominal rate and discards what does not fit within `--high-water`, counting every discard, as intermediate values are lost when an IOC's monitor queue overflows. This is the loss-under-offered-load measurement.
 
 These answer different questions. Any published figure must state which mode produced it.
+
+### Scenarios
+
+Consumers seldom fail in steady state. They fail when thousands of channels change at the same instant, when an IOC restarts and every channel it served reconnects together, when a stalled IOC resumes, or when the load climbs past what they absorb. `--scenario` stages those moments against the same fleet, from a TOML file of phases played in order:
+
+```toml
+name = "IOC restart"
+
+[start]
+subscriptions = "all"    # play nothing until the consumer has subscribed to every channel
+timeout = "10m"
+
+[[phase]]
+kind = "steady"
+duration = "30s"
+
+[[phase]]
+kind = "restart"
+iocs = [0]
+down = "10s"             # gone for ten seconds...
+duration = "90s"         # ...then eighty to come back
+
+[[phase]]
+kind = "steady"
+duration = "30s"
+```
+
+| `kind` | Fields | What happens |
+|---|---|---|
+| `steady` | `duration` | The configured rates |
+| `gain` | `duration`, `gain`, `iocs` | Every channel of the IOCs targeted at `gain` times its rate. `gain = { from = 1, to = 20 }` ramps over the phase; with `steps = 10` as well, it climbs in ten equal steps, each reported apart |
+| `burst` | `share`, `iocs`, `duration` | When the phase starts, `share` of the subscribed channels (all by default) send one update each, all with the same timestamp, as in a beam dump. The same channels are picked on every run |
+| `freeze` | `duration`, `iocs`, `resume` | The IOCs targeted send nothing; what falls due is counted as `held` and never sent. At the end, `resume = "burst"` (the default) sends every subscription its latest value at once, as a monitor queue does; `"silent"` carries on at the rates |
+| `restart` | `down`, `duration`, `iocs` | The IOCs targeted close every connection, refuse new ones and answer no search for `down`, then come back on the same ports. The rest of `duration` (`down` by default) is left for the consumer to reconnect |
+
+`iocs` is `"all"`, the default, or a list of indices. `label` names a phase in the report. Durations carry their unit: `500ms`, `60s`, `5m`, `1h`, `1m30s`. `repeat = 3` plays the phases three times. [`scenarios/`](scenarios) holds a beam dump, an IOC restart, a freeze, a staircase to find a consumer's limit, and a bad day that combines them.
+
+Each phase starts from the configured rates, and what it changes lasts as long as it does. A raised rate is not a rebuilt wheel: every schedule is built at the highest gain of the scenario and thinned back to the gain of the moment, so a channel at three times its rate sends three evenly spread updates, not three at once. A file that cannot be played is refused before MIMUS listens, with the line and the phase at fault.
+
+The report accounts for each phase apart, and for how the consumer came back from each restart. From a run of 1 000 channels at 10 Hz on two virtual IOCs, with `pvxmonitor` subscribed to all of them:
+
+```
+scenario readme (readme.toml)
+  waited 1.4 s for 1000 subscriptions before the first phase
+  phase                          start    length     offered     emitted   dropped      held  late closed   subscr.
+  before                         0.0 s    10.0 s      100008      100015         0         0     0      0      1000
+  burst 100%                    10.0 s     0.0 s        1308        1295         0         0     0      0      1000
+  restart IOC 0                 10.0 s    12.0 s      109689      101580         0         0     0      1      1000
+  freeze                        22.0 s     2.0 s        1307        1295         0     20005     0      0      1000
+  after                         24.0 s     5.0 s       49696       49705         0         0     0      0      1000
+  IOC 0 (restart IOC 0): reconnected 0.95 s after it came back; all 500 subscriptions back after 2.96 s
+```
+
+`offered` is what the phase asked for if every channel was subscribed throughout: the rates times the phase's gain, nothing from a frozen or a down IOC, plus the updates of its bursts. The restart's shortfall is the time `pvxmonitor` took to subscribe again to the 500 channels of IOC 0, and the line under the table measures it: the first connection came back 0.95 s after the IOC did, and the last subscription 2.96 s after. The JSON report holds the same, under `scenario`.
 
 ## Accounting
 
@@ -267,7 +326,7 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 | Field | Meaning |
 |---|---|
 | `emitted` | Updates written to the wire, opening messages included |
-| `sessions`, `sessions_dropped` | Connections accepted over the run, and those MIMUS closed under `--drop-connections` |
+| `sessions`, `sessions_dropped`, `sessions_closed_down` | Connections accepted over the run, those MIMUS closed under `--drop-connections`, and those closed because a scenario took their IOC down |
 | `dropped_backpressure` | Updates discarded under `--backpressure drop`. Counted, never silent |
 | `bytes` | Bytes written, headers included |
 | `elapsed_s` | Seconds from the moment MIMUS is listening to the end of the run |
@@ -277,6 +336,8 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 | `late_ticks` | Times a connection fell more than 16 ticks behind. Up to 16 missed ticks are made up; beyond that the rest is skipped, never sent, so nonzero means the offered rate was not delivered in full, and any figure from the run must say so |
 | `pipeline_acks`, `flow_control_holds` | Credit acknowledgements received from pipelined monitors, and updates withheld from one with no credit left (`--pipeline strict` only) |
 | `wheel_steps` | Turns of the timing wheel, to tell a wheel turning at the wrong speed from a wrong population |
+| `held`, `burst` | Under a scenario: updates that fell due while their IOC was frozen and were never sent, and updates sent by bursts and resumes, a part of `emitted` |
+| `scenario` | The scenario played, phase by phase, with its restarts' recovery times; `null` without one |
 | `profile`, `run` | The manifest: what was served, and with which options |
 
 `emitted` is what makes an end-to-end conservation check possible on the consumer side. Updates dropped under `--backpressure drop` never reached the wire, so they are not part of it. For an archiver:
@@ -285,7 +346,7 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 mimus.emitted == rows_stored + <every loss counter the client exposes>
 ```
 
-Any residual is either a bug in the client or a missing counter in it, and both are worth knowing. A consumer that cannot close this equation is a consumer that loses data without noticing. On MIMUS's side, an update due on a subscribed channel is either emitted, dropped (`dropped_backpressure`) or withheld from a pipelined monitor with no credit (`flow_control_holds`); only the time skipped after a late tick is in none of the three.
+Any residual is either a bug in the client or a missing counter in it, and both are worth knowing. A consumer that cannot close this equation is a consumer that loses data without noticing. On MIMUS's side, an update due on a subscribed channel is either emitted, dropped (`dropped_backpressure`), withheld from a pipelined monitor with no credit (`flow_control_holds`) or held while a scenario froze its IOC (`held`); only the time skipped after a late tick is in none of the four.
 
 ## Performance
 
@@ -365,6 +426,7 @@ A profile is more than a bag of bytes. It also records what the reference server
 | [`crates/mimus-serve`](crates/mimus-serve) | Server mode: fleet and naming, listeners, sessions, the per-connection type registry, UDP search responder |
 | [`src`](src) | The `mimus` command line |
 | [`catalogue`](catalogue) | The reference database and channel list calibration runs against |
+| [`scenarios`](scenarios) | Example scenarios for `--scenario` |
 | `bench.sh`, `bench-selftest.sh`, `repro-pvxs-stall.sh` | The benchmark and its companions |
 
 ## Building and testing

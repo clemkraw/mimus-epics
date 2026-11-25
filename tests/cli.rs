@@ -452,3 +452,166 @@ fn inspect_compares_and_refuses_what_is_not_a_profile() {
         assert_eq!(o.status.code(), Some(1), "{}", text(&o));
     }
 }
+
+#[test]
+fn a_scenario_ends_the_run_and_is_accounted_phase_by_phase() {
+    let dir = Scratch::new("scenario");
+    let demo = demo_profile(&dir);
+    let scenario = dir.path("s.toml");
+    std::fs::write(
+        &scenario,
+        r#"
+name = "short"
+
+[[phase]]
+kind = "steady"
+duration = "300ms"
+label = "warm"
+
+[[phase]]
+kind = "burst"
+share = 0.5
+
+[[phase]]
+kind = "freeze"
+duration = "200ms"
+iocs = [0]
+
+[[phase]]
+kind = "gain"
+duration = "300ms"
+gain = 2
+
+[[phase]]
+kind = "restart"
+iocs = [1]
+down = "200ms"
+duration = "300ms"
+"#,
+    )
+    .unwrap();
+    let path = dir.path("report.json");
+    let started = Instant::now();
+    let o = mimus(&[
+        "serve",
+        "-p",
+        demo.to_str().unwrap(),
+        "--iocs",
+        "2",
+        "--pvs",
+        "4",
+        "--base-port",
+        "0",
+        "--search-port",
+        "0",
+        "--scenario",
+        scenario.to_str().unwrap(),
+        "--report",
+        path.to_str().unwrap(),
+    ]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the run ends with its scenario"
+    );
+    assert!(
+        out.contains("scenario short"),
+        "the banner announces it: {out}"
+    );
+    assert!(out.contains("schedules built for ×2"), "{out}");
+
+    let r = report(&path);
+    let s = &r["scenario"];
+    assert_eq!(s["name"], "short");
+    assert_eq!(s["headroom"], 2.0);
+    let phases = s["phases"].as_array().unwrap();
+    let labels: Vec<&str> = phases
+        .iter()
+        .map(|p| p["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "warm",
+            "burst 50%",
+            "freeze IOC 0",
+            "gain ×2",
+            "restart IOC 1"
+        ]
+    );
+    for p in phases {
+        assert_eq!(p["interrupted"], false);
+        assert_eq!(p["emitted"], 0, "no client: nothing is sent");
+    }
+    let length = |i: usize| phases[i]["length_s"].as_f64().unwrap();
+    assert!((0.25..0.6).contains(&length(0)), "{}", length(0));
+    assert!(length(1) < 0.5, "a burst is an instant: {}", length(1));
+    // Offered as if every channel were subscribed: 4 channels at 1 Hz, two
+    // per IOC, at twice the rate during the gain.
+    let offered = |i: usize| phases[i]["offered"].as_f64().unwrap();
+    assert!(
+        (offered(3) - 4.0 * 2.0 * length(3)).abs() < 0.5,
+        "{}",
+        offered(3)
+    );
+    let recoveries = s["recoveries"].as_array().unwrap();
+    assert_eq!(recoveries.len(), 1);
+    assert_eq!(recoveries[0]["ioc"], 1);
+    assert_eq!(recoveries[0]["before"], 0, "nothing to recover");
+}
+
+#[test]
+fn a_scenario_that_cannot_be_played_is_refused_before_serving() {
+    let dir = Scratch::new("scenario-refused");
+    let demo = demo_profile(&dir);
+    let p = demo.to_str().unwrap();
+    let write = |name: &str, body: &str| {
+        let f = dir.path(name);
+        std::fs::write(&f, body).unwrap();
+        f.to_str().unwrap().to_string()
+    };
+    let far = write(
+        "far.toml",
+        "[[phase]]\nkind = \"restart\"\niocs = [5]\ndown = \"1s\"\n",
+    );
+    let typo = write(
+        "typo.toml",
+        "[[phase]]\nkind = \"steady\"\nduration = \"1s\"\n\n[[phase]]\nkind = \"gain\"\nduration = 60\ngain = 2\n",
+    );
+    let missing = dir.path("missing.toml");
+    let cases: Vec<(String, &str)> = vec![
+        (far, "IOC 5 does not exist"),
+        (typo, "line 7"),
+        (missing.to_str().unwrap().to_string(), "cannot read"),
+    ];
+    for (file, expect) in &cases {
+        let o = mimus(&[
+            "serve",
+            "-p",
+            p,
+            "--iocs",
+            "2",
+            "--search-port",
+            "0",
+            "--base-port",
+            "0",
+            "--scenario",
+            file,
+        ]);
+        let out = text(&o);
+        assert_eq!(o.status.code(), Some(1), "{file} was accepted: {out}");
+        assert!(out.contains(expect), "{file}: expected {expect:?} in {out}");
+        assert!(!out.contains("listening"), "{file} got as far as serving");
+    }
+    let o = mimus(&[
+        "serve",
+        "-p",
+        p,
+        "--scenario",
+        &cases[0].0,
+        "--duration-s",
+        "5",
+    ]);
+    assert_eq!(o.status.code(), Some(2), "a scenario sets its own length");
+}
