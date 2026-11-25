@@ -31,6 +31,8 @@ pub struct RunSummary {
     pub layout: String,
     pub backpressure: String,
     pub tick_us: u64,
+    /// How channels alternate bursts and silences, if they do.
+    pub activity: Option<mimus_emit::Activity>,
     /// The scenario played, if any.
     pub scenario: Option<ScenarioSummary>,
 }
@@ -82,6 +84,14 @@ pub fn print_banner(
         run.offered_eps,
         run.backpressure
     );
+    if let Some(a) = run.activity.filter(|a| !a.is_constant()) {
+        out!(
+            "activity {a}: each channel active {}% of the time, in bursts of {} updates \
+             on average, the offered load counting only those",
+            a.fraction * 100.0,
+            a.mean_burst
+        );
+    }
     out!("names {}", run.name_template);
     if let Some(s) = run.drop_connections_s {
         out!("dropping one connection every {s} s");
@@ -226,6 +236,7 @@ pub fn finish(
             "dropped_backpressure": counters.dropped_backpressure,
             "held": counters.held,
             "burst": counters.burst,
+            "quiet": counters.quiet,
             "bytes": counters.bytes,
             "elapsed_s": elapsed_s,
             "achieved_eps": achieved,
@@ -242,6 +253,7 @@ pub fn finish(
                 "backpressure": run.backpressure,
                 "tick_us": run.tick_us,
                 "mix": run.mix,
+                "activity": run.activity.map(|a| a.to_string()),
             },
             "scenario": scenario_json(run, played),
             "profile": {
@@ -267,6 +279,9 @@ pub fn finish(
     out!("dropped (pressure) {:>14}", counters.dropped_backpressure);
     if counters.held > 0 {
         out!("held (frozen)      {:>14}", counters.held);
+    }
+    if counters.quiet > 0 {
+        out!("quiet (activity)   {:>14}", counters.quiet);
     }
     if sessions.closed_down > 0 {
         out!("closed by restarts {:>14}", sessions.closed_down);
@@ -373,6 +388,7 @@ fn scenario_json(run: &RunSummary, played: Option<&Played>) -> serde_json::Value
             "dropped_backpressure": p.counters.dropped_backpressure,
             "held": p.counters.held,
             "burst": p.counters.burst,
+            "quiet": p.counters.quiet,
             "late_ticks": p.counters.late_ticks,
             "flow_control_holds": p.counters.flow_control_holds,
             "closed": p.closed,

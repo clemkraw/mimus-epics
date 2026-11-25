@@ -364,6 +364,8 @@ fn options_that_cannot_work_are_refused_before_serving() {
         (&["--drop-connections", "0"], "--drop-connections"),
         (&["--name-template", "X:{t}"], "distinctly"),
         (&["--report", missing_dir.to_str().unwrap()], "--report"),
+        (&["--activity", "0.9:2"], "--activity"),
+        (&["--activity", "0"], "--activity"),
     ];
     for (extra, expect) in cases {
         let mut args = vec!["serve", "-p", p, "--search-port", "0", "--base-port", "0"];
@@ -614,4 +616,37 @@ fn a_scenario_that_cannot_be_played_is_refused_before_serving() {
         "5",
     ]);
     assert_eq!(o.status.code(), Some(2), "a scenario sets its own length");
+}
+
+#[test]
+fn an_activity_model_lowers_the_offered_load_by_its_fraction() {
+    let dir = Scratch::new("activity");
+    let demo = demo_profile(&dir);
+    let path = dir.path("report.json");
+    let o = mimus(&[
+        "serve",
+        "-p",
+        demo.to_str().unwrap(),
+        "--pvs",
+        "10",
+        "--rate-hz",
+        "10",
+        "--activity",
+        "0.5:4",
+        "--base-port",
+        "0",
+        "--search-port",
+        "0",
+        "--duration-s",
+        "0.3",
+        "--report",
+        path.to_str().unwrap(),
+    ]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("activity 0.5:4"), "the banner says so: {out}");
+    let r = report(&path);
+    assert_eq!(r["offered_eps"], 50.0, "half of ten channels at 10 Hz");
+    assert_eq!(r["run"]["activity"], "0.5:4");
+    assert_eq!(r["quiet"], 0, "nothing subscribed, nothing due");
 }
