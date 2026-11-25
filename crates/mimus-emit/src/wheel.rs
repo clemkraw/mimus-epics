@@ -312,6 +312,17 @@ impl RateMix {
         Ok(Self { groups })
     }
 
+    /// Returns the same mix with every rate multiplied by `factor`.
+    ///
+    /// A scenario that raises the rate builds its schedule at the highest
+    /// rate it will ask for and thins it back the rest of the time, so the
+    /// shares, and therefore every channel's group, stay the same.
+    pub fn scaled(&self, factor: f64) -> Self {
+        Self {
+            groups: self.groups.iter().map(|&(r, s)| (r * factor, s)).collect(),
+        }
+    }
+
     /// Returns the rate group assigned to the channel at `index`.
     ///
     /// Repeats the group shares in a cycle rather than assigning contiguous

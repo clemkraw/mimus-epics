@@ -34,6 +34,14 @@ pub struct Counters {
     /// population. Both can produce the same update count but require
     /// different fixes.
     pub wheel_steps: u64,
+    /// Updates a scenario held back: due while their virtual IOC was frozen,
+    /// and never sent. An IOC that stops processing does not send late what
+    /// it did not process, so these are not losses of the consumer's making.
+    pub held: u64,
+    /// Updates sent by a scenario's bursts, and by frozen IOCs resuming:
+    /// a part of `emitted`, counted apart so a report can say which phase
+    /// asked for them.
+    pub burst: u64,
 }
 
 impl Counters {
@@ -67,6 +75,31 @@ impl Counters {
         self.wheel_steps += other.wheel_steps;
         self.pipeline_acks += other.pipeline_acks;
         self.flow_control_holds += other.flow_control_holds;
+        self.held += other.held;
+        self.burst += other.burst;
+    }
+
+    /// Returns what was counted between `earlier` and these totals.
+    ///
+    /// Both must come from the same counters, `earlier` first, as when a
+    /// scenario takes a snapshot at each phase boundary. A count that went
+    /// down, which those cannot, gives zero rather than wrapping around.
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            emitted: self.emitted.saturating_sub(earlier.emitted),
+            dropped_backpressure: self
+                .dropped_backpressure
+                .saturating_sub(earlier.dropped_backpressure),
+            bytes: self.bytes.saturating_sub(earlier.bytes),
+            pipeline_acks: self.pipeline_acks.saturating_sub(earlier.pipeline_acks),
+            flow_control_holds: self
+                .flow_control_holds
+                .saturating_sub(earlier.flow_control_holds),
+            late_ticks: self.late_ticks.saturating_sub(earlier.late_ticks),
+            wheel_steps: self.wheel_steps.saturating_sub(earlier.wheel_steps),
+            held: self.held.saturating_sub(earlier.held),
+            burst: self.burst.saturating_sub(earlier.burst),
+        }
     }
 }
 
@@ -110,6 +143,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_phase_counts_what_happened_since_its_start() {
+        let start = Counters {
+            emitted: 100,
+            bytes: 4000,
+            held: 7,
+            ..Default::default()
+        };
+        let end = Counters {
+            emitted: 250,
+            bytes: 10_000,
+            held: 7,
+            late_ticks: 2,
+            ..Default::default()
+        };
+        let phase = end.since(&start);
+        assert_eq!(phase.emitted, 150);
+        assert_eq!(phase.bytes, 6000);
+        assert_eq!(phase.held, 0);
+        assert_eq!(phase.late_ticks, 2);
+        assert_eq!(
+            start.since(&end).emitted,
+            0,
+            "saturates instead of wrapping"
+        );
+    }
+
+    #[test]
     fn offered_is_emitted_plus_dropped() {
         let c = Counters {
             emitted: 990,
@@ -147,6 +207,8 @@ mod tests {
             wheel_steps: 40,
             pipeline_acks: 5,
             flow_control_holds: 6,
+            held: 7,
+            burst: 8,
         };
         a.merge(&Counters {
             emitted: 10,
@@ -156,6 +218,8 @@ mod tests {
             wheel_steps: 400,
             pipeline_acks: 50,
             flow_control_holds: 60,
+            held: 70,
+            burst: 80,
         });
         assert_eq!(
             a,
@@ -167,6 +231,8 @@ mod tests {
                 wheel_steps: 440,
                 pipeline_acks: 55,
                 flow_control_holds: 66,
+                held: 77,
+                burst: 88,
             }
         );
     }
