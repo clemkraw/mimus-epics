@@ -240,10 +240,21 @@ impl Client {
         assert_eq!(validated.payload[0], 0xFF, "OK status");
     }
 
+    /// Searches as a PVXS client does for channels: by unicast, asking for
+    /// no reply to a miss.
     async fn search(&mut self, names: &[&str]) -> Vec<i32> {
+        self.search_with(0x80, names)
+            .await
+            .map(|(_, found)| found)
+            .unwrap_or_default()
+    }
+
+    /// Searches with the given flags, and returns the reply's found flag
+    /// and the channels found, if a reply comes.
+    async fn search_with(&mut self, flags: u8, names: &[&str]) -> Option<(u8, Vec<i32>)> {
         let mut p = Vec::new();
         put_i32(&mut p, 42, LE);
-        p.push(0x81);
+        p.push(flags);
         p.extend_from_slice(&[0, 0, 0]);
         p.extend_from_slice(&[0u8; 16]);
         p.extend_from_slice(&0u16.to_le_bytes());
@@ -259,21 +270,24 @@ impl Client {
         }
         self.send(commands::SEARCH, &p).await;
 
-        let Some(frame) = self
+        let frame = self
             .recv_command(commands::SEARCH_RESPONSE, Duration::from_millis(500))
-            .await
-        else {
-            return Vec::new();
-        };
+            .await?;
         let mut r = Reader::new(&frame.payload, LE);
         r.skip(mimus_wire::GUID_LEN).unwrap();
         assert_eq!(r.i32().unwrap(), 42, "sequence id echoed");
         r.skip(16).unwrap();
         let _port = r.u16().unwrap();
         assert_eq!(r.string().unwrap(), "tcp");
-        assert_eq!(r.u8().unwrap(), 1);
+        let found = r.u8().unwrap();
         let n = r.i16().unwrap();
-        (0..n).map(|_| r.i32().unwrap()).collect()
+        let ids: Vec<i32> = (0..n).map(|_| r.i32().unwrap()).collect();
+        assert_eq!(
+            found,
+            u8::from(!ids.is_empty()),
+            "the found flag says whether any was"
+        );
+        Some((found, ids))
     }
 
     /// Opens a channel and returns its server-assigned channel ID.
@@ -445,6 +459,116 @@ async fn search_stays_silent_for_channels_that_do_not() {
     let mut c = Client::connect(addr).await;
     c.handshake().await;
     assert!(c.search(&["NO:SUCH:PV"]).await.is_empty());
+}
+
+/// Reads until the server closes, for `within` at most: true if it closed.
+/// For a peer that has not validated, so has no [`Client`].
+async fn raw_closed_within(stream: &mut TcpStream, within: Duration) -> bool {
+    let mut buf = [0u8; 4096];
+    let until = tokio::time::Instant::now() + within;
+    loop {
+        match tokio::time::timeout_at(until, stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return true,
+            Ok(Ok(_)) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_peer_that_never_validates_is_closed_after_the_connection_timeout() {
+    let cfg = SessionConfig {
+        conn_timeout: Duration::from_millis(300),
+        ..fast_config()
+    };
+    let addr = start(fleet(10, 1), cfg).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    assert!(raw_closed_within(&mut stream, Duration::from_secs(5)).await);
+}
+
+#[tokio::test]
+async fn a_peer_that_never_validates_is_closed_when_the_run_ends() {
+    let (end, end_rx) = tokio::sync::watch::channel(false);
+    let cfg = SessionConfig {
+        run_end: Some(end_rx),
+        ..fast_config()
+    };
+    let addr = start(fleet(10, 1), cfg).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    assert!(!raw_closed_within(&mut stream, Duration::from_millis(300)).await);
+    end.send(true).unwrap();
+    assert!(raw_closed_within(&mut stream, Duration::from_secs(5)).await);
+}
+
+#[tokio::test]
+async fn requests_sent_with_the_validation_are_answered() {
+    // A client may send its first requests in the same packet as its
+    // validation. The session read them with it, and then waited for more
+    // bytes before looking at them: a client waiting for the replies waited
+    // for ever.
+    let f = fleet(10, 1);
+    let addr = start(Arc::clone(&f), fast_config()).await;
+    let mut c = Client::connect(addr).await;
+    c.recv_command(commands::CONNECTION_VALIDATION, Duration::from_secs(2))
+        .await
+        .expect("validation");
+    let frame = |command: u8, payload: &[u8]| {
+        let h = Header::application(
+            command,
+            payload.len() as i32,
+            LE,
+            Direction::FromClient,
+            Segmentation::None,
+        );
+        let mut b = h.encode().to_vec();
+        b.extend_from_slice(payload);
+        b
+    };
+    let mut validation = Vec::new();
+    put_i32(&mut validation, 32768, LE);
+    put_i16(&mut validation, 1024, LE);
+    put_i16(&mut validation, 0, LE);
+    put_string(&mut validation, "anonymous", LE);
+    validation.push(0xFF);
+    let mut create = Vec::new();
+    put_i16(&mut create, 1, LE);
+    put_i32(&mut create, 7, LE);
+    put_string(&mut create, &f.names[0], LE);
+    let mut packet = frame(commands::CONNECTION_VALIDATION, &validation);
+    packet.extend(frame(commands::CREATE_CHANNEL, &create));
+    packet.extend(frame(commands::ECHO, b"too"));
+    c.stream.write_all(&packet).await.unwrap();
+    let created = c
+        .recv_command(commands::CREATE_CHANNEL, Duration::from_secs(2))
+        .await
+        .expect("the channel, created without a further message");
+    assert_eq!(
+        i32::from_le_bytes(created.payload[..4].try_into().unwrap()),
+        7
+    );
+    assert!(
+        c.recv_command(commands::ECHO, Duration::from_secs(2))
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_search_that_requires_a_reply_gets_one_even_when_it_finds_nothing() {
+    // `pvxlist` finds servers with a search that names no channel and asks
+    // for a reply: PVXS answers it, found or not.
+    let f = fleet(10, 1);
+    let addr = start(Arc::clone(&f), fast_config()).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    assert_eq!(c.search_with(0x81, &[]).await, Some((0, vec![])));
+    assert_eq!(
+        c.search_with(0x81, &["NO:SUCH:PV"]).await,
+        Some((0, vec![]))
+    );
+    let found = c.search_with(0x81, &[&f.names[0]]).await.unwrap();
+    assert_eq!((found.0, found.1.len()), (1, 1));
+    assert_eq!(c.search_with(0x80, &["NO:SUCH:PV"]).await, None);
 }
 
 #[tokio::test]
@@ -3728,4 +3852,372 @@ async fn what_reaches_the_client_is_what_was_emitted_less_what_was_never_sent() 
     let counted = totals.snapshot();
     assert!(counted.unsent > 0, "the drop policy's buffer held some");
     assert_eq!(read, counted.emitted - counted.unsent);
+}
+
+// ------------------------------------------------ a peer that sends anything
+
+/// SplitMix64, seeded, so that a failure names the case that reproduces it.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn chance(&mut self, one_in: usize) -> bool {
+        self.below(one_in) == 0
+    }
+    fn bytes(&mut self, max: usize) -> Vec<u8> {
+        let n = self.below(max + 1);
+        (0..n).map(|_| self.next() as u8).collect()
+    }
+    fn pick<T: Copy>(&mut self, from: &[T]) -> T {
+        from[self.below(from.len())]
+    }
+}
+
+/// What the peer knows: the channels and requests it opened, so that its
+/// messages name real ones as often as not.
+#[derive(Default)]
+struct Known {
+    channels: Vec<i32>,
+    requests: Vec<i32>,
+}
+
+/// A message from a peer that follows the grammar loosely: real commands,
+/// real and invented identifiers, sub-commands real and not, values right,
+/// damaged and random.
+fn any_message(rng: &mut Rng, names: &[String], known: &mut Known) -> (bool, u8, Vec<u8>) {
+    let sid = |rng: &mut Rng, known: &Known| {
+        if !known.channels.is_empty() && !rng.chance(4) {
+            rng.pick(&known.channels)
+        } else {
+            rng.next() as i32
+        }
+    };
+    let ioid = |rng: &mut Rng, known: &mut Known| {
+        if !known.requests.is_empty() && rng.chance(2) {
+            rng.pick(&known.requests)
+        } else {
+            let id = (rng.next() % 64) as i32;
+            known.requests.push(id);
+            id
+        }
+    };
+    let name = |rng: &mut Rng| {
+        if rng.chance(3) {
+            String::from_utf8_lossy(&rng.bytes(20)).into_owned()
+        } else {
+            names[rng.below(names.len())].clone()
+        }
+    };
+    // The value of a PUT to the writable fixture: the changed set, then the
+    // double, right or not.
+    let put_value = |rng: &mut Rng| -> Vec<u8> {
+        match rng.below(4) {
+            0 => {
+                let mut v = vec![0x01, 0x02];
+                v.extend_from_slice(&(rng.next() as f64).to_le_bytes());
+                v
+            }
+            1 => {
+                let mut v = vec![0x01, 0x01];
+                v.extend(rng.bytes(40));
+                v
+            }
+            _ => rng.bytes(24),
+        }
+    };
+    let request = |rng: &mut Rng| -> Vec<u8> {
+        match rng.below(5) {
+            0 => vec![0xFF],
+            1 => vec![0x80, 0x00, 0x00],
+            2 => {
+                // record[queueSize=…], right or not.
+                let mut d = vec![0x80, 0x00, 0x01];
+                put_string(&mut d, "record", LE);
+                d.extend_from_slice(&[0x80, 0x00, 0x01]);
+                put_string(&mut d, "_options", LE);
+                d.extend_from_slice(&[0x80, 0x00, 0x01]);
+                put_string(&mut d, "queueSize", LE);
+                d.push(0x60);
+                put_string(&mut d, &format!("{}", rng.next() as i64 % 10), LE);
+                d
+            }
+            _ => rng.bytes(32),
+        }
+    };
+    let gpr_subs = [0x08u8, 0x00, 0x40, 0x10, 0x48, 0x50, 0x08, 0x00];
+    let monitor_subs = [0x08u8, 0x88, 0x44, 0x04, 0x10, 0x80, 0x00, 0x44];
+    match rng.below(16) {
+        0 => (false, commands::ECHO, rng.bytes(32)),
+        1 => {
+            let mut p = Vec::new();
+            put_i32(&mut p, rng.next() as i32, LE);
+            p.push(rng.pick(&[0x00u8, 0x01, 0x80, 0x81]));
+            p.extend_from_slice(&[0; 19]);
+            put_size(&mut p, 1, LE);
+            put_string(&mut p, "tcp", LE);
+            let n = rng.below(4);
+            put_i16(&mut p, n as i16, LE);
+            for _ in 0..n {
+                put_i32(&mut p, rng.next() as i32, LE);
+                put_string(&mut p, &name(rng), LE);
+            }
+            (false, commands::SEARCH, p)
+        }
+        2 | 3 => {
+            let mut p = Vec::new();
+            let n = 1 + rng.below(3);
+            put_i16(&mut p, n as i16, LE);
+            for _ in 0..n {
+                put_i32(&mut p, rng.next() as i32 & 0xFFFF, LE);
+                put_string(&mut p, &name(rng), LE);
+            }
+            (false, commands::CREATE_CHANNEL, p)
+        }
+        4 => {
+            let mut p = Vec::new();
+            put_i32(&mut p, sid(rng, known), LE);
+            put_i32(&mut p, rng.next() as i32, LE);
+            (false, commands::DESTROY_CHANNEL, p)
+        }
+        5..=8 => {
+            let command = rng.pick(&[
+                commands::GET,
+                commands::PUT,
+                commands::RPC,
+                commands::MONITOR,
+            ]);
+            let mut p = Vec::new();
+            put_i32(&mut p, sid(rng, known), LE);
+            put_i32(&mut p, ioid(rng, known), LE);
+            let sub = if command == commands::MONITOR {
+                rng.pick(&monitor_subs)
+            } else {
+                rng.pick(&gpr_subs)
+            };
+            p.push(sub);
+            if sub & 0x08 != 0 {
+                p.extend(request(rng));
+                if sub & 0x80 != 0 {
+                    put_i32(&mut p, rng.below(8) as i32, LE);
+                }
+            } else if command == commands::MONITOR && sub == 0x80 {
+                put_i32(&mut p, rng.below(16) as i32, LE);
+            } else if command == commands::PUT {
+                p.extend(put_value(rng));
+            } else if command == commands::RPC {
+                p.extend(request(rng));
+            } else if rng.chance(3) {
+                p.extend(rng.bytes(16));
+            }
+            (false, command, p)
+        }
+        9 => {
+            let mut p = Vec::new();
+            put_i32(&mut p, sid(rng, known), LE);
+            put_i32(&mut p, ioid(rng, known), LE);
+            (false, commands::DESTROY_REQUEST, p)
+        }
+        10 => {
+            let mut p = Vec::new();
+            put_i32(&mut p, sid(rng, known), LE);
+            put_i32(&mut p, ioid(rng, known), LE);
+            put_string(&mut p, &name(rng), LE);
+            (false, commands::GET_FIELD, p)
+        }
+        11 => (true, rng.pick(&[0u8, 1, 2, 3, 4, 0x7F]), Vec::new()),
+        12 => (false, commands::CONNECTION_VALIDATION, rng.bytes(16)),
+        _ => (false, rng.next() as u8, rng.bytes(48)),
+    }
+}
+
+/// A configuration drawn from every policy MIMUS has.
+fn any_config(rng: &mut Rng) -> SessionConfig {
+    SessionConfig {
+        rate_mix: RateMix::uniform([1.0, 50.0, 500.0][rng.below(3)]),
+        tick_us: 1000,
+        backpressure: [Backpressure::Block, Backpressure::Drop, Backpressure::Ioc][rng.below(3)],
+        pipeline: if rng.chance(2) {
+            mimus_serve::session::Pipeline::Strict
+        } else {
+            mimus_serve::session::Pipeline::Permissive
+        },
+        put: [Put::Apply, Put::Accept, Put::Refuse][rng.below(3)],
+        rpc: [Rpc::Value, Rpc::Refuse][rng.below(2)],
+        coalesce_us: [0, 0, 200][rng.below(3)],
+        high_water: [1 << 20, 4096, 64 << 20][rng.below(3)],
+        send_limit: [None, Some(1024)][rng.below(2)],
+        conn_timeout: Duration::from_secs(5),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_survives_whatever_a_peer_sends() {
+    // A session may answer, refuse or close; it may not panic, and it may
+    // not stop answering a peer that still talks while it is open.
+    let sessions: u64 = std::env::var("MIMUS_FUZZ_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    // MIMUS_FUZZ_SEED replays one case, and MIMUS_FUZZ_TRACE prints it.
+    let only: Option<u64> = std::env::var("MIMUS_FUZZ_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let trace = std::env::var_os("MIMUS_FUZZ_TRACE").is_some();
+    for seed in only.map_or(0..sessions, |s| s..s + 1) {
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
+        let f = if rng.chance(2) {
+            writable_fleet()
+        } else {
+            fleet(10, 1)
+        };
+        let names: Vec<String> = f.names.clone();
+        let cfg = any_config(&mut rng);
+        if trace {
+            eprintln!(
+                "seed {seed}: {} {} put {} rpc {} coalesce {} high water {} send limit {:?}",
+                cfg.backpressure,
+                cfg.pipeline,
+                cfg.put,
+                cfg.rpc,
+                cfg.coalesce_us,
+                cfg.high_water,
+                cfg.send_limit
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let session = tokio::spawn({
+            let f = Arc::clone(&f);
+            let mut cfg = cfg;
+            cfg.port = addr.port();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                Session::new(cfg, f).unwrap().run(stream).await
+            }
+        });
+        let mut c = Client::connect(addr).await;
+        let mut alive = true;
+        // A session waits for the peer's validation before it answers
+        // anything else, so only a peer that gave it is owed answers.
+        let validated = !rng.chance(5);
+        if validated {
+            c.handshake().await;
+        } else {
+            // Garbage before the handshake.
+            alive = c.stream.write_all(&rng.bytes(64)).await.is_ok();
+        }
+        let mut known = Known::default();
+        let steps = rng.below(60);
+        for step in 0..steps {
+            if !alive {
+                break;
+            }
+            let (control, command, payload) = any_message(&mut rng, &names, &mut known);
+            let seg = if !control && rng.chance(12) {
+                rng.pick(&[
+                    Segmentation::First,
+                    Segmentation::Middle,
+                    Segmentation::Last,
+                ])
+            } else {
+                Segmentation::None
+            };
+            let hdr = if control {
+                Header::control(command, rng.next() as i32, LE, Direction::FromClient)
+            } else {
+                Header::application(
+                    command,
+                    payload.len() as i32,
+                    LE,
+                    Direction::FromClient,
+                    seg,
+                )
+            };
+            let mut bytes = hdr.encode().to_vec();
+            bytes.extend_from_slice(&payload);
+            if trace {
+                eprintln!("  {step}: {hdr} {:02x?}", &payload[..payload.len().min(24)]);
+            }
+            // A message cut short, now and then: the rest never comes, so
+            // it is the last.
+            let cut = rng.chance(30);
+            if cut {
+                bytes.truncate(rng.below(bytes.len()));
+            }
+            alive = c.stream.write_all(&bytes).await.is_ok();
+            if cut {
+                break;
+            }
+            // Read what came back, and note the channels created.
+            while let Some(frame) = c.recv(Duration::from_millis(5)).await {
+                if trace {
+                    eprintln!(
+                        "    <- {} {:02x?}",
+                        frame.header,
+                        &frame.payload[..frame.payload.len().min(16)]
+                    );
+                }
+                if frame.header.command == commands::CREATE_CHANNEL && frame.payload.len() >= 9 {
+                    let mut r = Reader::new(&frame.payload, LE);
+                    let _client = r.i32().unwrap();
+                    let server = r.i32().unwrap();
+                    if r.u8().unwrap() == 0xFF {
+                        known.channels.push(server);
+                    }
+                }
+            }
+            // Now and then, is it still there?
+            if step % 10 == 9 && alive && validated {
+                let _ = c
+                    .stream
+                    .write_all(&{
+                        let h = Header::application(
+                            commands::ECHO,
+                            2,
+                            LE,
+                            Direction::FromClient,
+                            Segmentation::None,
+                        );
+                        let mut b = h.encode().to_vec();
+                        b.extend_from_slice(b"ok");
+                        b
+                    })
+                    .await;
+                let answered = c
+                    .recv_command(commands::ECHO, Duration::from_secs(3))
+                    .await
+                    .is_some();
+                let closed = session.is_finished();
+                if trace && !answered {
+                    eprintln!(
+                        "  no echo: inbox {} bytes {:02x?}, framer {:?}",
+                        c.inbox.len(),
+                        &c.inbox[..c.inbox.len().min(48)],
+                        c.framer.next_frame(&mut c.inbox.clone())
+                    );
+                }
+                assert!(
+                    answered || closed || c.framer.is_reassembling(),
+                    "seed {seed}: the session neither answered nor closed after {step} messages"
+                );
+                alive = answered;
+            }
+        }
+        drop(c);
+        match tokio::time::timeout(Duration::from_secs(8), session).await {
+            Ok(Ok(_end)) => {}
+            Ok(Err(e)) => panic!("seed {seed}: the session panicked: {e}"),
+            Err(_) => panic!("seed {seed}: the session did not end after its peer left"),
+        }
+    }
 }

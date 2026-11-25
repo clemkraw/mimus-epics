@@ -94,6 +94,10 @@ pub struct SessionConfig {
     /// The stages a scenario sets for each virtual IOC, if the run plays
     /// one. The session follows the stage of its own IOC.
     pub stages: Option<Arc<Stages>>,
+    /// Set when the run ends: the session sends what its socket takes at
+    /// once, counts the rest as never sent, and closes, so that the run's
+    /// counts are read once nothing more can change them.
+    pub run_end: Option<tokio::sync::watch::Receiver<bool>>,
     /// The highest rate factor the scenario asks for, at least 1.
     ///
     /// The schedule is built at the configured rates times this factor and
@@ -165,6 +169,7 @@ impl Default for SessionConfig {
             debug: false,
             pipeline: Pipeline::default(),
             stages: None,
+            run_end: None,
             headroom: 1.0,
             activity: None,
             alarms: None,
@@ -346,13 +351,16 @@ pub enum SessionEnd {
     Dropped,
     /// The connection's virtual IOC went down in a scenario.
     IocDown,
-    /// Under [`Backpressure::Ioc`]: the client sent nothing, or took nothing
-    /// MIMUS had for it, for the connection timeout, and MIMUS closed the
+    /// The client did not validate the connection within the connection
+    /// timeout. Or, under [`Backpressure::Ioc`]: it sent nothing, or took
+    /// nothing MIMUS had for it, for that timeout, and MIMUS closed the
     /// connection as a PVXS IOC does.
     TimedOut,
     /// Under [`Backpressure::Ioc`]: more waited for the client than the
     /// high-water mark allows.
     Overflow,
+    /// The run ended.
+    RunEnded,
 }
 
 /// Completes when this session has claimed a drop request, and never when
@@ -362,6 +370,21 @@ async fn claim_drop(dropper: Option<&Dropper>) {
         Some(d) => d.claim().await,
         None => std::future::pending().await,
     }
+}
+
+/// Completes when the run ends, and never when nothing ends it.
+async fn run_ended(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    if let Some(r) = rx {
+        while !*r.borrow_and_update() {
+            if r.changed().await.is_err() {
+                break;
+            }
+        }
+        if *r.borrow() {
+            return;
+        }
+    }
+    std::future::pending().await
 }
 
 /// Completes with the new stage when the session's IOC changes stage, and
@@ -385,6 +408,7 @@ impl std::fmt::Display for SessionEnd {
             Self::IocDown => f.write_str("closed: its IOC went down"),
             Self::TimedOut => f.write_str("closed: timed out"),
             Self::Overflow => f.write_str("closed: too much waited for the client"),
+            Self::RunEnded => f.write_str("closed: the run ended"),
         }
     }
 }
@@ -526,6 +550,22 @@ impl Session {
         if let Err(e) = self.handshake(&mut stream).await {
             return (e, self.counters);
         }
+        // A client may send its first requests in the same packet as its
+        // validation. They are in the inbox already, and no read will bring
+        // them again: left there, they waited for the client's next
+        // message, and a client waiting for their replies sent none.
+        loop {
+            match self.framer.next_frame(&mut self.inbox) {
+                Ok(Some(frame)) => {
+                    let _ = self.dispatch(&frame);
+                }
+                Ok(None) => break,
+                Err(e) => return (SessionEnd::Protocol(e.to_string()), self.counters),
+            }
+        }
+        if let Err(e) = self.flush_reply(&mut stream).await {
+            return (SessionEnd::Io(e), self.counters);
+        }
 
         // The timer drives emission and is only needed while there are
         // subscriptions to serve.
@@ -546,6 +586,7 @@ impl Session {
         let dropper = self.cfg.dropper.clone();
         let mut dropped = std::pin::pin!(claim_drop(dropper.as_deref()));
         let mut stage_rx = self.stage_rx.take();
+        let mut run_end = self.cfg.run_end.clone();
 
         // An IOC's limits: what its send buffer may hold before a message
         // from the client suspends the connection, and how long it waits on
@@ -582,6 +623,12 @@ impl Session {
             let idle = self.schedule.is_empty();
             tokio::select! {
                 () = &mut dropped => break SessionEnd::Dropped,
+                () = run_ended(&mut run_end) => {
+                    // What the socket takes now is sent; the rest is
+                    // counted as never sent when the session closes.
+                    let _ = self.write_ready(&stream);
+                    break SessionEnd::RunEnded;
+                }
                 stage = stage_changed(&mut stage_rx) => {
                     if self.follow(stage) && self.should_flush()
                         && let Err(e) = self.flush(&mut stream).await {
@@ -713,7 +760,11 @@ impl Session {
         self.push_app(commands::CONNECTION_VALIDATION, &payload);
         self.flush_reply(stream).await.map_err(SessionEnd::Io)?;
 
-        // Wait for the client's connection-validation response.
+        // Wait for the client's connection-validation response, for the
+        // connection timeout at most: a peer that never validates is no
+        // PVA client, and would hold its socket and task for the whole run.
+        let deadline = tokio::time::Instant::now() + self.cfg.conn_timeout;
+        let mut run_end = self.cfg.run_end.clone();
         loop {
             match self.framer.next_frame(&mut self.inbox) {
                 Ok(Some(frame)) => {
@@ -734,10 +785,11 @@ impl Session {
                     // Ignore other messages received before validation completes.
                 }
                 Ok(None) => {
-                    let n = stream
-                        .read_buf(&mut self.inbox)
-                        .await
-                        .map_err(SessionEnd::Io)?;
+                    let n = tokio::select! {
+                        read = stream.read_buf(&mut self.inbox) => read.map_err(SessionEnd::Io)?,
+                        () = tokio::time::sleep_until(deadline) => return Err(SessionEnd::TimedOut),
+                        () = run_ended(&mut run_end) => return Err(SessionEnd::RunEnded),
+                    };
                     if n == 0 {
                         return Err(SessionEnd::ClientClosed);
                     }
@@ -794,10 +846,11 @@ impl Session {
             .filter(|(_, name)| self.fleet.lookup_on(name, self.cfg.ioc).is_some())
             .map(|(id, _)| *id)
             .collect();
-        if found.is_empty() {
+        if found.is_empty() && req.flags & crate::udp::flags::REPLY_REQUIRED == 0 {
             // Silence is the correct response when no requested channel is found.
             // Replying to every miss would generate a large number of unnecessary responses
-            // during broadcast searches.
+            // during broadcast searches. A client that sets REPLY_REQUIRED
+            // gets an empty reply, as from PVXS.
             return Ok(());
         }
         let resp = SearchResponse {

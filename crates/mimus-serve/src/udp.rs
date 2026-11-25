@@ -216,14 +216,14 @@ impl SearchResponder {
             }
         }
 
-        if by_ioc.is_empty() {
-            // A search miss normally requires no reply. Responding to every
-            // broadcast that finds nothing would generate unnecessary traffic.
-            // Only send an empty response when the client explicitly requests
-            // one through REPLY_REQUIRED.
-            if req.flags & flags::REPLY_REQUIRED == 0 {
-                return;
-            }
+        // A search miss normally requires no reply: answering every
+        // broadcast that finds nothing would flood the network. A client
+        // that sets REPLY_REQUIRED wants one anyway, from every server, as
+        // `pvxlist` does to find the servers there are: each IOC up then
+        // answers, with what it found or with nothing, as PVXS does.
+        let reply_required = req.flags & flags::REPLY_REQUIRED != 0;
+        if by_ioc.is_empty() && !reply_required {
+            return;
         }
 
         // Resolve the reply destination. The request specifies a response port;
@@ -241,7 +241,7 @@ impl SearchResponder {
 
         for ioc in &self.iocs {
             let found = by_ioc.remove(&ioc.index).unwrap_or_default();
-            if found.is_empty() {
+            if found.is_empty() && !(reply_required && !self.is_down(ioc.index)) {
                 continue;
             }
             let body = SearchResponse {
@@ -505,6 +505,39 @@ mod tests {
             got.is_err(),
             "a miss was answered when it should have been silent"
         );
+    }
+
+    #[tokio::test]
+    async fn a_search_that_requires_a_reply_is_answered_by_every_ioc_found_or_not() {
+        // `pvxlist` finds servers with a search that names nothing and asks
+        // for a reply; each PVXS server answers it. Without the answer,
+        // MIMUS's IOCs cannot be listed.
+        let (_r, addr) = responder_for(4, &[5099, 5100]).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for names in [vec![], vec![(1, "NOT:MINE")], vec![(1, "MIM:dbl:0")]] {
+            client
+                .send_to(&search_datagram(9, &names, 0), addr)
+                .await
+                .unwrap();
+            let mut replies = Vec::new();
+            let mut buf = [0u8; 2048];
+            while let Ok(Ok(n)) =
+                tokio::time::timeout(std::time::Duration::from_millis(400), client.recv(&mut buf))
+                    .await
+            {
+                replies.push(parse_response(&buf[..n]));
+            }
+            replies.sort_by_key(|r| r.1);
+            let ports: Vec<u16> = replies.iter().map(|r| r.1).collect();
+            assert_eq!(ports, [5099, 5100], "{names:?}");
+            let found: Vec<usize> = replies.iter().map(|r| r.2.len()).collect();
+            let want = if names.iter().any(|(_, n)| *n == "MIM:dbl:0") {
+                vec![1, 0]
+            } else {
+                vec![0, 0]
+            };
+            assert_eq!(found, want, "{names:?}");
+        }
     }
 
     #[tokio::test]
