@@ -36,6 +36,11 @@ pub struct RunSummary {
     pub coalesce_us: u64,
     pub layout: String,
     pub backpressure: String,
+    /// The high-water mark: a connection's queue under the drop policy, the
+    /// most a connection may hold under the IOC policy.
+    pub high_water: usize,
+    /// Under the IOC policy, how long a connection may wait on its client.
+    pub conn_timeout_s: Option<f64>,
     pub tick_us: u64,
     /// How channels alternate bursts and silences, if they do.
     pub activity: Option<mimus_emit::Activity>,
@@ -56,11 +61,22 @@ pub struct ScenarioSummary {
     pub length_s: f64,
     /// The rate factor every schedule is built at.
     pub headroom: f64,
-    /// One pass: each phase's start, label and length, in seconds.
-    pub plan: Vec<(f64, String, f64)>,
+    /// One pass, phase by phase.
+    pub plan: Vec<PlannedPhase>,
     /// Subscriptions waited for before the first phase, and for how long at
     /// most.
     pub waits_for: Option<(u64, f64)>,
+}
+
+/// A phase as the banner announces it.
+#[derive(Debug, Clone)]
+pub struct PlannedPhase {
+    pub start_s: f64,
+    pub label: String,
+    pub length_s: f64,
+    /// The commands it runs as it starts and as it ends.
+    pub on_start: Option<String>,
+    pub on_end: Option<String>,
 }
 
 impl ScenarioSummary {
@@ -94,6 +110,13 @@ pub fn print_banner(
         per_second(run.offered_bytes_per_s),
         run.backpressure
     );
+    if let Some(timeout) = run.conn_timeout_s {
+        out!(
+            "  as a PVXS IOC: what a client does not read is kept, up to {} a connection; \
+             a connection silent for {timeout} s is closed",
+            size(run.high_water)
+        );
+    }
     if let Some((per_hour, channels)) = run.alarms {
         out!(
             "alarms {per_hour} per channel per hour, on the {channels} channels whose \
@@ -134,8 +157,19 @@ pub fn print_banner(
         if let Some((n, timeout)) = sc.waits_for {
             out!("  waits for {n} subscriptions, {timeout:.0} s at most, before its first phase");
         }
-        for (start, label, length) in &sc.plan {
-            out!("  {start:>8.1} s  {label:<28} {length:>8.1} s");
+        for p in &sc.plan {
+            out!(
+                "  {:>8.1} s  {:<28} {:>8.1} s",
+                p.start_s,
+                p.label,
+                p.length_s
+            );
+            if let Some(c) = &p.on_start {
+                out!("              runs `{c}` as it starts");
+            }
+            if let Some(c) = &p.on_end {
+                out!("              runs `{c}` as it ends");
+            }
         }
         if sc.headroom > 1.0 {
             out!(
@@ -225,6 +259,14 @@ pub struct Sessions {
     pub subscriptions: u64,
     /// Channels that hold a value a client wrote.
     pub written: u64,
+    /// Connections closed, under the IOC policy, because their client sent
+    /// nothing, or took nothing, for the timeout.
+    pub timed_out: u64,
+    /// Connections closed, under the IOC policy, because more than the
+    /// high-water mark waited for their client.
+    pub overflowed: u64,
+    /// The most bytes one connection had waiting for its client.
+    pub backlog_peak: u64,
 }
 
 pub fn finish(
@@ -256,6 +298,8 @@ pub fn finish(
             "sessions": sessions.total,
             "sessions_dropped": sessions.dropped,
             "sessions_closed_down": sessions.closed_down,
+            "sessions_timed_out": sessions.timed_out,
+            "sessions_overflowed": sessions.overflowed,
             "subscriptions": sessions.subscriptions,
             "late_ticks": counters.late_ticks,
             "wheel_steps": counters.wheel_steps,
@@ -267,6 +311,12 @@ pub fn finish(
             "burst": counters.burst,
             "quiet": counters.quiet,
             "alarms": counters.alarms,
+            "squashed": counters.squashed,
+            "queued_at_close": counters.queued_at_close,
+            "unsent": counters.unsent,
+            "suspensions": counters.suspensions,
+            "behind_s": counters.behind_us as f64 / 1e6,
+            "backlog_peak_bytes": sessions.backlog_peak,
             "puts": counters.puts,
             "put_bytes": counters.put_bytes,
             "rpcs": counters.rpcs,
@@ -289,6 +339,8 @@ pub fn finish(
                 "coalesce_us": run.coalesce_us,
                 "layout": run.layout,
                 "backpressure": run.backpressure,
+                "high_water": run.high_water,
+                "conn_timeout_s": run.conn_timeout_s,
                 "tick_us": run.tick_us,
                 "mix": run.mix,
                 "activity": run.activity.map(|a| a.to_string()),
@@ -328,6 +380,32 @@ pub fn finish(
     }
     if sessions.closed_down > 0 {
         out!("closed by restarts {:>14}", sessions.closed_down);
+    }
+    // What a client that falls behind costs it, and what MIMUS held for it.
+    if counters.squashed > 0 {
+        out!("written over       {:>14}", counters.squashed);
+    }
+    if counters.queued_at_close > 0 {
+        out!("queued at close    {:>14}", counters.queued_at_close);
+    }
+    if counters.unsent > 0 {
+        out!("unsent at close    {:>14}", counters.unsent);
+    }
+    if sessions.timed_out > 0 {
+        out!("closed, timed out  {:>14}", sessions.timed_out);
+    }
+    if sessions.overflowed > 0 {
+        out!("closed, high water {:>14}", sessions.overflowed);
+    }
+    if counters.suspensions > 0 {
+        out!("suspensions        {:>14}", counters.suspensions);
+    }
+    if counters.behind_us > 0 {
+        out!(
+            "behind             {:>14.1} s, holding {} at most",
+            counters.behind_us as f64 / 1e6,
+            size(sessions.backlog_peak as usize)
+        );
     }
     // Requests, not updates: none of the counts above includes them.
     if counters.puts > 0 {
@@ -447,6 +525,11 @@ fn scenario_json(run: &RunSummary, played: Option<&Played>) -> serde_json::Value
             "alarms": p.counters.alarms,
             "late_ticks": p.counters.late_ticks,
             "flow_control_holds": p.counters.flow_control_holds,
+            "squashed": p.counters.squashed,
+            "queued_at_close": p.counters.queued_at_close,
+            "unsent": p.counters.unsent,
+            "suspensions": p.counters.suspensions,
+            "behind_s": p.counters.behind_us as f64 / 1e6,
             "closed": p.closed,
             "subscriptions": p.subscriptions,
             "interrupted": p.interrupted,
@@ -459,7 +542,31 @@ fn scenario_json(run: &RunSummary, played: Option<&Played>) -> serde_json::Value
             "recovered_s": secs(r.recovered),
             "after": r.after,
         })).collect::<Vec<_>>(),
+        "catch_ups": played.catch_ups.iter().map(|c| serde_json::json!({
+            "phase": c.phase,
+            "cycle": c.cycle,
+            "behind": c.behind,
+            "caught_up_s": secs(c.caught_up),
+        })).collect::<Vec<_>>(),
+        "commands": played.commands.iter().map(|c| serde_json::json!({
+            "phase": c.phase,
+            "cycle": c.cycle,
+            "at": c.at.key(),
+            "command": c.command,
+            "status": c.outcome.as_ref().and_then(|o| o.as_ref().ok()),
+            "error": c.outcome.as_ref().and_then(|o| o.as_ref().err()),
+            "running": c.outcome.is_none(),
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// "1 connection", "2 connections".
+fn connections(n: u64) -> String {
+    if n == 1 {
+        "1 connection".into()
+    } else {
+        format!("{n} connections")
+    }
 }
 
 /// Prints each phase played, and how the consumer came back from restarts.
@@ -546,6 +653,38 @@ fn print_scenario(sc: &ScenarioSummary, played: &Played) {
     }
     if !played.recoveries.is_empty() {
         out!("  Recovery times are polled every 10 ms.");
+    }
+    for c in &played.catch_ups {
+        let mut label = c.phase.clone();
+        if sc.repeat > 1 {
+            label = format!("{} #{}", label, c.cycle + 1);
+        }
+        match c.caught_up {
+            _ if c.behind == 0 => out!("  after {label}: no connection was behind"),
+            Some(d) => out!(
+                "  after {label}: {} behind, caught up {:.2} s later",
+                connections(c.behind),
+                d.as_secs_f64()
+            ),
+            None => out!(
+                "  after {label}: {} behind, still behind when the run ended",
+                connections(c.behind)
+            ),
+        }
+    }
+    for c in &played.commands {
+        let what = match &c.outcome {
+            Some(Ok(0)) => continue,
+            Some(Ok(code)) => format!("exited with status {code}"),
+            Some(Err(why)) => why.clone(),
+            None => "was still running when the run ended".to_string(),
+        };
+        out!(
+            "  phase {}, {}: `{}` {what}",
+            c.phase,
+            c.at.key(),
+            c.command
+        );
     }
 }
 /// A byte count as people read it: 512 B, 64 KiB, 1.5 MiB. Sizes of

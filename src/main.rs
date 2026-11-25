@@ -4,6 +4,10 @@
 //! sockets, and print a report. All substantive decisions live in the library
 //! crates, where they can be tested without starting a process.
 
+// The run report is one `serde_json::json!` literal, deeper than the
+// default limit lets the macro expand.
+#![recursion_limit = "256"]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -232,11 +236,22 @@ struct ServeArgs {
     /// `block` lets TCP throttle the sender, measuring the consumer's
     /// effective capacity. `drop` maintains the nominal rate and discards,
     /// and counts, the updates that do not fit, as intermediate values are
-    /// lost when an IOC's monitor queue overflows.
+    /// lost when an IOC's monitor queue overflows. `ioc` does what a PVXS
+    /// IOC does: it keeps what a client does not read, writes the newest
+    /// update over the last in each subscription's queue of a client that
+    /// still talks while too much waits for it, and closes a connection
+    /// silent for `--conn-timeout-s`.
     /// These modes answer different questions; published results must
     /// identify which one was used.
     #[arg(long, default_value = "block")]
     backpressure: Backpressure,
+
+    /// Under `--backpressure ioc`: seconds a connection may go without a
+    /// message from the client, or without the client taking anything
+    /// waiting for it, before MIMUS closes it. 40 by default, as in a PVXS
+    /// server.
+    #[arg(long = "conn-timeout-s")]
+    conn_timeout_s: Option<f64>,
 
     /// Scheduler resolution in microseconds, from 1 to 1 000 000. Reduce it
     /// for rates above a few hundred hertz.
@@ -254,8 +269,12 @@ struct ServeArgs {
 
     /// Bytes allowed to queue on one connection before the drop policy
     /// discards updates: the stand-in for an IOC's monitor queue depth.
-    #[arg(long = "high-water", default_value_t = 1 << 20)]
-    high_water: usize,
+    /// One megabyte by default. Under `--backpressure ioc`, the most a
+    /// connection may hold for a client that does not read before MIMUS
+    /// closes it, where an IOC would run out of memory: 256 megabytes by
+    /// default.
+    #[arg(long = "high-water")]
+    high_water: Option<usize>,
 
     /// Send the full type descriptor in every monitor's opening reply,
     /// whatever the profile recorded.
@@ -677,6 +696,29 @@ fn run_serve(args: ServeArgs) -> i32 {
     for (name, why) in fleet.unstamped_openings() {
         eprintln!("warning: {name}: opening message sent with its recorded timestamp: {why}");
     }
+    let ioc = args.backpressure == Backpressure::Ioc;
+    let high_water = args
+        .high_water
+        .unwrap_or(if ioc { 256 << 20 } else { 1 << 20 });
+    let conn_timeout_s = args.conn_timeout_s.unwrap_or(40.0);
+    if !(conn_timeout_s.is_finite() && conn_timeout_s > 0.0) {
+        eprintln!("error: --conn-timeout-s {conn_timeout_s} is not a positive number of seconds");
+        return 1;
+    }
+    if args.conn_timeout_s.is_some() && !ioc {
+        eprintln!("warning: --conn-timeout-s applies only under --backpressure ioc");
+    }
+    // A PVXS client sends an echo every half of its own EPICS_PVA_CONN_TMO,
+    // 15 s at most: a shorter timeout here closes clients that are well.
+    if ioc && conn_timeout_s <= 15.0 {
+        eprintln!(
+            "warning: --conn-timeout-s {conn_timeout_s}: a PVXS client with the default \
+             EPICS_PVA_CONN_TMO sends an echo every 15 s, and MIMUS would close it while \
+             it is well. Give the clients EPICS_PVA_CONN_TMO={conn_timeout_s} too: they \
+             then send one every {:.1} s.",
+            conn_timeout_s / 2.0
+        );
+    }
     // Under the drop policy, --high-water is a connection's queue, counted in
     // bytes: the default megabyte holds thousands of scalar updates and not
     // one image. A queue shallower than two updates of the largest type
@@ -688,14 +730,14 @@ fn run_serve(args: ServeArgs) -> i32 {
             .map(|i| &fleet.templates[usize::from(i.template)])
             .filter(|t| !t.is_static())
             .max_by_key(|t| t.max_len())
-        && 2 * monitor_message(largest) > args.high_water
+        && 2 * monitor_message(largest) > high_water
     {
         let message = monitor_message(largest);
         eprintln!(
             "warning: --high-water {} queues less than two updates of {} ({} each): under \
              the drop policy, a consumer one update behind loses the next. A PVXS monitor \
              queues four; --high-water {} gives a connection that depth.",
-            report::size(args.high_water),
+            report::size(high_water),
             largest.name,
             report::size(message),
             4 * message
@@ -728,7 +770,8 @@ fn run_serve(args: ServeArgs) -> i32 {
         backpressure: args.backpressure,
         rate_mix: rate_mix.clone(),
         tick_us: args.tick_us,
-        high_water: args.high_water,
+        high_water,
+        conn_timeout: std::time::Duration::from_secs_f64(conn_timeout_s),
         dropper: args.drop_connections.map(|_| Dropper::new()),
         coalesce_us: args.coalesce_us,
         debug: args.debug,
@@ -802,6 +845,8 @@ fn run_serve(args: ServeArgs) -> i32 {
         coalesce_us: args.coalesce_us,
         layout: args.layout.to_string(),
         backpressure: args.backpressure.to_string(),
+        high_water,
+        conn_timeout_s: ioc.then_some(conn_timeout_s),
         tick_us: args.tick_us,
         activity,
         alarms: args.alarms.map(|n| (n, alarm_channels)),
@@ -817,11 +862,13 @@ fn run_serve(args: ServeArgs) -> i32 {
                 .scan(std::time::Duration::ZERO, |at, p| {
                     let start = *at;
                     *at += p.duration;
-                    Some((
-                        start.as_secs_f64(),
-                        p.label.clone(),
-                        p.duration.as_secs_f64(),
-                    ))
+                    Some(report::PlannedPhase {
+                        start_s: start.as_secs_f64(),
+                        label: p.label.clone(),
+                        length_s: p.duration.as_secs_f64(),
+                        on_start: p.on_start.clone(),
+                        on_end: p.on_end.clone(),
+                    })
                 })
                 .collect(),
             waits_for: match s.start {
@@ -1025,6 +1072,9 @@ fn run_serve(args: ServeArgs) -> i32 {
             sessions.total += t.sessions_total();
             sessions.dropped += t.sessions_dropped();
             sessions.closed_down += t.sessions_closed_down();
+            sessions.timed_out += t.sessions_timed_out();
+            sessions.overflowed += t.sessions_overflowed();
+            sessions.backlog_peak = sessions.backlog_peak.max(t.backlog_peak());
             sessions.subscriptions += t.subscriptions();
         }
         sessions.written = cfg.written.as_ref().map_or(0, |w| w.channels() as u64);

@@ -417,6 +417,10 @@ fn options_that_cannot_work_are_refused_before_serving() {
         (&["--activity", "0"], "--activity"),
         (&["--alarms", "0"], "--alarms"),
         (
+            &["--backpressure", "ioc", "--conn-timeout-s", "0"],
+            "--conn-timeout-s",
+        ),
+        (
             &["--alarms", "2"],
             "no template served carries an alarm transition",
         ),
@@ -616,6 +620,163 @@ duration = "300ms"
     assert_eq!(recoveries.len(), 1);
     assert_eq!(recoveries[0]["ioc"], 1);
     assert_eq!(recoveries[0]["before"], 0, "nothing to recover");
+}
+
+#[test]
+fn the_ioc_policy_is_announced_and_what_it_counts_reported() {
+    let dir = Scratch::new("ioc");
+    let demo = demo_profile(&dir);
+    let path = dir.path("report.json");
+    let o = mimus(&[
+        "serve",
+        "-p",
+        demo.to_str().unwrap(),
+        "--backpressure",
+        "ioc",
+        "--base-port",
+        "0",
+        "--search-port",
+        "0",
+        "--duration-s",
+        "0.3",
+        "--report",
+        path.to_str().unwrap(),
+    ]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(
+        out.contains(
+            "as a PVXS IOC: what a client does not read is kept, up to 256 MiB a \
+             connection; a connection silent for 40 s is closed"
+        ),
+        "{out}"
+    );
+    let r = report(&path);
+    assert_eq!(r["run"]["backpressure"], "ioc");
+    assert_eq!(r["run"]["high_water"], 256 << 20);
+    assert_eq!(r["run"]["conn_timeout_s"], 40.0);
+    for key in [
+        "squashed",
+        "queued_at_close",
+        "unsent",
+        "suspensions",
+        "backlog_peak_bytes",
+        "sessions_timed_out",
+        "sessions_overflowed",
+    ] {
+        assert_eq!(r[key].as_u64(), Some(0), "{key}");
+    }
+    assert_eq!(r["behind_s"], 0.0);
+
+    // A timeout shorter than a client's echo closes clients that are well.
+    let o = mimus(&[
+        "serve",
+        "-p",
+        demo.to_str().unwrap(),
+        "--backpressure",
+        "ioc",
+        "--conn-timeout-s",
+        "6",
+        "--base-port",
+        "0",
+        "--search-port",
+        "0",
+        "--duration-s",
+        "0.1",
+    ]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("EPICS_PVA_CONN_TMO=6 too"), "{out}");
+    assert!(out.contains("every 3.0 s"), "{out}");
+    // Elsewhere the option has nothing to act on, and says so.
+    let o = mimus(&[
+        "serve",
+        "-p",
+        demo.to_str().unwrap(),
+        "--conn-timeout-s",
+        "60",
+        "--base-port",
+        "0",
+        "--search-port",
+        "0",
+        "--duration-s",
+        "0.1",
+    ]);
+    assert!(
+        text(&o).contains("applies only under --backpressure ioc"),
+        "{}",
+        text(&o)
+    );
+}
+
+#[test]
+fn a_phase_s_commands_are_announced_run_and_reported() {
+    let dir = Scratch::new("commands");
+    let demo = demo_profile(&dir);
+    let scenario = dir.path("s.toml");
+    std::fs::write(
+        &scenario,
+        r#"
+[[phase]]
+kind = "steady"
+duration = "300ms"
+label = "paused"
+on_start = "echo started"
+on_end = "exit 4"
+
+[[phase]]
+kind = "steady"
+duration = "300ms"
+label = "after"
+"#,
+    )
+    .unwrap();
+    let path = dir.path("report.json");
+    let o = mimus(&[
+        "serve",
+        "-p",
+        demo.to_str().unwrap(),
+        "--base-port",
+        "0",
+        "--search-port",
+        "0",
+        "--scenario",
+        scenario.to_str().unwrap(),
+        "--report",
+        path.to_str().unwrap(),
+    ]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("runs `echo started` as it starts"), "{out}");
+    assert!(out.contains("runs `exit 4` as it ends"), "{out}");
+    assert!(
+        out.contains("phase paused, on_end: `exit 4` exited with status 4"),
+        "{out}"
+    );
+
+    let r = report(&path);
+    let commands = r["scenario"]["commands"].as_array().unwrap();
+    let got: Vec<(&str, &str, Option<i64>)> = commands
+        .iter()
+        .map(|c| {
+            (
+                c["at"].as_str().unwrap(),
+                c["command"].as_str().unwrap(),
+                c["status"].as_i64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("on_start", "echo started", Some(0)),
+            ("on_end", "exit 4", Some(4))
+        ]
+    );
+    let catch_ups = r["scenario"]["catch_ups"].as_array().unwrap();
+    assert_eq!(catch_ups.len(), 1);
+    assert_eq!(catch_ups[0]["phase"], "paused");
+    assert_eq!(catch_ups[0]["behind"], 0);
 }
 
 #[test]
