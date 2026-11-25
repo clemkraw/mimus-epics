@@ -7,6 +7,9 @@
 /pvxs*.json
 /bench-*/
 
+# The reference server for images, built where its source is
+/catalogue/ndarray/mimus-ndarray
+
 # Files the OS leaves behind
 Thumbs.db
 desktop.ini

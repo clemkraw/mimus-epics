@@ -1,0 +1,6 @@
+# The channels mimus-ndarray serves: two of each type, so that calibration
+# can compare their opening messages.
+MIM:IMG:0
+MIM:IMG:1
+MIM:WAVE:0
+MIM:WAVE:1
