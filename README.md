@@ -88,7 +88,7 @@ This is what makes fidelity a verified property rather than a claim - see [Fidel
 
 ### 3 · Generate
 
-`mimus serve` loads the profile, replicates its templates across the requested number of channels and opens one listening socket per virtual IOC. Each socket behaves as an independent IOC: it validates the connection, answers searches, creates channels, serves `GET`, `GET_FIELD` and `MONITOR` (with pipelining), answers echoes, and then emits. `PUT` and `RPC` are refused with an error status, as PVXS refuses an operation a channel does not implement.
+`mimus serve` loads the profile, replicates its templates across the requested number of channels and opens one listening socket per virtual IOC. Each socket behaves as an independent IOC: it validates the connection, answers searches, creates channels, serves `GET`, `GET_FIELD` and `MONITOR` (with pipelining), answers `PUT` and `RPC`, answers echoes, and then emits. A value a client writes is carried by the channel's later updates, as on an IOC (see [Writes and calls](#writes-and-calls)).
 
 Emission runs on a timing wheel. At each tick, the channels due in that bucket have their compiled template copied into the connection's write buffer with the value and timestamp slots written in place.
 
@@ -118,10 +118,11 @@ kill %1                     # the reference IOC is no longer needed
 ./target/release/mimus serve --profile profile.json \
     --iocs 4 --pvs 100000 --rate-hz 10 --mix ntscalar_f64 --search-port 0
 
-# 5 · in another terminal, read them with the PVXS tools
+# 5 · in another terminal, read and write them with the PVXS tools
 export EPICS_PVA_NAME_SERVERS="127.0.0.1:5075 127.0.0.1:5076 127.0.0.1:5077 127.0.0.1:5078"
 pvxget MIM:ntscalar_f64:0
-pvxmonitor MIM:ntscalar_f64:0
+pvxput MIM:ntscalar_f64:0 42.5
+pvxmonitor MIM:ntscalar_f64:0     # every update now carries 42.5
 ```
 
 Channel names follow `MIM:{template}:{index}` by default, with one index across the whole fleet, and `mimus serve` prints the address list to use with the name of a channel it serves. To try the server without a reference IOC, `mimus demo-profile` writes a hand-made profile; it is marked synthetic, and every command that loads it says so.
@@ -193,6 +194,8 @@ mimus demo-profile  write a hand-made profile for trying the server out
 |---|---|---|
 | `--backpressure` | `block` | `block` lets TCP throttle MIMUS; `drop` holds the nominal rate and counts what it discards (see below) |
 | `--high-water` | `1048576` | Bytes allowed to queue per connection before `drop` discards: the stand-in for an IOC's monitor queue. Raise it for images: MIMUS warns when it holds fewer than two updates of the largest type served |
+| `--put` | `apply` | What a write does. `apply` keeps the value written, and the channel's later updates, reads and RPC replies carry it; `accept` answers and changes nothing; `refuse` answers with an error (see [Writes and calls](#writes-and-calls)) |
+| `--rpc` | `value` | What an RPC gets. `value` answers with the channel's type and whole value, whatever the request; `refuse` answers with an error |
 | `--pipeline` | `permissive` | `strict` withholds updates from a pipelined monitor with no credit left, as PVXS does: the credit starts at the client's queue size and grows with each acknowledgement. `permissive` only counts acknowledgements |
 | `--always-full-descriptor` | off | Send the full type descriptor on every monitor, whatever the profile recorded |
 | `--tick-us` | `1000` | Scheduler resolution, from 1 µs to 1 s; lower it for rates above a few hundred hertz |
@@ -313,6 +316,18 @@ EPICS_PVA_AUTO_ADDR_LIST=NO EPICS_PVA_ADDR_LIST="127.0.0.1:5076 127.0.0.1:5176" 
     pvxget MIM:ntscalar_f64:0 CAM:ntndarray_union:0
 ```
 
+### Writes and calls
+
+Some clients write: an operator screen sets a setpoint and reads it back, a gateway forwards the puts of the screens behind it, an alarm handler acknowledges. MIMUS answers `PUT` and `RPC` as a PVXS IOC does, so those paths can be loaded too.
+
+Under `--put apply`, the default, what a client writes under a channel's `value` is kept, and every later update, read and RPC reply of that channel carries it, on every connection of the run, in place of the recorded value. The channel's value stops moving, as a setpoint's does; the timestamp and the alarm are still replayed as recorded. MIMUS posts no update on a write: the channel's next update carries the value, as the next scan of a periodic record would, and a read right after the write returns it at once. A string or an array may change length, an enum takes its new index, and a write in the other byte order is read in it. A write that is not of the channel's type is answered with an error and changes nothing. What is written is kept in memory for the run, and never saved.
+
+`--put accept` answers every write with success and changes nothing: the cheapest path for a write-heavy load, when what is written does not matter. `--put refuse` answers with an error, as an IOC whose channel refuses writes does.
+
+Under `--rpc value`, the default, an RPC gets the channel's type and its whole value, whatever the request carried. MIMUS runs no service, but the RPC path of a client or a gateway gets replies of the type and size each channel has, written values included. `--rpc refuse` answers with an error.
+
+The report counts the writes answered (`puts`), their bytes (`put_bytes`), the channels written to (`channels_written`) and the calls answered (`rpcs`). It gives no latency for them: MIMUS answers a request as soon as it reads it, before reading the next, so what a client waits for is the network and the updates queued ahead of the reply on the same connection, as on an IOC. That round trip is the client's to measure.
+
 ### Scenarios
 
 Consumers seldom fail in steady state. They fail when thousands of channels change at the same instant, when an IOC restarts and every channel it served reconnects together, when a stalled IOC resumes, or when the load climbs past what they absorb. `--scenario` stages those moments against the same fleet, from a TOML file of phases played in order:
@@ -408,6 +423,8 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 | `held`, `burst` | Under a scenario: updates that fell due while their IOC was frozen and were never sent, and updates sent by bursts and resumes, a part of `emitted` |
 | `quiet` | Under `--activity`: updates due while the channel was quiet, and so not sent |
 | `alarms` | Under `--alarms`: updates that carried an alarm transition, a part of `emitted` |
+| `puts`, `put_bytes`, `channels_written` | Writes answered (not their INIT, nor the reads a client makes of the value it is about to write over), their bytes as received, headers included, and the channels that hold a value written under `--put apply`. Requests, not updates: neither `emitted` nor `bytes` includes them |
+| `rpcs` | Calls answered, INIT apart |
 | `scenario` | The scenario played, phase by phase, with its restarts' recovery times; `null` without one |
 | `profile`, `run` | The manifest: what was served, and with which options |
 
@@ -481,7 +498,7 @@ A profile is more than a bag of bytes. It also records what the reference server
 
 ## Scope and limitations
 
-- **The monitor path, plus `GET` and `GET_FIELD`.** The monitor path dominates a long-running client's workload; the two read commands make `pvxget` and `pvxinfo` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. `PUT` and `RPC` are out of scope and answered with an error, and MIMUS sends no beacons.
+- **The monitor path, plus `GET`, `GET_FIELD`, `PUT` and `RPC`.** The monitor path dominates a long-running client's workload; the other commands make `pvxget`, `pvxinfo`, `pvxput` and `pvxcall` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. A write changes the value the channel carries, and nothing else: no record processes, no alarm is raised by it, no update is posted for it. An RPC returns the channel's value, not the result of a service. MIMUS sends no beacons.
 - **PVXS (QSRV2) only.** QSRV1 puts different bytes on the wire for the same record; a profile calibrated against one is wrong against the other.
 - **One ordinary update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape, a type of images the few frames its sample budget kept; the alarm variant replaces it only under `--alarms`, and the other variants are recorded but not sent. Static channels of a type that also has a moving channel update at the serving rate (`--rate-hz` must be positive); a type whose every channel was static gets a static template, whose channels send their opening message and nothing after it, as on the IOC. Without `--alarms`, a channel keeps the alarm state of its opening message.
 - **Structure is replicated; IOC dynamics are not.** Scan jitter under host load and monitor-queue behavior are properties *of an IOC*, and MIMUS deliberately does not reproduce them: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client (overflow policy), it is exposed as `--backpressure`.
@@ -492,11 +509,11 @@ A profile is more than a bag of bytes. It also records what the reference server
 
 | Path | Contents |
 |---|---|
-| [`crates/mimus-wire`](crates/mimus-wire) | PVAccess framing, headers, segmentation reassembly, control messages, and a generic PVData walker the tests decode MIMUS's messages with |
+| [`crates/mimus-wire`](crates/mimus-wire) | PVAccess framing, headers, segmentation reassembly, control messages, and a generic PVData walker, with which the tests decode MIMUS's messages and MIMUS reads what a client writes |
 | [`crates/mimus-profile`](crates/mimus-profile) | Profile format: templates, slots, session rules, manifest, schema versioning |
 | [`crates/mimus-emit`](crates/mimus-emit) | Template compilation and rendering, signals, timing wheel, counters |
 | [`crates/mimus-calibrate`](crates/mimus-calibrate) | Client mode: observation, differential analysis, template building, shadow verification |
-| [`crates/mimus-serve`](crates/mimus-serve) | Server mode: fleet and naming, listeners, sessions, the per-connection type registry, UDP search responder |
+| [`crates/mimus-serve`](crates/mimus-serve) | Server mode: fleet and naming, listeners, sessions, the per-connection type registry, the values written, UDP search responder |
 | [`src`](src) | The `mimus` command line |
 | [`catalogue`](catalogue) | The reference database and channel list calibration runs against, and in [`catalogue/ndarray`](catalogue/ndarray) a reference server for images and large waveforms |
 | [`scenarios`](scenarios) | Example scenarios for `--scenario` |
