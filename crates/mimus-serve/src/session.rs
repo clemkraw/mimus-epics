@@ -6,15 +6,16 @@
 //! after each frame would make throughput depend on scheduling rather than
 //! memory and processing speed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, BytesMut};
 use mimus_emit::{Activity, Backpressure, Counters, EpicsTime, Instance, RateMix, Schedule};
 use mimus_profile::DescriptorPolicy;
 use mimus_wire::codec::put_i32;
 use mimus_wire::header::{ByteOrder, Direction, Header, Segmentation};
-use mimus_wire::pvdata::{Descriptor, Located};
+use mimus_wire::pvdata::{Descriptor, Located, RequestTypes};
 use mimus_wire::{
     ConnectionValidation, ConnectionValidationResponse, CreateChannelRequest,
     CreateChannelResponse, Frame, Framer, GUID_LEN, GetFieldRequest, GetRequest, MonitorRequest,
@@ -49,8 +50,25 @@ pub struct SessionConfig {
     pub tick_us: u64,
     /// Maximum number of queued bytes before the drop policy takes effect.
     ///
-    /// Models the monitor queue depth of an IOC.
+    /// Models the monitor queue depth of an IOC. Under
+    /// [`Backpressure::Ioc`], the most a connection may have waiting before
+    /// MIMUS closes it: an IOC has no such limit, and runs out of memory
+    /// instead.
     pub high_water: usize,
+    /// Under [`Backpressure::Ioc`], how long a connection may go without a
+    /// message from the client, or without the client taking anything MIMUS
+    /// has for it, before MIMUS closes it: `EPICS_PVA_CONN_TMO`'s 40 s in
+    /// PVXS.
+    pub conn_timeout: Duration,
+    /// Under [`Backpressure::Ioc`], the bytes a connection's send buffer may
+    /// hold before a message from the client suspends it. `None` takes
+    /// twice the socket's send buffer, as PVXS does.
+    pub send_limit: Option<usize>,
+    /// The socket's send buffer, fixed. `None` leaves the system's, which
+    /// grows with the connection, to megabytes on a fast one, as an IOC's
+    /// does. Fixed, a client that stops reading leaves MIMUS holding what
+    /// follows sooner.
+    pub send_buffer: Option<usize>,
     /// Shared request to close one live session without warning, to
     /// exercise a consumer's reconnection. `None` disables connection drops.
     pub dropper: Option<Arc<Dropper>>,
@@ -139,6 +157,9 @@ impl Default for SessionConfig {
             rate_mix: RateMix::uniform(1.0),
             tick_us: 1000,
             high_water: 1 << 20,
+            conn_timeout: Duration::from_secs(40),
+            send_limit: None,
+            send_buffer: None,
             dropper: None,
             coalesce_us: 0,
             debug: false,
@@ -279,6 +300,35 @@ struct Monitor {
     /// Alarm transitions sent on this monitor: the place in the alarm
     /// variant's recorded transitions, replayed in the order observed.
     alarm_step: u64,
+    /// Under [`Backpressure::Ioc`], the updates this monitor's queue holds
+    /// before the newest is written over the last: the client's
+    /// `queueSize`, 4 if it asks for none, as in PVXS.
+    limit: u32,
+    /// Whether the monitor waits in the backlog of a suspended connection.
+    waiting: bool,
+}
+
+/// An update a subscription holds, under [`Backpressure::Ioc`], because it
+/// cannot be sent yet: its connection is suspended, or the client has given
+/// no credit for it. It is rendered when sent, from what it was due with.
+#[derive(Debug, Clone, Copy)]
+struct Queued {
+    shape: Shape,
+    /// The recorded sample it carries.
+    step: u64,
+    when: EpicsTime,
+}
+
+impl Shape {
+    /// How much of a value an update of this shape carries: an update
+    /// written over another keeps the larger of the two shapes.
+    fn rank(self) -> u8 {
+        match self {
+            Self::SteadyState => 0,
+            Self::Alarm => 1,
+            Self::Initial => 2,
+        }
+    }
 }
 
 /// Describes why a session ended.
@@ -296,6 +346,13 @@ pub enum SessionEnd {
     Dropped,
     /// The connection's virtual IOC went down in a scenario.
     IocDown,
+    /// Under [`Backpressure::Ioc`]: the client sent nothing, or took nothing
+    /// MIMUS had for it, for the connection timeout, and MIMUS closed the
+    /// connection as a PVXS IOC does.
+    TimedOut,
+    /// Under [`Backpressure::Ioc`]: more waited for the client than the
+    /// high-water mark allows.
+    Overflow,
 }
 
 /// Completes when this session has claimed a drop request, and never when
@@ -326,6 +383,8 @@ impl std::fmt::Display for SessionEnd {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Dropped => f.write_str("dropped by MIMUS"),
             Self::IocDown => f.write_str("closed: its IOC went down"),
+            Self::TimedOut => f.write_str("closed: timed out"),
+            Self::Overflow => f.write_str("closed: too much waited for the client"),
         }
     }
 }
@@ -365,6 +424,34 @@ pub struct Session {
     inbox: BytesMut,
     outbox: BytesMut,
     framer: Framer,
+    /// Bytes written to the socket since the connection opened.
+    sent: u64,
+    /// Where each update in the outbox ends, counted as `sent` is, until it
+    /// is written: those left when the connection closes were never sent.
+    update_ends: VecDeque<u64>,
+    /// Since when the socket has taken nothing of what waits in the outbox,
+    /// if it refused the last write.
+    stuck_since: Option<Instant>,
+    /// Since when the connection has been behind, if it is.
+    behind_since: Option<Instant>,
+    /// Under [`Backpressure::Ioc`]: when the client last sent anything.
+    last_read: Instant,
+    /// Under [`Backpressure::Ioc`]: the bytes the outbox may hold before a
+    /// message from the client suspends the connection.
+    send_limit: usize,
+    /// Under [`Backpressure::Ioc`]: whether the connection has stopped
+    /// taking updates from its subscriptions, and reading, until the client
+    /// catches up.
+    suspended: bool,
+    /// Under [`Backpressure::Ioc`]: what each subscription holds.
+    queues: HashMap<i32, VecDeque<Queued>>,
+    /// Updates `queues` holds.
+    queued: u64,
+    /// Monitors with updates queued while the connection was suspended, in
+    /// the order they had them, served first when it resumes.
+    backlog: VecDeque<i32>,
+    /// Types the client described in its requests.
+    request_types: RequestTypes,
 }
 
 impl Session {
@@ -406,6 +493,17 @@ impl Session {
             inbox: BytesMut::with_capacity(64 * 1024),
             outbox: BytesMut::with_capacity(256 * 1024),
             framer: Framer::new(),
+            sent: 0,
+            update_ends: VecDeque::new(),
+            stuck_since: None,
+            behind_since: None,
+            last_read: Instant::now(),
+            send_limit: usize::MAX,
+            suspended: false,
+            queues: HashMap::new(),
+            queued: 0,
+            backlog: VecDeque::new(),
+            request_types: RequestTypes::new(),
         })
     }
 
@@ -449,7 +547,31 @@ impl Session {
         let mut dropped = std::pin::pin!(claim_drop(dropper.as_deref()));
         let mut stage_rx = self.stage_rx.take();
 
-        let end = loop {
+        // An IOC's limits: what its send buffer may hold before a message
+        // from the client suspends the connection, and how long it waits on
+        // a client before closing.
+        let ioc = self.cfg.backpressure == Backpressure::Ioc;
+        if let Some(bytes) = self.cfg.send_buffer {
+            let _ = socket2::SockRef::from(&stream).set_send_buffer_size(bytes);
+        }
+        if ioc {
+            self.send_limit = self.cfg.send_limit.unwrap_or_else(|| {
+                2 * socket2::SockRef::from(&stream)
+                    .send_buffer_size()
+                    .unwrap_or(16 * 1024)
+            });
+            self.last_read = Instant::now();
+        }
+        let mut watchdog = tokio::time::interval(
+            (self.cfg.conn_timeout / 4).clamp(Duration::from_millis(10), Duration::from_secs(1)),
+        );
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let end = 'session: loop {
+            self.track_behind();
+            if ioc && self.outbox.len() > self.cfg.high_water {
+                break SessionEnd::Overflow;
+            }
             // An IOC can go down between the accept and the first pass.
             if self.stage.down {
                 break SessionEnd::IocDown;
@@ -473,10 +595,36 @@ impl Session {
                             break SessionEnd::Io(e);
                         }
                 }
-                read = stream.read_buf(&mut self.inbox) => {
+                // The socket takes again what it refused. Waited for only
+                // under the IOC policy: the drop policy writes on its ticks,
+                // and the block policy waits inside its write.
+                ready = stream.writable(), if ioc && self.stuck_since.is_some() => {
+                    if let Err(e) = ready {
+                        break SessionEnd::Io(e);
+                    }
+                    if let Err(e) = self.flush(&mut stream).await {
+                        break SessionEnd::Io(e);
+                    }
+                }
+                _ = watchdog.tick(), if ioc => {
+                    if self.timed_out() {
+                        break SessionEnd::TimedOut;
+                    }
+                }
+                // A suspended connection reads nothing until the client has
+                // caught up, as a PVXS server stops reading.
+                //
+                // Waited for as readiness, as the socket's writability is:
+                // both only look at the socket, where a read would hold it.
+                readable = stream.readable(), if !self.suspended => {
+                    let read = match readable {
+                        Ok(()) => stream.try_read_buf(&mut self.inbox),
+                        Err(e) => Err(e),
+                    };
                     match read {
                         Ok(0) => break SessionEnd::ClientClosed,
                         Ok(_) => {
+                            self.last_read = Instant::now();
                             // Process every complete frame buffered by this
                             // read before returning to the scheduler.
                             loop {
@@ -489,7 +637,7 @@ impl Session {
                                         let _ = self.dispatch(&frame);
                                     }
                                     Ok(None) => break,
-                                    Err(e) => return (SessionEnd::Protocol(e.to_string()), self.counters),
+                                    Err(e) => break 'session SessionEnd::Protocol(e.to_string()),
                                 }
                             }
                             // Flush replies according to the session's
@@ -512,12 +660,21 @@ impl Session {
                             if let Err(e) = self.flush(&mut stream).await {
                                 break SessionEnd::Io(e);
                             }
+                            // A message from a client that has not taken
+                            // what waits for it suspends the connection.
+                            if ioc && !self.suspended && self.outbox.len() >= self.send_limit {
+                                self.suspended = true;
+                                self.counters.suspensions += 1;
+                                self.pending.suspensions += 1;
+                            }
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => break SessionEnd::Io(e),
                     }
                 }
             }
         };
+        self.close_accounts();
         // A closed session releases all its subscriptions. Otherwise, the
         // shared live-subscription gauge would keep counting monitors from
         // disconnected clients and drift upward across reconnections.
@@ -529,6 +686,8 @@ impl Session {
             match end {
                 SessionEnd::Dropped => shared.session_dropped(),
                 SessionEnd::IocDown => shared.session_closed_down(),
+                SessionEnd::TimedOut => shared.session_timed_out(),
+                SessionEnd::Overflow => shared.session_overflowed(),
                 _ => {}
             }
         }
@@ -731,6 +890,16 @@ impl Session {
             // client sets the pipeline bit on INIT and appends its queue
             // size, which PVXS takes as the first window.
             let credit = req.initial_credit(payload, order);
+            // The queue the client asks for, read only where it is used.
+            let limit = if self.cfg.backpressure == Backpressure::Ioc {
+                payload
+                    .get(MONITOR_REQUEST..)
+                    .and_then(|request| self.request_types.queue_size(request, order))
+                    .filter(|&q| q >= 2)
+                    .unwrap_or(DEFAULT_QUEUE)
+            } else {
+                DEFAULT_QUEUE
+            };
             self.monitors.insert(
                 req.request_id,
                 Monitor {
@@ -746,6 +915,8 @@ impl Session {
                     }),
                     due: 0,
                     alarm_step: 0,
+                    limit,
+                    waiting: false,
                 },
             );
             return Ok(());
@@ -766,10 +937,15 @@ impl Session {
                 mon.credits = mon.credits.saturating_add(ack.free);
                 self.counters.pipeline_acks += 1;
                 self.pending.pipeline_acks += 1;
+                // What waited for this credit goes now.
+                if !self.suspended {
+                    self.drain(ack.request_id);
+                }
             }
         }
 
         if req.is_destroy() || req.is_stop() {
+            self.discard_queue(req.request_id);
             if self
                 .monitors
                 .remove(&req.request_id)
@@ -812,7 +988,7 @@ impl Session {
                 // Send the complete value before any deltas. The client needs
                 // an initial value to apply subsequent updates; fields not
                 // included in those deltas would otherwise remain undefined.
-                self.emit_one(req.request_id, EpicsTime::now(), Shape::Initial);
+                self.post(req.request_id, EpicsTime::now(), Shape::Initial);
             }
         }
         Ok(())
@@ -1107,6 +1283,7 @@ impl Session {
         let (Ok(_cid), Ok(request_id)) = (r.i32(), r.i32()) else {
             return Err(());
         };
+        self.discard_queue(request_id);
         if self.monitors.remove(&request_id).is_some_and(|m| m.started)
             && let Some(shared) = &self.shared
         {
@@ -1197,7 +1374,7 @@ impl Session {
                     now.plus_nanos(k as u64 * d.spacing_ns)
                 };
                 let shape = self.alarm_or_steady(d.request_id);
-                self.emit_one(d.request_id, at, shape);
+                self.post(d.request_id, at, shape);
             }
         }
     }
@@ -1359,7 +1536,7 @@ impl Session {
                 continue;
             }
             let before = self.counters.emitted;
-            self.emit_one(request_id, now, Shape::SteadyState);
+            self.post(request_id, now, Shape::SteadyState);
             queued += self.counters.emitted - before;
         }
         self.counters.burst += queued;
@@ -1368,27 +1545,162 @@ impl Session {
         queued
     }
 
-    /// Renders one monitor update into the outbox.
+    /// Posts one monitor update: sends it, or, under [`Backpressure::Ioc`],
+    /// queues it when it cannot be sent yet.
     ///
-    /// Used both by the scheduler and when a monitor starts. Keeping framing,
-    /// counters, and flow control in one place ensures both paths behave
-    /// consistently. The caller selects whether to render the initial value
-    /// or a steady-state update.
-    fn emit_one(&mut self, request_id: i32, now: EpicsTime, shape: Shape) {
+    /// Used both by the scheduler and when a monitor starts. Keeping flow
+    /// control and the recorded samples' order in one place ensures both
+    /// paths behave consistently. The caller selects whether the update is
+    /// the opening value, an ordinary update or an alarm transition.
+    fn post(&mut self, request_id: i32, now: EpicsTime, shape: Shape) {
+        let ioc = self.cfg.backpressure == Backpressure::Ioc;
         let strict = self.cfg.pipeline == Pipeline::Strict;
+        let gain = self.stage.gain;
         let Some(mon) = self.monitors.get_mut(&request_id) else {
             return;
         };
-        if strict && mon.pipelined {
-            if mon.credits <= 0 {
-                // The client has exhausted its available credits. A PVXS
-                // server waits for more credit instead of sending an update.
-                self.counters.flow_control_holds += 1;
-                self.pending.flow_control_holds += 1;
-                return;
+        let no_credit = strict && mon.pipelined && mon.credits <= 0;
+        if no_credit && !ioc {
+            // The client has exhausted its available credits. A PVXS
+            // server waits for more credit instead of sending an update.
+            self.counters.flow_control_holds += 1;
+            self.pending.flow_control_holds += 1;
+            return;
+        }
+        let instance = self.fleet.instances[mon.instance as usize];
+        // Initial values are seeded by channel, so channels of the same
+        // template do not all start with identical data. The others take
+        // the next recorded sample, sent or not: a channel moves on whether
+        // its client reads or not.
+        let step = match shape {
+            Shape::Initial => instance.seed,
+            Shape::SteadyState => {
+                mon.step += 1;
+                mon.step - 1
             }
+            Shape::Alarm => {
+                mon.alarm_step += 1;
+                mon.alarm_step - 1
+            }
+        };
+        // Steady-state updates are stamped with their emission time. Initial
+        // values represent the channel's current value and use its last
+        // processing time, as they do in a GET response.
+        let when = match shape {
+            Shape::Initial => last_processed(
+                channel_rate(&self.cfg.rate_mix, gain, &instance),
+                &instance,
+                now,
+            ),
+            Shape::SteadyState | Shape::Alarm => now,
+        };
+        let update = Queued { shape, step, when };
+        if ioc
+            && (self.suspended
+                || no_credit
+                || self.queues.get(&request_id).is_some_and(|q| !q.is_empty()))
+        {
+            self.enqueue(request_id, update, no_credit);
+            return;
+        }
+        if strict && mon.pipelined {
             mon.credits -= 1;
         }
+        self.render(request_id, update);
+    }
+
+    /// Queues an update a monitor cannot send yet, as a PVXS IOC does: up
+    /// to the monitor's limit, then written over the last held.
+    ///
+    /// PVXS merges the two, the newer fields over the older. MIMUS sends
+    /// recorded updates whole, so it keeps the one that carries more, the
+    /// opening value over an alarm transition over an ordinary update, at
+    /// the later time.
+    fn enqueue(&mut self, request_id: i32, update: Queued, no_credit: bool) {
+        let Some(mon) = self.monitors.get_mut(&request_id) else {
+            return;
+        };
+        let queue = self.queues.entry(request_id).or_default();
+        if queue.len() < mon.limit as usize {
+            queue.push_back(update);
+            self.queued += 1;
+        } else if let Some(last) = queue.back_mut() {
+            if update.shape.rank() >= last.shape.rank() {
+                *last = update;
+            } else {
+                last.when = update.when;
+            }
+            self.counters.squashed += 1;
+            self.pending.squashed += 1;
+        }
+        // A monitor waiting for credit is served when the credit comes, not
+        // when the connection resumes.
+        if self.suspended && !no_credit && !mon.waiting {
+            mon.waiting = true;
+            self.backlog.push_back(request_id);
+        }
+    }
+
+    /// Sends what a monitor's queue holds, as far as its credit goes.
+    fn drain(&mut self, request_id: i32) {
+        let strict = self.cfg.pipeline == Pipeline::Strict;
+        loop {
+            let Some(mon) = self.monitors.get_mut(&request_id) else {
+                return;
+            };
+            if strict && mon.pipelined && mon.credits <= 0 {
+                return;
+            }
+            let Some(queue) = self.queues.get_mut(&request_id) else {
+                return;
+            };
+            let Some(update) = queue.pop_front() else {
+                self.queues.remove(&request_id);
+                return;
+            };
+            self.queued -= 1;
+            if strict && mon.pipelined {
+                mon.credits -= 1;
+            }
+            self.render(request_id, update);
+        }
+    }
+
+    /// Serves the backlog of a suspended connection once its client has
+    /// taken half of what waited, as PVXS does when its send buffer drains:
+    /// monitor by monitor, in order, while the send buffer stays under the
+    /// limit. The connection reads again once it is under it.
+    fn resume(&mut self) {
+        while self.outbox.len() < self.send_limit {
+            let Some(request_id) = self.backlog.pop_front() else {
+                break;
+            };
+            if let Some(mon) = self.monitors.get_mut(&request_id) {
+                mon.waiting = false;
+                self.drain(request_id);
+            }
+        }
+        if self.outbox.len() < self.send_limit {
+            self.suspended = false;
+        }
+    }
+
+    /// Drops what a monitor's queue holds, when it stops: never sent.
+    fn discard_queue(&mut self, request_id: i32) {
+        if let Some(queue) = self.queues.remove(&request_id) {
+            let n = queue.len() as u64;
+            self.queued -= n;
+            self.counters.queued_at_close += n;
+            self.pending.queued_at_close += n;
+        }
+    }
+
+    /// Renders one monitor update into the outbox.
+    fn render(&mut self, request_id: i32, update: Queued) {
+        let Some(mon) = self.monitors.get(&request_id) else {
+            return;
+        };
+        let Queued { shape, step, when } = update;
         let instance = self.fleet.instances[mon.instance as usize];
         let steady = &self.fleet.templates[instance.template as usize];
         // Profiles captured before initial updates were recorded have no
@@ -1403,24 +1715,6 @@ impl Session {
         let mut payload = Vec::with_capacity(compiled.max_len() + 8);
         put_i32(&mut payload, mon.request_id, self.order);
         payload.push(0); // Sub-command: a standard monitor update.
-        // Initial values are seeded by channel, so channels of the same
-        // template do not all start with identical data.
-        let step = match shape {
-            Shape::Initial => instance.seed,
-            Shape::SteadyState => mon.step,
-            Shape::Alarm => mon.alarm_step,
-        };
-        // Steady-state updates are stamped with their emission time. Initial
-        // values represent the channel's current value and use its last
-        // processing time, as they do in a GET response.
-        let when = match shape {
-            Shape::Initial => last_processed(
-                channel_rate(&self.cfg.rate_mix, self.stage.gain, &instance),
-                &instance,
-                now,
-            ),
-            Shape::SteadyState | Shape::Alarm => now,
-        };
         compiled.render(step, instance.seed, when, &mut payload);
         apply_written(
             self.written.as_deref(),
@@ -1429,13 +1723,11 @@ impl Session {
             &mut payload,
             MONITOR_BODY,
         );
-        if shape == Shape::SteadyState {
-            mon.step += 1;
-        } else if shape == Shape::Alarm {
-            mon.alarm_step += 1;
+        if shape == Shape::Alarm {
             self.counters.alarms += 1;
             self.pending.alarms += 1;
-        } else if steady.initial.is_some()
+        } else if shape == Shape::Initial
+            && steady.initial.is_some()
             && let Some(desc) = &self.fleet.openings[instance.template as usize]
         {
             restamp(desc, &mut payload[MONITOR_BODY..], when);
@@ -1466,6 +1758,8 @@ impl Session {
 
         self.outbox.extend_from_slice(&hdr.encode());
         self.outbox.extend_from_slice(&payload);
+        self.update_ends
+            .push_back(self.sent + self.outbox.len() as u64);
 
         self.counters.emitted += 1;
         self.pending.emitted += 1;
@@ -1533,7 +1827,8 @@ impl Session {
             return Ok(());
         }
         stream.write_all(&self.outbox).await?;
-        self.outbox.clear();
+        let n = self.outbox.len();
+        self.wrote(n);
         self.last_flush = Some(std::time::Instant::now());
         Ok(())
     }
@@ -1547,9 +1842,22 @@ impl Session {
             // Let TCP apply backpressure naturally. The resulting throughput
             // reflects the consumer's actual receive capacity, which is the
             // measurement this policy is intended to capture.
+            //
+            // The write is `write_all`'s, taken apart so that the time the
+            // socket refuses is counted.
             Backpressure::Block => {
-                stream.write_all(&self.outbox).await?;
-                self.outbox.clear();
+                while !self.outbox.is_empty() {
+                    match stream.try_write(&self.outbox) {
+                        Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                        Ok(n) => self.wrote(n),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            self.refused();
+                            stream.writable().await?;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
             }
 
             // Write only what the socket can accept immediately.
@@ -1566,28 +1874,134 @@ impl Session {
             // Retain any unwritten bytes so the buffer remains above the
             // high-water threshold on subsequent ticks. New updates can then
             // be dropped and counted as intended.
-            Backpressure::Drop => loop {
-                match stream.try_write(&self.outbox) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        self.outbox.advance(n);
-                        if self.outbox.is_empty() {
-                            break;
-                        }
+            Backpressure::Drop => self.write_ready(stream)?,
+
+            // Write what the socket takes, and keep the rest, without
+            // limit, as PVXS keeps it in its send buffer. A suspended
+            // connection takes its subscriptions' backlog once the client
+            // has taken half of what waited.
+            Backpressure::Ioc => loop {
+                self.write_ready(stream)?;
+                if self.suspended && self.outbox.len() <= self.send_limit / 2 {
+                    let before = self.outbox.len();
+                    self.resume();
+                    if self.outbox.len() > before {
+                        continue;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
                 }
+                break;
             },
         }
         self.last_flush = Some(std::time::Instant::now());
         Ok(())
     }
+
+    /// Writes what the socket takes now, without waiting.
+    fn write_ready(&mut self, stream: &TcpStream) -> std::io::Result<()> {
+        while !self.outbox.is_empty() {
+            match stream.try_write(&self.outbox) {
+                Ok(0) => break,
+                Ok(n) => self.wrote(n),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.refused();
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Accounts for `n` bytes of the outbox written to the socket.
+    fn wrote(&mut self, n: usize) {
+        self.outbox.advance(n);
+        self.sent += n as u64;
+        while self
+            .update_ends
+            .front()
+            .is_some_and(|&end| end <= self.sent)
+        {
+            self.update_ends.pop_front();
+        }
+        self.stuck_since = None;
+    }
+
+    /// Notes that the socket took nothing more of what waits.
+    fn refused(&mut self) {
+        if self.stuck_since.is_none() {
+            self.stuck_since = Some(Instant::now());
+        }
+        if let Some(shared) = &self.shared {
+            shared.note_backlog(self.outbox.len());
+        }
+    }
+
+    /// Counts the time the connection spends behind its client, and tells
+    /// the run when it falls behind or catches up.
+    ///
+    /// Behind is holding what the client's socket would not take yet, or
+    /// being suspended with updates queued for it. The time is counted as
+    /// it passes, so that a phase of a scenario gets the part of a stall
+    /// that fell within it.
+    fn track_behind(&mut self) {
+        let behind = self.stuck_since.is_some() || self.suspended || self.queued > 0;
+        let was = self.behind_since.is_some();
+        if !behind && !was {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(since) = self.behind_since {
+            let us = now.saturating_duration_since(since).as_micros() as u64;
+            self.counters.behind_us += us;
+            self.pending.behind_us += us;
+        }
+        self.behind_since = behind.then_some(now);
+        if behind != was
+            && let Some(shared) = &self.shared
+        {
+            shared.set_behind(behind);
+        }
+    }
+
+    /// Whether the client has sent nothing, or taken nothing waiting for
+    /// it, for the connection timeout. A suspended connection does not
+    /// read, and does not count the client's silence against it.
+    fn timed_out(&self) -> bool {
+        let limit = self.cfg.conn_timeout;
+        (!self.suspended && self.last_read.elapsed() >= limit)
+            || self.stuck_since.is_some_and(|t| t.elapsed() >= limit)
+    }
+
+    /// Counts what the closing connection never sent: the updates still in
+    /// its send buffer, and those still queued.
+    fn close_accounts(&mut self) {
+        let unsent = self.update_ends.len() as u64;
+        self.update_ends.clear();
+        self.counters.unsent += unsent;
+        self.pending.unsent += unsent;
+        let queued = std::mem::take(&mut self.queued);
+        self.queues.clear();
+        self.backlog.clear();
+        self.counters.queued_at_close += queued;
+        self.pending.queued_at_close += queued;
+        self.stuck_since = None;
+        self.suspended = false;
+        self.track_behind();
+        self.publish();
+    }
 }
 
 /// Offset of the value body in a monitor update, after the request ID and sub-command.
 const MONITOR_BODY: usize = 5;
+
+/// Offset of the `pvRequest` in a monitor request, after the server's
+/// channel ID, the request ID and the sub-command.
+const MONITOR_REQUEST: usize = 4 + 4 + 1;
+
+/// The updates a PVXS subscription queues when its client asks for no other
+/// number.
+const DEFAULT_QUEUE: u32 = 4;
 
 /// Replaces the timestamp in a replayed opening message with the current
 /// run's timestamp, and the data's timestamp beside it if there is one.

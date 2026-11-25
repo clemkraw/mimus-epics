@@ -11,7 +11,9 @@
 /// Emission totals for one emitter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counters {
-    /// Updates successfully written to the wire.
+    /// Updates put in a connection's send buffer, opening messages
+    /// included. Each reaches the socket, unless the connection closes
+    /// first: see `unsent`.
     pub emitted: u64,
     /// Updates discarded because the consumer could not keep up.
     /// Always counted, never silently dropped.
@@ -58,6 +60,24 @@ pub struct Counters {
     pub put_bytes: u64,
     /// RPC requests answered, INIT apart.
     pub rpcs: u64,
+    /// Under `--backpressure ioc`: updates written over in a subscription's
+    /// full queue, as a PVXS IOC writes the newest over the last it holds.
+    /// Never sent, and the client is not told.
+    pub squashed: u64,
+    /// Under `--backpressure ioc`: updates still in a subscription's queue
+    /// when the subscription stopped or the connection closed. Never sent.
+    pub queued_at_close: u64,
+    /// Updates still in a connection's send buffer when it closed: a part
+    /// of `emitted` that never reached the socket.
+    pub unsent: u64,
+    /// Microseconds connections spent behind: holding updates the client's
+    /// socket would not take yet, or queued while the connection was
+    /// suspended. Summed over connections.
+    pub behind_us: u64,
+    /// Under `--backpressure ioc`: times a connection's send buffer reached
+    /// the IOC's limit while the client was still sending, and the
+    /// connection stopped taking updates from its subscriptions.
+    pub suspensions: u64,
 }
 
 impl Counters {
@@ -98,6 +118,11 @@ impl Counters {
         self.puts += other.puts;
         self.put_bytes += other.put_bytes;
         self.rpcs += other.rpcs;
+        self.squashed += other.squashed;
+        self.queued_at_close += other.queued_at_close;
+        self.unsent += other.unsent;
+        self.behind_us += other.behind_us;
+        self.suspensions += other.suspensions;
     }
 
     /// Returns what was counted between `earlier` and these totals.
@@ -125,6 +150,11 @@ impl Counters {
             puts: self.puts.saturating_sub(earlier.puts),
             put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
             rpcs: self.rpcs.saturating_sub(earlier.rpcs),
+            squashed: self.squashed.saturating_sub(earlier.squashed),
+            queued_at_close: self.queued_at_close.saturating_sub(earlier.queued_at_close),
+            unsent: self.unsent.saturating_sub(earlier.unsent),
+            behind_us: self.behind_us.saturating_sub(earlier.behind_us),
+            suspensions: self.suspensions.saturating_sub(earlier.suspensions),
         }
     }
 }
@@ -142,6 +172,12 @@ pub enum Backpressure {
     /// Maintain the nominal rate and count updates that cannot be sent
     /// as dropped. Models an IOC monitor queue overflowing under load.
     Drop,
+    /// Do what a PVXS IOC does. What a client does not read is kept, with
+    /// no limit, until the connection times out. A client still sending
+    /// while too much waits for it suspends the connection: each of its
+    /// subscriptions then holds a few updates and writes the newest over
+    /// the last, until the client catches up.
+    Ioc,
 }
 
 impl std::fmt::Display for Backpressure {
@@ -149,6 +185,7 @@ impl std::fmt::Display for Backpressure {
         f.write_str(match self {
             Self::Block => "block",
             Self::Drop => "drop",
+            Self::Ioc => "ioc",
         })
     }
 }
@@ -159,7 +196,10 @@ impl std::str::FromStr for Backpressure {
         match s {
             "block" => Ok(Self::Block),
             "drop" => Ok(Self::Drop),
-            other => Err(format!("unknown backpressure policy {other:?}")),
+            "ioc" => Ok(Self::Ioc),
+            other => Err(format!(
+                "unknown backpressure policy {other:?}: block, drop or ioc"
+            )),
         }
     }
 }
@@ -240,6 +280,11 @@ mod tests {
             puts: 3,
             put_bytes: 12,
             rpcs: 1,
+            squashed: 2,
+            queued_at_close: 3,
+            unsent: 4,
+            behind_us: 5,
+            suspensions: 6,
         };
         a.merge(&Counters {
             emitted: 10,
@@ -256,6 +301,11 @@ mod tests {
             puts: 30,
             put_bytes: 120,
             rpcs: 10,
+            squashed: 20,
+            queued_at_close: 30,
+            unsent: 40,
+            behind_us: 50,
+            suspensions: 60,
         });
         assert_eq!(
             a,
@@ -274,15 +324,22 @@ mod tests {
                 puts: 33,
                 put_bytes: 132,
                 rpcs: 11,
+                squashed: 22,
+                queued_at_close: 33,
+                unsent: 44,
+                behind_us: 55,
+                suspensions: 66,
             }
         );
     }
 
     #[test]
-    fn backpressure_parses_both_ways() {
+    fn backpressure_parses_every_way() {
         assert_eq!("block".parse(), Ok(Backpressure::Block));
         assert_eq!("drop".parse(), Ok(Backpressure::Drop));
+        assert_eq!("ioc".parse(), Ok(Backpressure::Ioc));
         assert!("wait".parse::<Backpressure>().is_err());
         assert_eq!(Backpressure::Drop.to_string(), "drop");
+        assert_eq!(Backpressure::Ioc.to_string(), "ioc");
     }
 }
