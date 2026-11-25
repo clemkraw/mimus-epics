@@ -24,6 +24,12 @@
 //! iocs = [1]
 //! down = "10s"
 //! duration = "60s"
+//!
+//! [[phase]]
+//! kind = "steady"          # any phase can run a command as it starts and ends
+//! duration = "15s"
+//! on_start = "kill -STOP $ARCHIVER_PID"
+//! on_end = "kill -CONT $ARCHIVER_PID"
 //! ```
 
 use std::time::Duration;
@@ -80,6 +86,8 @@ struct RawPhase {
     share: Option<f64>,
     resume: Option<RawResume>,
     down: Option<Span>,
+    on_start: Option<String>,
+    on_end: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -145,9 +153,23 @@ impl RawScenario {
 
 impl RawPhase {
     /// Returns the phases this table stands for: one, or several for a gain
-    /// climbing in steps. `n` is the table's place in the file, from 1, and
-    /// `line` the line it starts on.
-    fn into_phases(self, n: usize, line: usize) -> Result<Vec<Phase>, String> {
+    /// climbing in steps, the first running the table's start command and
+    /// the last its end command. `n` is the table's place in the file, from
+    /// 1, and `line` the line it starts on.
+    fn into_phases(mut self, n: usize, line: usize) -> Result<Vec<Phase>, String> {
+        let on_start = self.on_start.take();
+        let on_end = self.on_end.take();
+        let mut phases = self.phases(n, line)?;
+        if let Some(first) = phases.first_mut() {
+            first.on_start = on_start;
+        }
+        if let Some(last) = phases.last_mut() {
+            last.on_end = on_end;
+        }
+        Ok(phases)
+    }
+
+    fn phases(self, n: usize, line: usize) -> Result<Vec<Phase>, String> {
         let kind = self.kind;
         let at = |why: String| format!("phase {n} ({}, line {line}): {why}", kind.name());
         // What each kind takes; anything else in the table is a mistake.
@@ -186,6 +208,8 @@ impl RawPhase {
                 label: label.clone().unwrap_or(default),
                 duration,
                 action,
+                on_start: None,
+                on_end: None,
             }])
         };
         match kind {
@@ -274,6 +298,8 @@ impl RawPhase {
                                 to: g,
                                 iocs: targets.clone(),
                             },
+                            on_start: None,
+                            on_end: None,
                         }
                     })
                     .collect())
@@ -654,6 +680,44 @@ mod tests {
     }
 
     #[test]
+    fn a_phase_s_commands_are_read_and_a_staircase_runs_them_at_its_ends() {
+        let s = parse(
+            r#"
+            [[phase]]
+            kind = "steady"
+            duration = "15s"
+            on_start = "kill -STOP $CONSUMER_PID"
+            on_end = "kill -CONT $CONSUMER_PID"
+
+            [[phase]]
+            kind = "gain"
+            duration = "30s"
+            gain = { from = 1, to = 3, steps = 3 }
+            on_start = "date"
+            on_end = "sync"
+            "#,
+        )
+        .unwrap();
+        let commands: Vec<_> = s
+            .phases
+            .iter()
+            .map(|p| (p.on_start.as_deref(), p.on_end.as_deref()))
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                (
+                    Some("kill -STOP $CONSUMER_PID"),
+                    Some("kill -CONT $CONSUMER_PID")
+                ),
+                (Some("date"), None),
+                (None, None),
+                (None, Some("sync")),
+            ]
+        );
+    }
+
+    #[test]
     fn the_scenarios_shipped_with_mimus_are_valid() {
         for (name, text) in [
             ("beam-dump", include_str!("../scenarios/beam-dump.toml")),
@@ -661,6 +725,7 @@ mod tests {
             ("freeze", include_str!("../scenarios/freeze.toml")),
             ("staircase", include_str!("../scenarios/staircase.toml")),
             ("bad-day", include_str!("../scenarios/bad-day.toml")),
+            ("slow-client", include_str!("../scenarios/slow-client.toml")),
         ] {
             let s = parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
             s.check(4).unwrap_or_else(|e| panic!("{name}: {e}"));
