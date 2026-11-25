@@ -2855,11 +2855,27 @@ async fn alarm_transitions_are_sent_in_place_of_ordinary_updates_in_the_order_re
     let (addr, totals) = start_staged(Arc::clone(&f), cfg, &stages).await;
     let mut c = Client::connect(addr).await;
     c.handshake().await;
-    let ids = c.subscribe_all(&f.names).await;
 
-    let got = c
-        .collect_updates(ids[0], 1000, Duration::from_secs(2))
+    // Every update is kept from the start. Draining the first ones, as
+    // `subscribe_all` does, would also drain whatever transitions fell in
+    // the drain, and how many do depends on the machine's timers: on
+    // Windows the sequence then began at its second transition.
+    let cid = c.create_channel(&f.names[0]).await.unwrap();
+    let (request_id, _) = c.monitor_init(cid).await;
+    c.monitor_start(cid, request_id).await;
+    let mut got = c
+        .collect_updates(request_id, 1000, Duration::from_secs(2))
         .await;
+    // Then the monitor is stopped and what was already on its way is kept
+    // too, so that the count the session publishes covers exactly what
+    // arrived.
+    c.monitor_start_with(cid, request_id, commands::monitor::STOP)
+        .await;
+    got.extend(
+        c.collect_updates(request_id, 1000, Duration::from_millis(300))
+            .await,
+    );
+
     let alarms: Vec<&Vec<u8>> = got
         .iter()
         .filter(|b| b[..3] == [0x03, 0xBA, 0x01])
@@ -2867,21 +2883,29 @@ async fn alarm_transitions_are_sent_in_place_of_ordinary_updates_in_the_order_re
     let ordinary = got.iter().filter(|b| b[..3] == [0x03, 0x83, 0x01]).count();
     assert_eq!(alarms.len() + ordinary, got.len(), "only the two shapes");
     assert!(
-        (8..=40).contains(&alarms.len()),
+        (8..=45).contains(&alarms.len()),
         "about one in five of {}: {}",
         got.len(),
         alarms.len()
     );
-    let severities: Vec<i32> = alarms
+
+    // Each transition is the recorded one, value and severity together:
+    // 11 with severity 1 first, then 12 with 2, 13 with 1, 14 with 0, again.
+    let sent: Vec<(f64, i32)> = alarms
         .iter()
-        .map(|b| i32::from_le_bytes(b[11..15].try_into().unwrap()))
+        .map(|b| {
+            (
+                f64::from_le_bytes(b[3..11].try_into().unwrap()),
+                i32::from_le_bytes(b[11..15].try_into().unwrap()),
+            )
+        })
         .collect();
-    let recorded = [1, 2, 1, 0];
-    for (k, s) in severities.iter().enumerate() {
+    let recorded = [(11.0, 1), (12.0, 2), (13.0, 1), (14.0, 0)];
+    for (k, transition) in sent.iter().enumerate() {
         assert_eq!(
-            *s,
+            *transition,
             recorded[k % 4],
-            "transition {k} out of order: {severities:?}"
+            "transition {k} out of order: {sent:?}"
         );
     }
     assert_eq!(totals.snapshot().alarms, alarms.len() as u64);
