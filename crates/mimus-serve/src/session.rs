@@ -86,6 +86,9 @@ pub struct SessionConfig {
     /// Whether channels post in bursts and fall silent in between, and how.
     /// `None` sends every update a channel is due.
     pub activity: Option<Activity>,
+    /// Alarm transitions per channel per hour, for the channels whose type
+    /// carries an alarm variant. `None` sends the ordinary update only.
+    pub alarms: Option<f64>,
 }
 
 impl Default for SessionConfig {
@@ -108,6 +111,7 @@ impl Default for SessionConfig {
             stages: None,
             headroom: 1.0,
             activity: None,
+            alarms: None,
         }
     }
 }
@@ -158,6 +162,8 @@ enum Shape {
     Initial,
     /// A delta containing only the fields that changed.
     SteadyState,
+    /// A delta that also carries an alarm transition.
+    Alarm,
 }
 
 /// A monitor established by the client on this connection.
@@ -188,6 +194,9 @@ struct Monitor {
     /// Updates the channel has been due on this monitor: the count the
     /// activity model draws from.
     due: u64,
+    /// Alarm transitions sent on this monitor: the place in the alarm
+    /// variant's recorded transitions, replayed in the order observed.
+    alarm_step: u64,
 }
 
 /// Describes why a session ended.
@@ -642,6 +651,7 @@ impl Session {
                         a.starts_active(self.fleet.instances[instance as usize].seed)
                     }),
                     due: 0,
+                    alarm_step: 0,
                 },
             );
             return Ok(());
@@ -952,7 +962,8 @@ impl Session {
                 } else {
                     now.plus_nanos(k as u64 * d.spacing_ns)
                 };
-                self.emit_one(d.request_id, at, Shape::SteadyState);
+                let shape = self.alarm_or_steady(d.request_id);
+                self.emit_one(d.request_id, at, shape);
             }
         }
     }
@@ -986,6 +997,44 @@ impl Session {
             d.repeats = n;
             true
         });
+    }
+
+    /// Decides whether the update a monitor is due carries an alarm
+    /// transition, under `--alarms`.
+    ///
+    /// A channel of a type with an alarm variant sends a transition with the
+    /// probability that gives it the transitions per hour asked for, at the
+    /// rate it runs at. The draw comes from the channel's seed and its
+    /// counts, so the same channel alarms at the same updates on every run.
+    /// The transitions themselves follow one another as calibration saw
+    /// them, a raise and later its clear.
+    fn alarm_or_steady(&self, request_id: i32) -> Shape {
+        let Some(per_hour) = self.cfg.alarms else {
+            return Shape::SteadyState;
+        };
+        let Some(mon) = self.monitors.get(&request_id) else {
+            return Shape::SteadyState;
+        };
+        let instance = &self.fleet.instances[mon.instance as usize];
+        if self.fleet.templates[usize::from(instance.template)]
+            .alarm
+            .is_none()
+        {
+            return Shape::SteadyState;
+        }
+        let rate = channel_rate(&self.cfg.rate_mix, self.stage.gain, instance);
+        if rate <= 0.0 {
+            return Shape::SteadyState;
+        }
+        let chance = per_hour / 3600.0 / rate;
+        let draw = unit_fraction(
+            instance.seed ^ (mon.step + mon.alarm_step).wrapping_mul(0xD6E8_FEB8_6659_FD93),
+        );
+        if draw < chance {
+            Shape::Alarm
+        } else {
+            Shape::SteadyState
+        }
     }
 
     /// Keeps, of each due monitor's updates, those its channel would send:
@@ -1114,6 +1163,7 @@ impl Session {
         let compiled = match shape {
             Shape::Initial => steady.initial.as_deref().unwrap_or(steady),
             Shape::SteadyState => steady,
+            Shape::Alarm => steady.alarm.as_deref().unwrap_or(steady),
         };
 
         let mut payload = Vec::with_capacity(compiled.max_len() + 8);
@@ -1124,6 +1174,7 @@ impl Session {
         let step = match shape {
             Shape::Initial => instance.seed,
             Shape::SteadyState => mon.step,
+            Shape::Alarm => mon.alarm_step,
         };
         // Steady-state updates are stamped with their emission time. Initial
         // values represent the channel's current value and use its last
@@ -1134,11 +1185,15 @@ impl Session {
                 &instance,
                 now,
             ),
-            Shape::SteadyState => now,
+            Shape::SteadyState | Shape::Alarm => now,
         };
         compiled.render(step, instance.seed, when, &mut payload);
         if shape == Shape::SteadyState {
             mon.step += 1;
+        } else if shape == Shape::Alarm {
+            mon.alarm_step += 1;
+            self.counters.alarms += 1;
+            self.pending.alarms += 1;
         } else if steady.initial.is_some()
             && let Some(desc) = &self.fleet.openings[instance.template as usize]
         {
