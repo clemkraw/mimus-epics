@@ -2855,11 +2855,27 @@ async fn alarm_transitions_are_sent_in_place_of_ordinary_updates_in_the_order_re
     let (addr, totals) = start_staged(Arc::clone(&f), cfg, &stages).await;
     let mut c = Client::connect(addr).await;
     c.handshake().await;
-    let ids = c.subscribe_all(&f.names).await;
 
-    let got = c
-        .collect_updates(ids[0], 1000, Duration::from_secs(2))
+    // Every update is kept from the start. Draining the first ones, as
+    // `subscribe_all` does, would also drain whatever transitions fell in
+    // the drain, and how many do depends on the machine's timers: on
+    // Windows the sequence then began at its second transition.
+    let cid = c.create_channel(&f.names[0]).await.unwrap();
+    let (request_id, _) = c.monitor_init(cid).await;
+    c.monitor_start(cid, request_id).await;
+    let mut got = c
+        .collect_updates(request_id, 1000, Duration::from_secs(2))
         .await;
+    // Then the monitor is stopped and what was already on its way is kept
+    // too, so that the count the session publishes covers exactly what
+    // arrived.
+    c.monitor_start_with(cid, request_id, commands::monitor::STOP)
+        .await;
+    got.extend(
+        c.collect_updates(request_id, 1000, Duration::from_millis(300))
+            .await,
+    );
+
     let alarms: Vec<&Vec<u8>> = got
         .iter()
         .filter(|b| b[..3] == [0x03, 0xBA, 0x01])
@@ -2867,21 +2883,29 @@ async fn alarm_transitions_are_sent_in_place_of_ordinary_updates_in_the_order_re
     let ordinary = got.iter().filter(|b| b[..3] == [0x03, 0x83, 0x01]).count();
     assert_eq!(alarms.len() + ordinary, got.len(), "only the two shapes");
     assert!(
-        (8..=40).contains(&alarms.len()),
+        (8..=45).contains(&alarms.len()),
         "about one in five of {}: {}",
         got.len(),
         alarms.len()
     );
-    let severities: Vec<i32> = alarms
+
+    // Each transition is the recorded one, value and severity together:
+    // 11 with severity 1 first, then 12 with 2, 13 with 1, 14 with 0, again.
+    let sent: Vec<(f64, i32)> = alarms
         .iter()
-        .map(|b| i32::from_le_bytes(b[11..15].try_into().unwrap()))
+        .map(|b| {
+            (
+                f64::from_le_bytes(b[3..11].try_into().unwrap()),
+                i32::from_le_bytes(b[11..15].try_into().unwrap()),
+            )
+        })
         .collect();
-    let recorded = [1, 2, 1, 0];
-    for (k, s) in severities.iter().enumerate() {
+    let recorded = [(11.0, 1), (12.0, 2), (13.0, 1), (14.0, 0)];
+    for (k, transition) in sent.iter().enumerate() {
         assert_eq!(
-            *s,
+            *transition,
             recorded[k % 4],
-            "transition {k} out of order: {severities:?}"
+            "transition {k} out of order: {sent:?}"
         );
     }
     assert_eq!(totals.snapshot().alarms, alarms.len() as u64);
@@ -2901,4 +2925,202 @@ async fn without_alarms_asked_for_the_variant_is_never_sent() {
     assert!(!got.is_empty());
     assert!(got.iter().all(|b| b[..3] == [0x03, 0x83, 0x01]));
     assert_eq!(totals.snapshot().alarms, 0);
+}
+
+// ------------------------------------------------------------ large frames
+
+/// Pixels in each frame of the image fixture: one megabyte, so that a frame
+/// is larger than anything else these tests send by four orders of magnitude.
+const PIXELS: usize = 1 << 20;
+
+/// Encodes a descriptor shaped like an NTNDArray's, reduced to what the
+/// fixture moves: the pixels in a union, a frame counter, and the two stamps.
+///
+/// ```text
+///   bit 0  the structure          bit 3  dataTimeStamp (4, 5, 6)
+///   bit 1  value                  bit 7  timeStamp (8, 9, 10)
+///   bit 2  uniqueId
+/// ```
+fn ntndarray_descriptor() -> Vec<u8> {
+    let mut d = vec![0xFF, 0xFD, 0x04, 0x00, 0x80];
+    put_string(&mut d, "epics:nt/NTNDArray:1.0", LE);
+    put_size(&mut d, 4, LE);
+    put_string(&mut d, "value", LE);
+    d.push(0x81);
+    put_string(&mut d, "", LE);
+    put_size(&mut d, 1, LE);
+    put_string(&mut d, "ubyteValue", LE);
+    d.push(0x2C);
+    put_string(&mut d, "uniqueId", LE);
+    d.push(0x22);
+    for stamp in ["dataTimeStamp", "timeStamp"] {
+        put_string(&mut d, stamp, LE);
+        d.push(0x80);
+        put_string(&mut d, "time_t", LE);
+        put_size(&mut d, 3, LE);
+        put_string(&mut d, "secondsPastEpoch", LE);
+        d.push(0x23);
+        put_string(&mut d, "nanoseconds", LE);
+        d.push(0x22);
+        put_string(&mut d, "userTag", LE);
+        d.push(0x22);
+    }
+    d
+}
+
+/// The bytes before the pixels: the union's selector and the array's size.
+fn pixels_prefix() -> Vec<u8> {
+    let mut v = vec![0x00];
+    put_size(&mut v, PIXELS, LE);
+    v
+}
+
+/// A frame of the fixture: every pixel is `k`, so a frame names itself.
+fn frame(k: u8) -> Vec<u8> {
+    vec![k; PIXELS]
+}
+
+/// A stamp's three members, as calibration would leave them in a template:
+/// two live slots and the user tag.
+fn push_stamp(t: &mut Template, first_id: u16) {
+    t.push_slot(
+        Slot::new(first_id, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds),
+    )
+    .push_slot(
+        Slot::new(first_id + 1, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos),
+    )
+    .push_fixed(0i32.to_le_bytes().to_vec());
+}
+
+/// A profile with one image type, as calibration builds it with the image
+/// kept whole: three frames replayed, the counter replayed beside them, both
+/// stamps live. Its opening message was recorded with both stamps at
+/// [`RECORDED_SECONDS`].
+fn image_profile() -> Profile {
+    let mut steady = Template::new("ntndarray_union", MONITOR);
+    steady
+        .with_introspection(Introspection {
+            full: ntndarray_descriptor(),
+            id_only: Some(vec![0xFF, 0xFE, 0x04, 0x00]),
+        })
+        // Changed set {1, 2, 3, 7}: value, uniqueId and the two stamps.
+        .push_fixed([vec![0x01, 0x8E], pixels_prefix()].concat())
+        .push_slot(
+            Slot::new(1, SlotWidth::Fixed { bytes: PIXELS })
+                .with_samples((0..3).map(frame).collect()),
+        )
+        .push_slot(
+            Slot::new(2, SlotWidth::Fixed { bytes: 4 })
+                .with_samples((101i32..104).map(|id| id.to_le_bytes().to_vec()).collect()),
+        );
+    push_stamp(&mut steady, 3);
+    push_stamp(&mut steady, 5);
+    steady.push_fixed(vec![0x00]);
+    steady.observations = 30;
+
+    let mut recorded = Vec::new();
+    for _ in 0..2 {
+        recorded.extend_from_slice(&RECORDED_SECONDS.to_le_bytes());
+        recorded.extend_from_slice(&7i32.to_le_bytes());
+        recorded.extend_from_slice(&0i32.to_le_bytes());
+    }
+    let mut opening = Template::new("ntndarray_union_initial", MONITOR);
+    opening.push_fixed(
+        [
+            vec![0x01, 0x01],
+            pixels_prefix(),
+            frame(9),
+            100i32.to_le_bytes().to_vec(),
+            recorded,
+            vec![0x00],
+        ]
+        .concat(),
+    );
+    opening.observations = 1;
+    steady.with_initial(opening);
+
+    let mut p = profile();
+    p.templates = vec![steady];
+    p.assignments = vec![Assignment {
+        pv: "IMG".into(),
+        template: "ntndarray_union".into(),
+    }];
+    p.validate(0).unwrap();
+    p
+}
+
+/// Where the parts of an image update lie: after the changed set, the
+/// selector, the size and the pixels come the counter and the two stamps.
+const IMAGE_HEAD: usize = 2 + 1 + 5;
+const UNIQUE_AT: usize = IMAGE_HEAD + PIXELS;
+const DATA_STAMP_AT: usize = UNIQUE_AT + 4;
+const STAMP_AT: usize = DATA_STAMP_AT + 16;
+const IMAGE_LEN: usize = STAMP_AT + 16 + 1;
+
+#[tokio::test]
+async fn an_image_of_a_megabyte_arrives_whole_frame_after_frame() {
+    let spec = FleetSpec {
+        iocs: 1,
+        pvs: 1,
+        layout: Layout::Blocked,
+        mix: vec![("ntndarray_union".into(), 1)],
+        rate_mix: RateMix::uniform(50.0),
+        names: mimus_serve::NameTemplate::default_pattern("MIM"),
+    };
+    let f = Arc::new(Fleet::build(&image_profile(), &spec).unwrap());
+    assert!(f.unstamped_openings().is_empty());
+    let cfg = SessionConfig {
+        high_water: 16 << 20,
+        ..fast_config()
+    };
+    let addr = start(Arc::clone(&f), cfg).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let (request_id, intro) = c.subscribe(&f.names[0]).await;
+    assert!(intro.ends_with(&ntndarray_descriptor()[1..]));
+
+    let updates = c
+        .collect_updates(request_id, 7, Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        updates.len(),
+        7,
+        "seven updates of a megabyte in five seconds"
+    );
+
+    // The opening message: the recorded frame, both stamps current.
+    let opening = &updates[0];
+    assert_eq!(opening.len(), IMAGE_LEN);
+    assert!(opening[IMAGE_HEAD..UNIQUE_AT].iter().all(|&p| p == 9));
+    assert_current(opening, DATA_STAMP_AT, "the opening's dataTimeStamp");
+    assert_current(opening, STAMP_AT, "the opening's timeStamp");
+
+    // Then the recorded frames in turn, each whole, each with the counter
+    // recorded with it and current stamps.
+    let mut seen = Vec::new();
+    for u in &updates[1..] {
+        assert_eq!(u.len(), IMAGE_LEN);
+        assert_eq!(
+            &u[..IMAGE_HEAD],
+            &[vec![0x01, 0x8E], pixels_prefix()].concat()[..]
+        );
+        let k = u[IMAGE_HEAD];
+        assert!(k < 3, "frame {k} was never recorded");
+        assert!(
+            u[IMAGE_HEAD..UNIQUE_AT].iter().all(|&p| p == k),
+            "frame {k} arrived torn"
+        );
+        let unique = i32::from_le_bytes(u[UNIQUE_AT..DATA_STAMP_AT].try_into().unwrap());
+        assert_eq!(
+            unique,
+            101 + i32::from(k),
+            "the counter recorded with frame {k}"
+        );
+        assert_current(u, DATA_STAMP_AT, "dataTimeStamp");
+        assert_current(u, STAMP_AT, "timeStamp");
+        seen.push(k);
+    }
+    for k in 0..3u8 {
+        assert!(seen.contains(&k), "frame {k} never replayed: {seen:?}");
+    }
 }

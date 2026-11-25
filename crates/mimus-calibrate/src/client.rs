@@ -30,6 +30,10 @@ use tokio::net::TcpStream;
 
 use crate::observe::ChannelObserver;
 
+/// Largest message calibration reads: a gigabyte, so that a reference
+/// server's largest image is observed rather than refused.
+const MAX_MESSAGE: u32 = 1 << 30;
+
 /// Why observation stopped.
 #[derive(Debug)]
 pub enum ClientError {
@@ -102,6 +106,13 @@ pub struct Settings {
     /// Prevents long runs from exhausting memory. The observer evicts
     /// duplicate samples first to preserve variety.
     pub max_updates_per_channel: usize,
+    /// Maximum bytes of message bodies retained per channel.
+    ///
+    /// The count alone bounds nothing once a body can be an image: 64
+    /// frames of 16 MB are a gigabyte per channel. Channels whose bodies
+    /// reach this budget before the count keep fewer, and the criterion
+    /// asks no more of them than they can keep.
+    pub max_bytes_per_channel: usize,
     /// Interval between progress callback invocations.
     pub poll: Duration,
     /// Maximum observation duration.
@@ -123,6 +134,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             max_updates_per_channel: 64,
+            max_bytes_per_channel: 128 << 20,
             poll: Duration::from_secs(1),
             deadline: Duration::from_secs(600),
             quiet_exit: Duration::from_secs(45),
@@ -153,14 +165,20 @@ pub async fn observe(
 ) -> Result<Vec<ChannelObserver>, ClientError> {
     let mut observers: Vec<ChannelObserver> = channels
         .iter()
-        .map(|pv| ChannelObserver::new(pv.clone(), settings.max_updates_per_channel))
+        .map(|pv| {
+            ChannelObserver::new(pv.clone(), settings.max_updates_per_channel)
+                .with_byte_budget(settings.max_bytes_per_channel)
+        })
         .collect();
 
     let mut stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
 
     let order = ByteOrder::Little;
-    let mut framer = Framer::new();
+    // The server's own messages are what calibration is for: an image of
+    // 64 MB must be read, not refused as the 16 MB a server accepts from a
+    // client would be.
+    let mut framer = Framer::new().with_max_payload(MAX_MESSAGE);
     let mut inbox = BytesMut::with_capacity(256 * 1024);
     let started = Instant::now();
 

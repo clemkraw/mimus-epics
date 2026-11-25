@@ -359,6 +359,25 @@ struct CalibrateArgs {
     #[arg(long = "epics-version", default_value = "unknown")]
     epics_version: String,
 
+    /// Arrays of at least this many bytes are kept whole: one slot,
+    /// replayed as observed, rather than compared byte by byte.
+    ///
+    /// Compared byte by byte, a 1 MB image is hundreds of thousands of
+    /// fields and a profile larger than the capture. Smaller arrays are
+    /// analysed as any field is, as the catalogue's waveforms of 64
+    /// elements are.
+    #[arg(long = "array-from", default_value_t = 4096, value_name = "BYTES")]
+    array_from: usize,
+
+    /// Bytes of samples a template keeps for replay, at most.
+    ///
+    /// A template replays the updates it was learned from, so thirty frames
+    /// of an image are thirty images in the profile. Past this budget a type
+    /// keeps the first updates that fit, two at least, and says so; each
+    /// one kept is still reproduced byte for byte.
+    #[arg(long = "sample-budget", default_value_t = 4 << 20, value_name = "BYTES")]
+    sample_budget: usize,
+
     /// Log observations at each step, channel by channel.
     #[arg(long)]
     debug: bool,
@@ -387,6 +406,8 @@ fn main() {
             deadline_s: args.deadline_s,
             pvxs_version: args.pvxs_version,
             epics_version: args.epics_version,
+            array_from: args.array_from,
+            sample_budget: args.sample_budget,
             debug: args.debug,
             allow_incomplete: args.allow_incomplete,
         }),
@@ -394,6 +415,12 @@ fn main() {
         Command::DemoProfile { out } => demo::write(&out),
     };
     std::process::exit(code);
+}
+
+/// The bytes of one monitor update of a template on the wire, at its longest:
+/// the header, the request ID and sub-command, then the body.
+fn monitor_message(t: &mimus_emit::Compiled) -> usize {
+    mimus_wire::HEADER_SIZE + 4 + 1 + t.max_len()
 }
 
 /// Parse a comma-separated list of `name` or `name:share` entries.
@@ -631,6 +658,30 @@ fn run_serve(args: ServeArgs) -> i32 {
     for (name, why) in fleet.unstamped_openings() {
         eprintln!("warning: {name}: opening message sent with its recorded timestamp: {why}");
     }
+    // Under the drop policy, --high-water is a connection's queue, counted in
+    // bytes: the default megabyte holds thousands of scalar updates and not
+    // one image. A queue shallower than two updates of the largest type
+    // served drops what a real IOC's would hold.
+    if args.backpressure == Backpressure::Drop
+        && let Some(largest) = fleet
+            .instances
+            .iter()
+            .map(|i| &fleet.templates[usize::from(i.template)])
+            .filter(|t| !t.is_static())
+            .max_by_key(|t| t.max_len())
+        && 2 * monitor_message(largest) > args.high_water
+    {
+        let message = monitor_message(largest);
+        eprintln!(
+            "warning: --high-water {} queues less than two updates of {} ({} each): under \
+             the drop policy, a consumer one update behind loses the next. A PVXS monitor \
+             queues four; --high-water {} gives a connection that depth.",
+            report::size(args.high_water),
+            largest.name,
+            report::size(message),
+            4 * message
+        );
+    }
     // Channels that can carry an alarm transition: those whose type has one.
     let alarm_channels = fleet
         .instances
@@ -701,12 +752,24 @@ fn run_serve(args: ServeArgs) -> i32 {
         .map(|i| rate_mix.groups[usize::from(i.rate_group)].0)
         .fold(0.0, |sum, rate| sum + rate)
         * active;
+    // In bytes too: a type whose image calibration kept whole offers a
+    // megabyte with each update. A message of a variable length counts at
+    // its longest.
+    let offered_bytes_per_s: f64 = fleet
+        .instances
+        .iter()
+        .map(|i| (i, &fleet.templates[usize::from(i.template)]))
+        .filter(|(_, t)| !t.is_static())
+        .map(|(i, t)| rate_mix.groups[usize::from(i.rate_group)].0 * monitor_message(t) as f64)
+        .sum::<f64>()
+        * active;
     let summary = report::RunSummary {
         mix: mix_label,
         iocs: args.iocs,
         pvs: args.pvs,
         rate_mix: rate_mix.to_string(),
         offered_eps,
+        offered_bytes_per_s,
         name_template: spec.names.pattern().to_string(),
         drop_connections_s: args.drop_connections,
         pipeline: args.pipeline.to_string(),
@@ -991,7 +1054,15 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
         } else {
             format!("{}..{} B variable", t.min_len(), t.max_len())
         };
-        out!("{name:<24} {pvs:>6} {:>6}  {shape}", t.observations);
+        // A type whose samples passed calibration's --sample-budget replays
+        // only the first of the updates it was learned from.
+        let replayed = t.slots.iter().map(|s| s.samples.len()).max().unwrap_or(0);
+        let kept = if replayed > 0 && (replayed as u32) < t.observations {
+            format!(", replays the first {replayed}")
+        } else {
+            String::new()
+        };
+        out!("{name:<24} {pvs:>6} {:>6}  {shape}{kept}", t.observations);
         for v in &t.variants {
             let changes = if v.changes.is_empty() {
                 String::new()

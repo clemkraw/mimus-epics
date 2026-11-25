@@ -44,6 +44,9 @@ pub enum Kind {
     TimestampSeconds,
     /// Nanoseconds within a second, stored as a `u32` below one billion in every observation.
     TimestampNanos,
+    /// A large array, kept whole rather than compared byte by byte: the
+    /// type descriptor says where it lies. Replayed like an opaque slot.
+    Array,
 }
 
 /// A region of the message that changed, with its inferred classification.

@@ -62,6 +62,10 @@ pub struct ChannelObserver {
     /// tracks that independently of their traffic.
     last_new_distinct: f64,
     max_updates: usize,
+    /// Most bytes of bodies retained: see [`ChannelObserver::with_byte_budget`].
+    max_bytes: usize,
+    /// Bytes of the bodies in `updates`.
+    retained_bytes: usize,
 }
 
 impl ChannelObserver {
@@ -78,7 +82,47 @@ impl ChannelObserver {
             last_arrival: 0.0,
             last_new_distinct: 0.0,
             max_updates: max_updates.max(2),
+            max_bytes: usize::MAX,
+            retained_bytes: 0,
         }
+    }
+
+    /// Caps the bytes of the bodies retained, as well as their number.
+    ///
+    /// Sixty-four updates of a scalar are a few kilobytes; of a 16 MB image,
+    /// a gigabyte. Bodies that would pass the budget are not retained, or
+    /// replace a duplicate, as past the count. Two are always retained:
+    /// fewer leave nothing to compare.
+    pub fn with_byte_budget(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// How many bodies of the size this channel sends can be retained: the
+    /// count cap, or fewer when the bodies are large enough to reach the byte
+    /// budget first. Never fewer than two.
+    pub fn capacity(&self) -> usize {
+        match self.updates.iter().map(Vec::len).max() {
+            Some(len) if len > 0 => (self.max_bytes / len).clamp(2, self.max_updates),
+            _ => self.max_updates,
+        }
+    }
+
+    /// How many distinct bodies the criterion asks of this channel: its
+    /// count, or the room the channel has for steady-state bodies if that is
+    /// less. A channel of large frames that cannot keep thirty within the
+    /// byte budget is complete when it holds all it can; otherwise it would
+    /// wait for bodies it has no room for until the deadline.
+    ///
+    /// The room is what the channel can keep less what it keeps of other
+    /// shapes, its opening message first: of fifteen frames of 8 MB that fit
+    /// in 128 MB, one is the opening, and fourteen are all the steady state
+    /// will ever have. Never fewer than two.
+    pub fn wanted(&self, c: &Criterion) -> usize {
+        let steady = self.steady_key().map_or(0, |(_, n)| n);
+        let others = self.updates.len() - steady;
+        let room = self.capacity().saturating_sub(others).max(2);
+        c.min_distinct_updates.min(room)
     }
 
     /// Records the type descriptor received in the monitor INIT reply.
@@ -115,7 +159,10 @@ impl ChannelObserver {
             self.last_new_distinct = at;
         }
 
-        if self.updates.len() < self.max_updates {
+        let fits = self.updates.len() < 2
+            || self.retained_bytes.saturating_add(body.len()) <= self.max_bytes;
+        if self.updates.len() < self.max_updates && fits {
+            self.retained_bytes += body.len();
             self.updates.push(body);
             self.arrivals.push(at);
             return;
@@ -130,6 +177,7 @@ impl ChannelObserver {
             .iter()
             .position(|u| self.updates.iter().filter(|o| *o == u).count() > 1)
         {
+            self.retained_bytes = self.retained_bytes - self.updates[dup].len() + body.len();
             self.updates[dup] = body;
             self.arrivals[dup] = at;
         }
@@ -201,6 +249,23 @@ impl ChannelObserver {
         out
     }
 
+    /// The most common changed-set among the retained bodies and how many
+    /// carry it, chosen as [`ChannelObserver::by_changed_set`] orders them,
+    /// without copying a body: the criterion asks every second, and a
+    /// channel of frames retains a hundred megabytes of them.
+    fn steady_key(&self) -> Option<(Vec<u8>, usize)> {
+        let mut counts: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+        for u in &self.updates {
+            *counts
+                .entry(leading_bitset(u).unwrap_or_default())
+                .or_insert(0) += 1;
+        }
+        // Largest first, ties to the smallest bitset, as by_changed_set.
+        counts
+            .into_iter()
+            .min_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)))
+    }
+
     /// Returns the number of distinct bodies in the most common changed-set.
     ///
     /// This is the count used to determine whether a channel has provided
@@ -210,7 +275,7 @@ impl ChannelObserver {
     /// threshold with five distinct bodies may therefore build a template
     /// from only four, causing the resulting profile to fail validation.
     pub fn steady_state_distinct(&self) -> usize {
-        let Some((key, _)) = self.by_changed_set().into_iter().next() else {
+        let Some((key, _)) = self.steady_key() else {
             return 0;
         };
         let mut bodies: Vec<&Vec<u8>> = self
@@ -343,7 +408,7 @@ pub fn status(obs: &ChannelObserver, c: &Criterion, now: f64) -> Status {
     }
     // Count only steady-state updates, since these are used to build the template.
     let distinct = obs.steady_state_distinct();
-    if distinct >= c.min_distinct_updates {
+    if distinct >= obs.wanted(c) {
         return Status::Complete { distinct };
     }
     if obs.stale_for(now) >= c.settled_after {
@@ -658,6 +723,77 @@ mod novelty_tests {
         assert!(o.quiet_for(200.0) <= 1.0, "the channel is still posting");
         assert!(o.stale_for(200.0) > c.settled_after, "but teaching nothing");
         assert!(status(&o, &c, 200.0).is_done());
+    }
+
+    #[test]
+    fn large_bodies_are_retained_within_the_byte_budget() {
+        let mut o = ChannelObserver::new("MIM:IMG:0", 64).with_byte_budget(10_000);
+        o.observe_introspection(vec![0xFF], true);
+        for k in 0..20u8 {
+            let mut body = vec![0x01, 0x02];
+            body.resize(3_000, k);
+            o.observe_update(body, f64::from(k));
+        }
+        // Three bodies of 3000 B fit in 10000 B; the count cap is 64.
+        assert_eq!(o.updates().len(), 3);
+        assert_eq!(o.capacity(), 3);
+        assert_eq!(o.wanted(&Criterion::default()), 3);
+        assert_eq!(o.total_updates(), 20);
+
+        // The criterion asks for thirty; the channel holds all it can.
+        assert_eq!(
+            status(&o, &Criterion::default(), 20.0),
+            Status::Complete { distinct: 3 }
+        );
+    }
+
+    #[test]
+    fn the_opening_message_takes_its_room_in_the_byte_budget() {
+        let mut o = ChannelObserver::new("MIM:IMG:0", 64).with_byte_budget(10_000);
+        o.observe_introspection(vec![0xFF], true);
+        // The opening message: the whole value, changed set {0}.
+        let mut opening = vec![0x01, 0x01];
+        opening.resize(3_000, 0xAA);
+        o.observe_update(opening, 0.0);
+        for k in 0..20u8 {
+            let mut body = vec![0x01, 0x02];
+            body.resize(3_000, k);
+            o.observe_update(body, 1.0 + f64::from(k));
+        }
+        // Three fit; one is the opening, so the steady state has two, and
+        // can never have more: two are all the criterion asks.
+        assert_eq!(o.updates().len(), 3);
+        assert_eq!(o.steady_state_distinct(), 2);
+        assert_eq!(o.wanted(&Criterion::default()), 2);
+        assert_eq!(
+            status(&o, &Criterion::default(), 21.0),
+            Status::Complete { distinct: 2 }
+        );
+    }
+
+    #[test]
+    fn two_bodies_are_retained_whatever_their_size() {
+        let mut o = ChannelObserver::new("MIM:IMG:0", 64).with_byte_budget(100);
+        o.observe_introspection(vec![0xFF], true);
+        for k in 0..5u8 {
+            o.observe_update(vec![k; 1_000], f64::from(k));
+        }
+        assert_eq!(o.updates().len(), 2);
+        assert_eq!(o.capacity(), 2);
+    }
+
+    #[test]
+    fn small_bodies_still_wait_for_the_criterion() {
+        let mut o = ChannelObserver::new("MIM:F64:0", 64).with_byte_budget(128 << 20);
+        o.observe_introspection(vec![0xFF], true);
+        for k in 0..10u8 {
+            o.observe_update(vec![0x02, 0x82, 0x03, k], f64::from(k));
+        }
+        assert_eq!(o.wanted(&Criterion::default()), 30);
+        assert_eq!(
+            status(&o, &Criterion::default(), 10.0),
+            Status::Waiting { distinct: 10 }
+        );
     }
 
     #[test]

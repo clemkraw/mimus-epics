@@ -19,6 +19,7 @@ Adding coverage means adding records here, listing their channels in
 | `catalogue.db` | EPICS base and PVXS | scalar and array type codes, enums, alarm transitions, static channels |
 | `catalogue-groups.db` | EPICS base and PVXS | nested structures, the variant union, a top-level bool |
 | `channels.txt` | - | the channels `mimus calibrate` observes |
+| `ndarray/` | a C++ compiler, EPICS base and PVXS | NTNDArray images and large waveforms, from a server of MIMUS's own: see [Images and large waveforms](#images-and-large-waveforms-ndarray) |
 
 `channels.txt` is not the record list. QSRV2 serves every record *field* as
 a channel of its own, and some type codes are only reachable that way: no
@@ -94,7 +95,9 @@ so they hold one element that changes every scan.
 | Code | Covered by |
 |---|---|
 | structure | every NTScalar, NTScalarArray and NTEnum; nested in `MIM:GRP:*` |
-| variant union (`any`) | `MIM:GRP:0`, `MIM:GRP:1`, member `y_any` |
+| variant union (`any`) | `MIM:GRP:0`, `MIM:GRP:1`, member `y_any`; each attribute's `value` in `MIM:IMG:*` |
+| union | `MIM:IMG:*`, member `value` ([`ndarray/`](#images-and-large-waveforms-ndarray)) |
+| structure array | `MIM:IMG:*`, members `dimension` and `attribute` ([`ndarray/`](#images-and-large-waveforms-ndarray)) |
 
 ### Behaviors
 
@@ -171,13 +174,50 @@ What a profile does not reproduce:
   every one seen, and `mimus inspect` says how much of the traffic the
   dominant one covers.
 
+## Images and large waveforms: `ndarray/`
+
+No base record produces an NTNDArray, and none fills a large array with
+changing values without C code. These come instead from a small PVXS server
+of MIMUS's own, `ndarray/mimus-ndarray.cpp`, which builds its values with
+PVXS's normative-type builders (`pvxs::nt::NTNDArray`, `pvxs::nt::NTScalar`)
+and posts them as a detector driver does, each post a delta marking only
+what changed.
+
+| Channel | Type | Each update |
+|---|---|---|
+| `MIM:IMG:0`, `MIM:IMG:1` | NTNDArray, mono, `--width` × `--height` (1024 × 1024), `--bits` 8 or 16 | a new frame: the pixels, `uniqueId`, `dataTimeStamp` and `timeStamp` |
+| `MIM:WAVE:0`, `MIM:WAVE:1` | NTScalarArray of `--length` (16384) doubles | a new waveform and its `timeStamp` |
+
+Every channel posts `--rate` (10) times a second. A frame is a gradient
+that moves from one frame to the next, with a few counts of noise on it:
+frames differ, and compress as a camera's do, where constant frames would
+compress to nothing.
+
+```bash
+make -C catalogue/ndarray EPICS_BASE=/path/to/base PVXS=/path/to/pvxs
+EPICS_PVAS_SERVER_PORT=5085 catalogue/ndarray/mimus-ndarray
+mimus calibrate -a 127.0.0.1:5085 -c catalogue/ndarray/channels.txt \
+    -o images.json --catalogue catalogue/ndarray/mimus-ndarray.cpp
+```
+
+It runs beside `softIocPVX` on another TCP port and is calibrated into a
+profile of its own. MIMUS serves the sizes the server sent: for frames of
+four megapixels at 16 bits, start it with `--width 2048 --height 2048
+--bits 16` and calibrate again.
+
+It adds to the coverage above the plain union (an NTNDArray's `value`),
+arrays of structures (`dimension`, `attribute`), a variant union inside an
+array of structures (each attribute's `value`), a second top-level stamp,
+and arrays of a hundred kilobytes to megabytes, which calibration keeps
+whole: see [Images and large arrays](../README.md#images-and-large-arrays).
+
 ## Not covered
 
-- **Union, and arrays of structures, unions or variant unions.** No base
-  record produces them. A QSRV2 group can serve an array of structures
-  (field names such as `"elem[0].v"`), which this catalogue does not use
-  yet. NTNDArray, which has a union and arrays of structures, needs
-  areaDetector.
+- **Arrays of unions and of variant unions.** No base record produces
+  them, nor does `mimus-ndarray`. A plain union and arrays of structures
+  come from `mimus-ndarray`, above; from base records alone, a QSRV2 group
+  can serve an array of structures (field names such as `"elem[0].v"`),
+  which this catalogue does not use.
 - **Bounded strings, bounded and fixed-size arrays.** QSRV2 serves every
   string and array in its variable form, so an IOC never sends these codes.
 - **`boolean[]`.** A group `const` is a scalar only: given a JSON array,
@@ -326,3 +366,19 @@ for pv in $CHANNELS; do pvxinfo $pv; done > catalogue-pvxinfo.txt
 
 It records the types the reference IOC served. Keep it beside the profile
 calibrated from it.
+
+**7. The reference server for images builds and posts.** Only for a
+profile of images, from [`ndarray/`](#images-and-large-waveforms-ndarray).
+
+```bash
+make -C catalogue/ndarray
+EPICS_PVAS_SERVER_PORT=5085 catalogue/ndarray/mimus-ndarray &
+IMAGES="MIM:IMG:0 MIM:IMG:1 MIM:WAVE:0 MIM:WAVE:1"
+EPICS_PVA_NAME_SERVERS=127.0.0.1:5085 pvxinfo -w 5 $IMAGES
+EPICS_PVA_NAME_SERVERS=127.0.0.1:5085 timeout -s INT 5 pvxmonitor $IMAGES \
+    2>/dev/null | grep -v '^ ' | sort | uniq -c
+```
+
+It must build without a warning. `pvxinfo` must show
+`epics:nt/NTNDArray:1.0` for `MIM:IMG:*` and `epics:nt/NTScalarArray:1.0`
+for `MIM:WAVE:*`, and each channel must post about ten times a second.

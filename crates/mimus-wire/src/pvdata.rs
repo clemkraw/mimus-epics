@@ -11,12 +11,17 @@
 //! Locating the timestamp requires the value's layout and the type descriptor
 //! sent by the server. This module reads both at the encoding level: sizes,
 //! strings, arrays, structures, and unions. It looks for `timeStamp` by its
-//! two members, `secondsPastEpoch` and `nanoseconds`, rather than by type.
+//! two members, `secondsPastEpoch` and `nanoseconds`, rather than by type,
+//! and for `dataTimeStamp`, the second stamp an NTNDArray carries, the same way.
+//!
+//! The same walk lists where a value's arrays lie, which calibration needs
+//! to keep a large array whole: see [`Descriptor::arrays`].
 //!
 //! Anything it cannot understand is an error, never a guess. The caller then
 //! sends the message unchanged, preserving the previous behavior.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::codec::{CodecError, Reader, Size};
 use crate::header::ByteOrder;
@@ -120,6 +125,9 @@ pub struct Descriptor {
     /// Bit positions of `timeStamp.secondsPastEpoch` and
     /// `timeStamp.nanoseconds`, if present at the top level.
     stamp_bits: Option<(usize, usize)>,
+    /// The same for `dataTimeStamp`, which an NTNDArray carries beside
+    /// `timeStamp`: when its frame was taken.
+    data_stamp_bits: Option<(usize, usize)>,
 }
 
 /// Layout of a body: changed set, selected value, and optional overrun set.
@@ -131,6 +139,9 @@ pub struct Located {
     /// Byte offsets of the 8-byte seconds and 4-byte nanoseconds fields,
     /// if included in the changed set.
     pub stamp: Option<(usize, usize)>,
+    /// The same for `dataTimeStamp`, if the type has one and the changed
+    /// set includes it.
+    pub data_stamp: Option<(usize, usize)>,
 }
 
 impl Descriptor {
@@ -157,12 +168,12 @@ impl Descriptor {
         if !matches!(root.kind, Kind::Struct { .. }) {
             return Err(WalkError::Malformed("the top level is not a structure"));
         }
-        let stamp_bits = stamp_bits(&root);
         Ok(Self {
+            stamp_bits: stamp_bits(&root, "timeStamp"),
+            data_stamp_bits: stamp_bits(&root, "dataTimeStamp"),
             root,
             order,
             registry: reg.local,
-            stamp_bits,
         })
     }
 
@@ -174,6 +185,29 @@ impl Descriptor {
     /// Locates the end of the value and the timestamp in a body.
     /// Expects a changed set, a value, and an overrun set, with no trailing bytes.
     pub fn locate(&self, body: &[u8]) -> Result<Located, WalkError> {
+        self.walk(body, None)
+    }
+
+    /// Returns where the elements of each array of fixed-width elements
+    /// lie in a body, in the order the value carries them: the bytes after
+    /// the array's size, empty for an empty array. Arrays of strings,
+    /// structures and unions are not listed; a scalar array a union or an
+    /// `any` carries is, like the pixels of an NTNDArray.
+    ///
+    /// Calibration keeps a large array whole rather than comparing it
+    /// byte by byte, which would describe a megabyte image as hundreds of
+    /// thousands of one-byte fields.
+    pub fn arrays(&self, body: &[u8]) -> Result<Vec<Range<usize>>, WalkError> {
+        let mut found = Vec::new();
+        self.walk(body, Some(&mut found))?;
+        Ok(found)
+    }
+
+    fn walk(
+        &self,
+        body: &[u8],
+        arrays: Option<&mut Vec<Range<usize>>>,
+    ) -> Result<Located, WalkError> {
         let mut w = Walker {
             r: Reader::new(body, self.order),
             reg: Registry {
@@ -181,8 +215,12 @@ impl Descriptor {
                 local: HashMap::new(),
             },
             stamp_bits: self.stamp_bits,
+            data_stamp_bits: self.data_stamp_bits,
             seconds: None,
             nanos: None,
+            data_seconds: None,
+            data_nanos: None,
+            arrays,
         };
         let changed = read_bitset(&mut w.r, self.order)?;
         w.partial(&self.root, 0, &changed, 0)?;
@@ -191,11 +229,11 @@ impl Descriptor {
         if !w.r.is_empty() {
             return Err(WalkError::Malformed("bytes follow the overrun set"));
         }
-        let stamp = match (w.seconds, w.nanos) {
-            (Some(s), Some(n)) => Some((s, n)),
-            _ => None,
-        };
-        Ok(Located { value_end, stamp })
+        Ok(Located {
+            value_end,
+            stamp: w.seconds.zip(w.nanos),
+            data_stamp: w.data_seconds.zip(w.data_nanos),
+        })
     }
 
     /// Names the top-level fields a changed set touches, in the order the
@@ -235,15 +273,15 @@ impl Descriptor {
     }
 }
 
-/// Returns the bit positions of the timestamp's two members,
-/// if the top-level structure contains a `timeStamp` field.
-fn stamp_bits(root: &Node) -> Option<(usize, usize)> {
+/// Returns the bit positions of a timestamp's two members, if the
+/// top-level structure contains a field of that name.
+fn stamp_bits(root: &Node, field: &str) -> Option<(usize, usize)> {
     let Kind::Struct { fields } = &root.kind else {
         return None;
     };
     let mut off = 1;
     for (name, f) in fields {
-        if name == "timeStamp" {
+        if name == field {
             let Kind::Struct { fields: inner } = &f.kind else {
                 return None;
             };
@@ -429,8 +467,13 @@ struct Walker<'a> {
     r: Reader<'a>,
     reg: Registry<'a>,
     stamp_bits: Option<(usize, usize)>,
+    data_stamp_bits: Option<(usize, usize)>,
     seconds: Option<usize>,
     nanos: Option<usize>,
+    data_seconds: Option<usize>,
+    data_nanos: Option<usize>,
+    /// Where to list the arrays of fixed-width elements, when asked.
+    arrays: Option<&'a mut Vec<Range<usize>>>,
 }
 
 impl Walker<'_> {
@@ -481,11 +524,21 @@ impl Walker<'_> {
         }
         match &node.kind {
             Kind::Fixed(w) => {
-                if let (Some(o), Some((s, n))) = (offset, self.stamp_bits) {
-                    if o == s {
-                        self.seconds = Some(self.r.position());
-                    } else if o == n {
-                        self.nanos = Some(self.r.position());
+                if let Some(o) = offset {
+                    let at = Some(self.r.position());
+                    if let Some((s, n)) = self.stamp_bits {
+                        if o == s {
+                            self.seconds = at;
+                        } else if o == n {
+                            self.nanos = at;
+                        }
+                    }
+                    if let Some((s, n)) = self.data_stamp_bits {
+                        if o == s {
+                            self.data_seconds = at;
+                        } else if o == n {
+                            self.data_nanos = at;
+                        }
                     }
                 }
                 self.r.skip(*w)?;
@@ -501,7 +554,11 @@ impl Walker<'_> {
                         let bytes = count
                             .checked_mul(*w)
                             .ok_or(WalkError::Malformed("array larger than memory"))?;
+                        let start = self.r.position();
                         self.r.skip(bytes)?;
+                        if let Some(found) = self.arrays.as_deref_mut() {
+                            found.push(start..start + bytes);
+                        }
                     }
                     Elem::Str => {
                         for _ in 0..count {
@@ -658,7 +715,8 @@ mod tests {
             at,
             Located {
                 value_end: end,
-                stamp: Some((s, s + 8))
+                stamp: Some((s, s + 8)),
+                data_stamp: None,
             }
         );
     }
@@ -693,6 +751,113 @@ mod tests {
             Descriptor::from_init_reply(&[0xFF, 0x80, 0x00, 0x01, 0x01, b'x', 0x7E], LE),
             Err(WalkError::UnknownType(0x7E))
         ));
+    }
+
+    /// A structure like an NTNDArray's: a union of scalar arrays, then a
+    /// string array, a double array and a counter.
+    fn image_descriptor() -> Vec<u8> {
+        let mut d = vec![0xFF, 0x80];
+        put_string(&mut d, "image", LE);
+        put_size(&mut d, 4, LE);
+        put_string(&mut d, "value", LE); // bit 1
+        d.push(0x81);
+        put_string(&mut d, "", LE);
+        put_size(&mut d, 2, LE);
+        put_string(&mut d, "ubyteValue", LE);
+        d.push(0x2C);
+        put_string(&mut d, "doubleValue", LE);
+        d.push(0x4B);
+        put_string(&mut d, "names", LE); // bit 2
+        d.push(0x68);
+        put_string(&mut d, "wave", LE); // bit 3
+        d.push(0x4B);
+        put_string(&mut d, "uniqueId", LE); // bit 4
+        d.push(0x22);
+        d
+    }
+
+    #[test]
+    fn finds_the_stamp_of_the_data_beside_the_stamp_of_the_update() {
+        // An NTNDArray's two stamps: dataTimeStamp, then timeStamp.
+        let mut d = vec![0xFF, 0x80];
+        put_string(&mut d, "epics:nt/NTNDArray:1.0", LE);
+        put_size(&mut d, 3, LE);
+        put_string(&mut d, "uniqueId", LE); // bit 1
+        d.push(0x22);
+        for stamp in ["dataTimeStamp", "timeStamp"] {
+            put_string(&mut d, stamp, LE); // bits 2 and 6
+            d.push(0x80);
+            put_string(&mut d, "time_t", LE);
+            put_size(&mut d, 3, LE);
+            put_string(&mut d, "secondsPastEpoch", LE);
+            d.push(0x23);
+            put_string(&mut d, "nanoseconds", LE);
+            d.push(0x22);
+            put_string(&mut d, "userTag", LE);
+            d.push(0x22);
+        }
+        let desc = Descriptor::from_init_reply(&d, LE).unwrap();
+        let mut body = vec![0x01, 0x01];
+        body.extend_from_slice(&7i32.to_le_bytes());
+        for sec in [10i64, 20] {
+            body.extend_from_slice(&sec.to_le_bytes());
+            body.extend_from_slice(&5i32.to_le_bytes());
+            body.extend_from_slice(&0i32.to_le_bytes());
+        }
+        body.push(0x00);
+        let at = desc.locate(&body).unwrap();
+        assert_eq!(at.data_stamp, Some((6, 14)));
+        assert_eq!(at.stamp, Some((22, 30)));
+
+        // A delta that carries only timeStamp's seconds and nanoseconds,
+        // bits 7 and 8, locates only it.
+        let mut delta = vec![0x02, 0x80, 0x01];
+        delta.extend_from_slice(&30i64.to_le_bytes());
+        delta.extend_from_slice(&5i32.to_le_bytes());
+        delta.push(0x00);
+        let at = desc.locate(&delta).unwrap();
+        assert_eq!(at.stamp, Some((3, 11)));
+        assert_eq!(at.data_stamp, None);
+    }
+
+    #[test]
+    fn lists_the_arrays_of_fixed_width_elements_a_value_carries() {
+        let desc = Descriptor::from_init_reply(&image_descriptor(), LE).unwrap();
+
+        // The whole structure: the pixels inside the union are listed, the
+        // string array is not.
+        let mut body = vec![0x01, 0x01];
+        put_size(&mut body, 0, LE); // union member "ubyteValue"
+        put_size(&mut body, 5, LE);
+        let pixels = body.len();
+        body.extend_from_slice(&[1, 2, 3, 4, 5]);
+        put_size(&mut body, 1, LE);
+        put_string(&mut body, "a", LE);
+        put_size(&mut body, 2, LE);
+        let wave = body.len();
+        body.extend_from_slice(&[0; 16]);
+        body.extend_from_slice(&7i32.to_le_bytes());
+        body.push(0x00);
+        assert_eq!(
+            desc.arrays(&body).unwrap(),
+            vec![pixels..pixels + 5, wave..wave + 16]
+        );
+
+        // A delta that changes only the waveform lists only the waveform.
+        let mut delta = vec![0x01, 0x08];
+        put_size(&mut delta, 2, LE);
+        delta.extend_from_slice(&[0; 16]);
+        delta.push(0x00);
+        assert_eq!(desc.arrays(&delta).unwrap(), vec![3..19]);
+
+        // An empty array is listed, empty.
+        let mut empty = vec![0x01, 0x08];
+        put_size(&mut empty, 0, LE);
+        empty.push(0x00);
+        assert_eq!(desc.arrays(&empty).unwrap(), vec![3..3]);
+
+        // What the walker cannot read is an error, as for the stamp.
+        assert!(desc.arrays(&delta[..10]).is_err());
     }
 
     #[test]
@@ -753,7 +918,8 @@ mod tests {
             at,
             Located {
                 value_end: end,
-                stamp: Some((s, s + 8))
+                stamp: Some((s, s + 8)),
+                data_stamp: None,
             }
         );
     }

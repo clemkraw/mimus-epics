@@ -24,6 +24,9 @@ pub struct RunSummary {
     /// describes the run as a whole; it cannot be inferred from a single
     /// rate when the population spans multiple rates.
     pub offered_eps: f64,
+    /// The bytes those updates come to, headers included: what sizes a run
+    /// of images, where forty updates a second can be forty megabytes.
+    pub offered_bytes_per_s: f64,
     pub name_template: String,
     pub drop_connections_s: Option<f64>,
     pub pipeline: String,
@@ -83,8 +86,9 @@ pub fn print_banner(
     );
     out!("rates {} Hz, types {}", run.rate_mix, run.mix);
     out!(
-        "offered load {:.0} updates/s, backpressure {}",
+        "offered load {:.0} updates/s, about {}, backpressure {}",
         run.offered_eps,
+        per_second(run.offered_bytes_per_s),
         run.backpressure
     );
     if let Some((per_hour, channels)) = run.alarms {
@@ -228,6 +232,11 @@ pub fn finish(
         0.0
     };
     let offered = run.offered_eps;
+    let throughput = if elapsed_s > 0.0 {
+        counters.bytes as f64 / elapsed_s
+    } else {
+        0.0
+    };
 
     // The file is written before anything is printed: the summary goes to a
     // terminal or a pipe that may already be gone, and the file is the record
@@ -252,6 +261,8 @@ pub fn finish(
             "elapsed_s": elapsed_s,
             "achieved_eps": achieved,
             "offered_eps": offered,
+            "bytes_per_s": throughput,
+            "offered_bytes_per_s": run.offered_bytes_per_s,
             "run": {
                 "iocs": run.iocs,
                 "pvs": run.pvs,
@@ -305,6 +316,7 @@ pub fn finish(
     out!("bytes              {:>14}", counters.bytes);
     out!("elapsed            {elapsed_s:>14.1} s");
     out!("achieved           {achieved:>14.0} updates/s");
+    out!("throughput         {:>16}", per_second(throughput));
     if let Some(bpe) = counters.bytes_per_event() {
         out!("bytes/event        {bpe:>14.1}");
     }
@@ -507,5 +519,52 @@ fn print_scenario(sc: &ScenarioSummary, played: &Played) {
     }
     if !played.recoveries.is_empty() {
         out!("  Recovery times are polled every 10 ms.");
+    }
+}
+/// A byte count as people read it: 512 B, 64 KiB, 1.5 MiB. Sizes of
+/// messages and frames are binary, as the arrays they carry are.
+pub fn size(n: usize) -> String {
+    const KIB: f64 = 1024.0;
+    let x = n as f64;
+    if x < KIB {
+        format!("{n} B")
+    } else if x < KIB * KIB {
+        format!("{} KiB", one_decimal(x / KIB))
+    } else if x < KIB * KIB * KIB {
+        format!("{} MiB", one_decimal(x / (KIB * KIB)))
+    } else {
+        format!("{} GiB", one_decimal(x / (KIB * KIB * KIB)))
+    }
+}
+
+/// A rate of bytes as networks count them: 52 kB/s, 1.6 GB/s.
+pub fn per_second(bytes_per_s: f64) -> String {
+    let (scale, unit) = [(1e9, "GB/s"), (1e6, "MB/s"), (1e3, "kB/s")]
+        .into_iter()
+        .find(|(scale, _)| bytes_per_s >= *scale)
+        .unwrap_or((1.0, "B/s"));
+    format!("{} {unit}", one_decimal(bytes_per_s / scale))
+}
+
+/// One decimal, without a trailing `.0`.
+fn one_decimal(x: f64) -> String {
+    let s = format!("{x:.1}");
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_and_rates_read_as_people_write_them() {
+        assert_eq!(size(512), "512 B");
+        assert_eq!(size(1536), "1.5 KiB");
+        assert_eq!(size(1 << 20), "1 MiB");
+        assert_eq!(size(3 << 30), "3 GiB");
+        assert_eq!(per_second(0.0), "0 B/s");
+        assert_eq!(per_second(52_100.0), "52.1 kB/s");
+        assert_eq!(per_second(419_430_400.0), "419.4 MB/s");
+        assert_eq!(per_second(1.6e9), "1.6 GB/s");
     }
 }
