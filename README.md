@@ -169,6 +169,7 @@ mimus demo-profile  write a hand-made profile for trying the server out
 | `--iocs` | `1` | Virtual IOCs, one listening port each. A consumer typically runs one task per connection, so this caps how far its work can spread across cores |
 | `--rate-hz` | `1` | Updates per second per channel. Offered load is `pvs × rate` |
 | `--rate-mix` | - | Several rates at once: `10:2,1:60,0.1:38` puts 2 % of channels at 10 Hz, 60 % at 1 Hz, 38 % at 0.1 Hz. Shares are relative. Overrides `--rate-hz` |
+| `--activity` | every update sent | Channels post in bursts and fall silent in between, as behind a monitor deadband: `0.3:20` keeps each channel active 30 % of the time, in bursts of 20 updates on average (see [Irregular updates](#irregular-updates)) |
 | `--mix` | every template, equal shares | Which templates to serve and in what proportion: `ntscalar_f64:3,ntscalar_i32:1` |
 | `--layout` | `blocked` | `blocked` gives each IOC a contiguous range of channels, as a facility does; `round-robin` interleaves them, each IOC still getting every template and rate of the mix |
 | `--prefix` | `MIM` | Prefix of the default names; a `--name-template` replaces it |
@@ -244,6 +245,14 @@ When the client under test cannot keep up, TCP would normally throttle the sende
 - **`--backpressure drop`**: MIMUS holds its nominal rate and discards what does not fit within `--high-water`, counting every discard, as intermediate values are lost when an IOC's monitor queue overflows. This is the loss-under-offered-load measurement.
 
 These answer different questions. Any published figure must state which mode produced it.
+
+### Irregular updates
+
+A real IOC does not post every channel like a clock. A monitor with a deadband sends only when the value has moved far enough: a channel posts at its scan rate while its process moves, and not at all while it is still. A consumer fed only regular updates is spared the gaps, runs and uneven batches a facility puts on it, and its figures flatter it.
+
+`--activity FRACTION:BURST` gives every channel that behavior. A channel is either active, and sends each update it is due, or quiet, and sends none. After each update it is due, an active channel falls quiet with probability `1/BURST`, and a quiet one wakes at the rate that keeps it active `FRACTION` of the time. Its bursts then last `BURST` updates on average, its silences `BURST × (1 − FRACTION) / FRACTION`, and it sends `FRACTION` of what its rate asks, which is the offered load MIMUS reports. The draws come from the channel's seed and the count of updates it was due, so the same channel goes through the same bursts and silences on every run.
+
+What a quiet channel does not send is counted as `quiet`, not as a loss: an IOC would not have sent it either. Bursts asked for by a scenario send from every channel they select, quiet or not.
 
 ### Scenarios
 
@@ -337,6 +346,7 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 | `pipeline_acks`, `flow_control_holds` | Credit acknowledgements received from pipelined monitors, and updates withheld from one with no credit left (`--pipeline strict` only) |
 | `wheel_steps` | Turns of the timing wheel, to tell a wheel turning at the wrong speed from a wrong population |
 | `held`, `burst` | Under a scenario: updates that fell due while their IOC was frozen and were never sent, and updates sent by bursts and resumes, a part of `emitted` |
+| `quiet` | Under `--activity`: updates due while the channel was quiet, and so not sent |
 | `scenario` | The scenario played, phase by phase, with its restarts' recovery times; `null` without one |
 | `profile`, `run` | The manifest: what was served, and with which options |
 
@@ -346,7 +356,7 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 mimus.emitted == rows_stored + <every loss counter the client exposes>
 ```
 
-Any residual is either a bug in the client or a missing counter in it, and both are worth knowing. A consumer that cannot close this equation is a consumer that loses data without noticing. On MIMUS's side, an update due on a subscribed channel is either emitted, dropped (`dropped_backpressure`), withheld from a pipelined monitor with no credit (`flow_control_holds`) or held while a scenario froze its IOC (`held`); only the time skipped after a late tick is in none of the four.
+Any residual is either a bug in the client or a missing counter in it, and both are worth knowing. A consumer that cannot close this equation is a consumer that loses data without noticing. On MIMUS's side, an update due on a subscribed channel is either emitted, dropped (`dropped_backpressure`), withheld from a pipelined monitor with no credit (`flow_control_holds`), held while a scenario froze its IOC (`held`) or left unsent while its channel was quiet under `--activity` (`quiet`); only the time skipped after a late tick is in none of the five.
 
 ## Performance
 

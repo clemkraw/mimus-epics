@@ -30,6 +30,7 @@ pub struct SharedCounters {
     flow_control_holds: AtomicU64,
     held: AtomicU64,
     burst: AtomicU64,
+    quiet: AtomicU64,
     sessions_open: AtomicU64,
     sessions_total: AtomicU64,
     sessions_dropped: AtomicU64,
@@ -85,6 +86,9 @@ impl SharedCounters {
         }
         if batch.burst > 0 {
             self.burst.fetch_add(batch.burst, Ordering::Relaxed);
+        }
+        if batch.quiet > 0 {
+            self.quiet.fetch_add(batch.quiet, Ordering::Relaxed);
         }
     }
 
@@ -145,6 +149,7 @@ impl SharedCounters {
             flow_control_holds: self.flow_control_holds.load(Ordering::Relaxed),
             held: self.held.load(Ordering::Relaxed),
             burst: self.burst.load(Ordering::Relaxed),
+            quiet: self.quiet.load(Ordering::Relaxed),
         }
     }
 

@@ -42,6 +42,10 @@ pub struct Counters {
     /// a part of `emitted`, counted apart so a report can say which phase
     /// asked for them.
     pub burst: u64,
+    /// Updates a channel was due but did not send because the activity model
+    /// had it quiet, as a value that moved less than its deadband. Not a
+    /// loss: an IOC would not have sent them either.
+    pub quiet: u64,
 }
 
 impl Counters {
@@ -77,6 +81,7 @@ impl Counters {
         self.flow_control_holds += other.flow_control_holds;
         self.held += other.held;
         self.burst += other.burst;
+        self.quiet += other.quiet;
     }
 
     /// Returns what was counted between `earlier` and these totals.
@@ -99,6 +104,7 @@ impl Counters {
             wheel_steps: self.wheel_steps.saturating_sub(earlier.wheel_steps),
             held: self.held.saturating_sub(earlier.held),
             burst: self.burst.saturating_sub(earlier.burst),
+            quiet: self.quiet.saturating_sub(earlier.quiet),
         }
     }
 }
@@ -209,6 +215,7 @@ mod tests {
             flow_control_holds: 6,
             held: 7,
             burst: 8,
+            quiet: 9,
         };
         a.merge(&Counters {
             emitted: 10,
@@ -220,6 +227,7 @@ mod tests {
             flow_control_holds: 60,
             held: 70,
             burst: 80,
+            quiet: 90,
         });
         assert_eq!(
             a,
@@ -233,6 +241,7 @@ mod tests {
                 flow_control_holds: 66,
                 held: 77,
                 burst: 88,
+                quiet: 99,
             }
         );
     }

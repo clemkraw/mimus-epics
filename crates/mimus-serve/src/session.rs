@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{Buf, BytesMut};
-use mimus_emit::{Backpressure, Counters, EpicsTime, Instance, RateMix, Schedule};
+use mimus_emit::{Activity, Backpressure, Counters, EpicsTime, Instance, RateMix, Schedule};
 use mimus_profile::DescriptorPolicy;
 use mimus_wire::codec::put_i32;
 use mimus_wire::header::{ByteOrder, Direction, Header, Segmentation};
@@ -83,6 +83,9 @@ pub struct SessionConfig {
     /// arriving in clumps once per configured period, and no wheel has to be
     /// rebuilt while clients are connected.
     pub headroom: f64,
+    /// Whether channels post in bursts and fall silent in between, and how.
+    /// `None` sends every update a channel is due.
+    pub activity: Option<Activity>,
 }
 
 impl Default for SessionConfig {
@@ -104,6 +107,7 @@ impl Default for SessionConfig {
             pipeline: Pipeline::default(),
             stages: None,
             headroom: 1.0,
+            activity: None,
         }
     }
 }
@@ -179,6 +183,11 @@ struct Monitor {
     /// drawn from the channel's seed, so thinned channels do not all send on
     /// the same steps.
     credit: f64,
+    /// Whether the activity model has the channel active, and so sending.
+    active: bool,
+    /// Updates the channel has been due on this monitor: the count the
+    /// activity model draws from.
+    due: u64,
 }
 
 /// Describes why a session ended.
@@ -629,6 +638,10 @@ impl Session {
                     credits: credit.unwrap_or(0),
                     step: 0,
                     credit: unit_fraction(self.fleet.instances[instance as usize].seed),
+                    active: self.cfg.activity.is_none_or(|a| {
+                        a.starts_active(self.fleet.instances[instance as usize].seed)
+                    }),
+                    due: 0,
                 },
             );
             return Ok(());
@@ -904,6 +917,7 @@ impl Session {
             return;
         }
         self.thin(&mut due);
+        self.keep_active(&mut due);
 
         if self.stage.frozen {
             // A frozen IOC processes nothing: what falls due is held, and
@@ -972,6 +986,43 @@ impl Session {
             d.repeats = n;
             true
         });
+    }
+
+    /// Keeps, of each due monitor's updates, those its channel would send:
+    /// what falls due while the activity model has it quiet is counted as
+    /// quiet and dropped from the step.
+    ///
+    /// The model moves on once per update the channel is due, so its bursts
+    /// and silences are counted in updates at the rate of the moment.
+    fn keep_active(&mut self, due: &mut Vec<mimus_emit::Due>) {
+        let Some(activity) = self.cfg.activity.filter(|a| !a.is_constant()) else {
+            return;
+        };
+        let mut quiet = 0u64;
+        due.retain_mut(|d| {
+            let Some(mon) = self.monitors.get_mut(&d.request_id) else {
+                return false;
+            };
+            let seed = self.fleet.instances[mon.instance as usize].seed;
+            let mut sent = 0u32;
+            for _ in 0..d.repeats {
+                if mon.active {
+                    sent += 1;
+                }
+                mon.active = activity.next(mon.active, seed, mon.due);
+                mon.due += 1;
+            }
+            quiet += u64::from(d.repeats - sent);
+            if sent == 0 {
+                return false;
+            }
+            d.spacing_ns = d.spacing_ns * u64::from(d.repeats) / u64::from(sent);
+            d.spacing_us = d.spacing_ns / 1000;
+            d.repeats = sent;
+            true
+        });
+        self.counters.quiet += quiet;
+        self.pending.quiet += quiet;
     }
 
     /// Takes in a new stage of this session's IOC, and returns whether

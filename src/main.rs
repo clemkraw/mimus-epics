@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use mimus_emit::{Backpressure, Counters, RateMix, Schedule};
+use mimus_emit::{Activity, Backpressure, Counters, RateMix, Schedule};
 use mimus_profile::{DescriptorPolicy, Profile};
 use mimus_serve::fleet::{Fleet, FleetSpec, Layout};
 use mimus_serve::session::{Pipeline, SessionConfig};
@@ -119,6 +119,18 @@ struct ServeArgs {
     /// Overrides `--rate-hz`.
     #[arg(long = "rate-mix")]
     rate_mix: Option<String>,
+
+    /// Let channels post in bursts and fall silent in between, as behind a
+    /// monitor deadband: `0.3:20` keeps each channel active 30% of the time,
+    /// in bursts of 20 updates on average, so it sends about 30% of what its
+    /// rate asks, at irregular times.
+    ///
+    /// A consumer that sees every channel post like a clock is spared the
+    /// gaps and runs a facility puts on it. The bursts and silences come
+    /// from each channel's seed, so the same channel goes through the same
+    /// ones on every run.
+    #[arg(long)]
+    activity: Option<String>,
 
     /// Pattern for channel names. Tokens, each in braces: `i` global index,
     /// `ioc` IOC index, `n` index within the IOC, `t` template name. A width
@@ -494,6 +506,14 @@ fn run_serve(args: ServeArgs) -> i32 {
         eprintln!("error: --rate-hz / --rate-mix / --tick-us: {e}");
         return 1;
     }
+    let activity = match args.activity.as_deref().map(Activity::parse) {
+        None => None,
+        Some(Ok(a)) => Some(a),
+        Some(Err(e)) => {
+            eprintln!("error: --activity: {e}");
+            return 1;
+        }
+    };
     if let Some(s) = args.drop_connections
         && !(s > 0.0 && std::time::Duration::try_from_secs_f64(s).is_ok())
     {
@@ -615,6 +635,7 @@ fn run_serve(args: ServeArgs) -> i32 {
             .as_ref()
             .map(|_| mimus_serve::Stages::new(args.iocs)),
         headroom,
+        activity,
         ..Default::default()
     };
 
@@ -637,13 +658,16 @@ fn run_serve(args: ServeArgs) -> i32 {
     // The mix's proportions hold only over whole cycles of its shares, so for
     // a small population the ideal figure can be far off: three channels of
     // `10:2,1:60,0.1:38` run at 10, 10 and 1 Hz, 21 updates/s, not 2.5.
-    // A channel of a static template sends its opening message only.
+    // A channel of a static template sends its opening message only, and
+    // under --activity a channel sends while it is active only.
+    let active = activity.map_or(1.0, |a| a.fraction);
     let offered_eps: f64 = fleet
         .instances
         .iter()
         .filter(|i| !fleet.templates[usize::from(i.template)].is_static())
         .map(|i| rate_mix.groups[usize::from(i.rate_group)].0)
-        .fold(0.0, |sum, rate| sum + rate);
+        .fold(0.0, |sum, rate| sum + rate)
+        * active;
     let summary = report::RunSummary {
         mix: mix_label,
         iocs: args.iocs,
@@ -657,6 +681,7 @@ fn run_serve(args: ServeArgs) -> i32 {
         layout: args.layout.to_string(),
         backpressure: args.backpressure.to_string(),
         tick_us: args.tick_us,
+        activity,
         scenario: scenario.as_ref().map(|s| report::ScenarioSummary {
             name: s.name.clone(),
             file: args.scenario.clone().unwrap_or_default(),
@@ -697,7 +722,7 @@ fn run_serve(args: ServeArgs) -> i32 {
         .filter(|i| !fleet.templates[usize::from(i.template)].is_static())
     {
         if let Some(slot) = offered_by_ioc.get_mut(usize::from(i.ioc)) {
-            *slot += rate_mix.groups[usize::from(i.rate_group)].0;
+            *slot += rate_mix.groups[usize::from(i.rate_group)].0 * active;
         }
     }
 

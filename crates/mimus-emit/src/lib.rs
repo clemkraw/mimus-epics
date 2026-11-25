@@ -11,15 +11,19 @@
 //!   timer per PV.
 //! - [`Counters`]: emission statistics that let consumers verify the
 //!   conservation of updates.
+//! - [`Activity`]: channels that post in bursts and fall silent in between,
+//!   as behind a deadband.
 //!
 //! The crate is split into three concerns: rendering, scheduling and
 //! accounting.
 
+pub mod activity;
 pub mod counters;
 pub mod render;
 pub mod signal;
 pub mod wheel;
 
+pub use activity::Activity;
 pub use counters::{Backpressure, Counters};
 pub use render::{CompileError, Compiled, Fill};
 pub use signal::{EPICS_EPOCH_OFFSET, EpicsTime, Signal};
