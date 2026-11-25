@@ -9,6 +9,7 @@ use std::path::Path;
 use mimus_emit::Counters;
 use mimus_profile::Profile;
 use mimus_serve::Fleet;
+use mimus_serve::scenario::Played;
 
 /// The configuration used for the run. Included in the report because a
 /// throughput figure is meaningless without its offered load, rate mix,
@@ -30,6 +31,34 @@ pub struct RunSummary {
     pub layout: String,
     pub backpressure: String,
     pub tick_us: u64,
+    /// The scenario played, if any.
+    pub scenario: Option<ScenarioSummary>,
+}
+
+/// A scenario as the banner announces it and the report records it.
+#[derive(Debug, Clone)]
+pub struct ScenarioSummary {
+    pub name: Option<String>,
+    pub file: std::path::PathBuf,
+    pub repeat: u32,
+    /// Every pass, not counting the wait at the start.
+    pub length_s: f64,
+    /// The rate factor every schedule is built at.
+    pub headroom: f64,
+    /// One pass: each phase's start, label and length, in seconds.
+    pub plan: Vec<(f64, String, f64)>,
+    /// Subscriptions waited for before the first phase, and for how long at
+    /// most.
+    pub waits_for: Option<(u64, f64)>,
+}
+
+impl ScenarioSummary {
+    fn title(&self) -> String {
+        match &self.name {
+            Some(n) => format!("{n} ({})", self.file.display()),
+            None => self.file.display().to_string(),
+        }
+    }
 }
 
 pub fn print_banner(
@@ -58,6 +87,31 @@ pub fn print_banner(
         out!("dropping one connection every {s} s");
     }
     out!("pipeline {}", run.pipeline);
+    if let Some(sc) = &run.scenario {
+        out!();
+        let passes = if sc.repeat > 1 {
+            format!(", played {} times", sc.repeat)
+        } else {
+            String::new()
+        };
+        out!(
+            "scenario {}{passes}, {:.0} s in all:",
+            sc.title(),
+            sc.length_s
+        );
+        if let Some((n, timeout)) = sc.waits_for {
+            out!("  waits for {n} subscriptions, {timeout:.0} s at most, before its first phase");
+        }
+        for (start, label, length) in &sc.plan {
+            out!("  {start:>8.1} s  {label:<28} {length:>8.1} s");
+        }
+        if sc.headroom > 1.0 {
+            out!(
+                "  schedules built for ×{}: thinned to the rate of each phase",
+                sc.headroom
+            );
+        }
+    }
     if run.coalesce_us > 0 {
         out!(
             "coalescing writes for up to {} µs — timestamps stay true but \
@@ -131,6 +185,8 @@ pub struct Sessions {
     pub total: u64,
     /// Connections MIMUS closed under `--drop-connections`.
     pub dropped: u64,
+    /// Connections closed because a scenario took their IOC down.
+    pub closed_down: u64,
     /// Monitors still active at the end of the run. This gauge tells a low
     /// offered load from a slow scheduler: both produce too few updates, but
     /// they need different fixes.
@@ -142,6 +198,7 @@ pub fn finish(
     run: &RunSummary,
     counters: Counters,
     sessions: Sessions,
+    played: Option<&Played>,
     elapsed_s: f64,
     report_path: Option<&Path>,
 ) {
@@ -159,6 +216,7 @@ pub fn finish(
         let json = serde_json::json!({
             "sessions": sessions.total,
             "sessions_dropped": sessions.dropped,
+            "sessions_closed_down": sessions.closed_down,
             "subscriptions": sessions.subscriptions,
             "late_ticks": counters.late_ticks,
             "wheel_steps": counters.wheel_steps,
@@ -166,6 +224,8 @@ pub fn finish(
             "flow_control_holds": counters.flow_control_holds,
             "emitted": counters.emitted,
             "dropped_backpressure": counters.dropped_backpressure,
+            "held": counters.held,
+            "burst": counters.burst,
             "bytes": counters.bytes,
             "elapsed_s": elapsed_s,
             "achieved_eps": achieved,
@@ -183,6 +243,7 @@ pub fn finish(
                 "tick_us": run.tick_us,
                 "mix": run.mix,
             },
+            "scenario": scenario_json(run, played),
             "profile": {
                 "synthetic": profile.manifest.synthetic,
                 "incomplete": profile.manifest.incomplete,
@@ -204,6 +265,12 @@ pub fn finish(
     out!("subscriptions      {:>14}", sessions.subscriptions);
     out!("emitted            {:>14}", counters.emitted);
     out!("dropped (pressure) {:>14}", counters.dropped_backpressure);
+    if counters.held > 0 {
+        out!("held (frozen)      {:>14}", counters.held);
+    }
+    if sessions.closed_down > 0 {
+        out!("closed by restarts {:>14}", sessions.closed_down);
+    }
     out!("bytes              {:>14}", counters.bytes);
     out!("elapsed            {elapsed_s:>14.1} s");
     out!("achieved           {achieved:>14.0} updates/s");
@@ -233,6 +300,8 @@ pub fn finish(
              sends to subscribers; loading channels costs nothing on its own. Point \
              a consumer at the addresses above."
         );
+    } else if let (Some(sc), Some(played)) = (&run.scenario, played) {
+        print_scenario(sc, played);
     } else if offered > 0.0 && achieved < offered * 0.95 {
         // Under drop, the updates discarded for a slow consumer are part of
         // the gap; only what remains beyond them is the emitter's.
@@ -272,5 +341,138 @@ pub fn finish(
             Ok(()) => out!("\nreport written to {}", path.display()),
             Err(e) => eprintln!("warning: cannot write {}: {e}", path.display()),
         }
+    }
+}
+
+/// The phases played, as the report file records them.
+fn scenario_json(run: &RunSummary, played: Option<&Played>) -> serde_json::Value {
+    let (Some(sc), Some(played)) = (&run.scenario, played) else {
+        return serde_json::Value::Null;
+    };
+    let secs = |d: Option<std::time::Duration>| d.map(|d| d.as_secs_f64());
+    serde_json::json!({
+        "name": sc.name,
+        "file": sc.file.display().to_string(),
+        "repeat": sc.repeat,
+        "length_s": sc.length_s,
+        "headroom": sc.headroom,
+        "wait": played.wait.as_ref().map(|w| serde_json::json!({
+            "waited_s": w.waited.as_secs_f64(),
+            "wanted": w.wanted,
+            "held": w.held,
+        })),
+        "phases": played.phases.iter().map(|p| serde_json::json!({
+            "label": p.label,
+            "kind": p.kind,
+            "cycle": p.cycle,
+            "start_s": p.start.as_secs_f64(),
+            "length_s": p.length.as_secs_f64(),
+            "offered": p.offered,
+            "emitted": p.counters.emitted,
+            "bytes": p.counters.bytes,
+            "dropped_backpressure": p.counters.dropped_backpressure,
+            "held": p.counters.held,
+            "burst": p.counters.burst,
+            "late_ticks": p.counters.late_ticks,
+            "flow_control_holds": p.counters.flow_control_holds,
+            "closed": p.closed,
+            "subscriptions": p.subscriptions,
+            "interrupted": p.interrupted,
+        })).collect::<Vec<_>>(),
+        "recoveries": played.recoveries.iter().map(|r| serde_json::json!({
+            "ioc": r.ioc,
+            "phase": r.phase,
+            "before": r.before,
+            "reconnected_s": secs(r.reconnected),
+            "recovered_s": secs(r.recovered),
+            "after": r.after,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Prints each phase played, and how the consumer came back from restarts.
+///
+/// `offered` is what the phase asked for if every channel was subscribed
+/// throughout; a gap between it and `emitted` measures the consumer only if
+/// it was.
+fn print_scenario(sc: &ScenarioSummary, played: &Played) {
+    out!();
+    out!("scenario {}", sc.title());
+    if let Some(w) = &played.wait {
+        if w.held >= w.wanted {
+            out!(
+                "  waited {:.1} s for {} subscriptions before the first phase",
+                w.waited.as_secs_f64(),
+                w.wanted
+            );
+        } else {
+            out!(
+                "  started after waiting {:.1} s with {} of the {} subscriptions waited for: \
+                 the first phases ran against a consumer still subscribing",
+                w.waited.as_secs_f64(),
+                w.held,
+                w.wanted
+            );
+        }
+    }
+    out!(
+        "  {:<26} {:>9} {:>9} {:>11} {:>11} {:>9} {:>9} {:>5} {:>6} {:>9}",
+        "phase",
+        "start",
+        "length",
+        "offered",
+        "emitted",
+        "dropped",
+        "held",
+        "late",
+        "closed",
+        "subscr."
+    );
+    for p in &played.phases {
+        let mut label = p.label.clone();
+        if sc.repeat > 1 {
+            label = format!("{} #{}", label, p.cycle + 1);
+        }
+        if p.interrupted {
+            label.push_str(" (cut)");
+        }
+        out!(
+            "  {:<26} {:>7.1} s {:>7.1} s {:>11.0} {:>11} {:>9} {:>9} {:>5} {:>6} {:>9}",
+            label,
+            p.start.as_secs_f64(),
+            p.length.as_secs_f64(),
+            p.offered,
+            p.counters.emitted,
+            p.counters.dropped_backpressure,
+            p.counters.held,
+            p.counters.late_ticks,
+            p.closed,
+            p.subscriptions
+        );
+    }
+    if played.phases.iter().any(|p| p.interrupted) {
+        out!("  (cut): the run ended before the phase did; its counts cover the part played.");
+    }
+    for r in &played.recoveries {
+        let reconnected = match r.reconnected {
+            Some(d) => format!("reconnected {:.2} s after it came back", d.as_secs_f64()),
+            None => "no reconnection".to_string(),
+        };
+        let back = match r.recovered {
+            _ if r.before == 0 => "it held no subscription to recover".to_string(),
+            Some(d) => format!(
+                "all {} subscriptions back after {:.2} s",
+                r.before,
+                d.as_secs_f64()
+            ),
+            None => format!(
+                "{} of {} subscriptions back when the run ended",
+                r.after, r.before
+            ),
+        };
+        out!("  IOC {} ({}): {reconnected}; {back}", r.ioc, r.phase);
+    }
+    if !played.recoveries.is_empty() {
+        out!("  Recovery times are polled every 10 ms.");
     }
 }

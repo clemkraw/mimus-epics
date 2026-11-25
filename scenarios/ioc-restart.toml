@@ -1,0 +1,29 @@
+# An IOC restarts.
+#
+# IOC 0 closes every connection, refuses new ones and answers no search for
+# ten seconds, then comes back. The consumer has to notice, find it again,
+# reconnect and subscribe to every channel it had there, all at once. The
+# report gives the time from its return to the first reconnection, and to
+# the moment every subscription was back.
+
+name = "IOC restart"
+
+[start]
+subscriptions = "all"
+timeout = "10m"
+
+[[phase]]
+kind = "steady"
+duration = "30s"
+label = "before"
+
+[[phase]]
+kind = "restart"
+iocs = [0]
+down = "10s"
+duration = "90s"     # ten seconds down, then eighty to come back
+
+[[phase]]
+kind = "steady"
+duration = "30s"
+label = "after"

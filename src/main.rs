@@ -35,6 +35,7 @@ macro_rules! out {
 mod calibrate;
 mod demo;
 mod report;
+mod scenario;
 
 #[derive(Parser)]
 #[command(
@@ -265,8 +266,19 @@ struct ServeArgs {
 
     /// Stop after this many seconds. Runs until interrupted otherwise; Ctrl-C
     /// or SIGTERM ends a timed run early too, and the report is still written.
-    #[arg(long = "duration-s")]
+    #[arg(long = "duration-s", conflicts_with = "scenario")]
     duration_s: Option<f64>,
+
+    /// Play a scenario: a TOML file of phases (steady, gain, burst, freeze,
+    /// restart), played one after the other. The run ends with the last
+    /// phase, and the report accounts for each phase apart.
+    ///
+    /// Consumers rarely fail in steady state. They fail when thousands of
+    /// channels change at once, when an IOC restarts and everything it
+    /// served reconnects together, or when the load climbs past what they
+    /// absorb. `scenarios/` holds examples.
+    #[arg(long)]
+    scenario: Option<PathBuf>,
 
     /// Write the accounting report to this file on exit.
     #[arg(long = "report")]
@@ -494,6 +506,31 @@ fn run_serve(args: ServeArgs) -> i32 {
         eprintln!("error: --duration-s: {s} is not a positive number of seconds");
         return 1;
     }
+    let scenario = match &args.scenario {
+        None => None,
+        Some(path) => match scenario::load(path).and_then(|s| s.check(args.iocs).map(|()| s)) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("error: --scenario: {e}");
+                return 1;
+            }
+        },
+    };
+    // A scenario that raises the rate builds every schedule at its highest
+    // factor; that schedule has to be one the wheel can run.
+    let headroom = scenario
+        .as_ref()
+        .map_or(1.0, mimus_serve::Scenario::headroom);
+    if headroom > 1.0
+        && let Err(e) = Schedule::new(&rate_mix.scaled(headroom), args.tick_us)
+    {
+        eprintln!(
+            "error: --scenario: its highest gain, ×{headroom}, takes the rates {rate_mix} Hz \
+             past what --tick-us {} can schedule: {e}",
+            args.tick_us
+        );
+        return 1;
+    }
     // The report is written at the end of the run. A path that cannot be
     // written would lose the run's accounting after it has been paid for.
     if let Some(path) = &args.report
@@ -574,6 +611,10 @@ fn run_serve(args: ServeArgs) -> i32 {
         coalesce_us: args.coalesce_us,
         debug: args.debug,
         pipeline: args.pipeline,
+        stages: scenario
+            .as_ref()
+            .map(|_| mimus_serve::Stages::new(args.iocs)),
+        headroom,
         ..Default::default()
     };
 
@@ -616,7 +657,49 @@ fn run_serve(args: ServeArgs) -> i32 {
         layout: args.layout.to_string(),
         backpressure: args.backpressure.to_string(),
         tick_us: args.tick_us,
+        scenario: scenario.as_ref().map(|s| report::ScenarioSummary {
+            name: s.name.clone(),
+            file: args.scenario.clone().unwrap_or_default(),
+            repeat: s.repeat,
+            length_s: s.length().as_secs_f64(),
+            headroom,
+            plan: s
+                .phases
+                .iter()
+                .scan(std::time::Duration::ZERO, |at, p| {
+                    let start = *at;
+                    *at += p.duration;
+                    Some((
+                        start.as_secs_f64(),
+                        p.label.clone(),
+                        p.duration.as_secs_f64(),
+                    ))
+                })
+                .collect(),
+            waits_for: match s.start {
+                mimus_serve::scenario::Start::Now => None,
+                mimus_serve::scenario::Start::Subscribed { count, timeout } => Some((
+                    match count {
+                        mimus_serve::scenario::Count::All => u64::from(args.pvs),
+                        mimus_serve::scenario::Count::Minimum(n) => n,
+                    },
+                    timeout.as_secs_f64(),
+                )),
+            },
+        }),
     };
+    // Each IOC's share of the offered load, for the phases that act on some
+    // IOCs only.
+    let mut offered_by_ioc = vec![0.0f64; usize::from(args.iocs)];
+    for i in fleet
+        .instances
+        .iter()
+        .filter(|i| !fleet.templates[usize::from(i.template)].is_static())
+    {
+        if let Some(slot) = offered_by_ioc.get_mut(usize::from(i.ioc)) {
+            *slot += rate_mix.groups[usize::from(i.rate_group)].0;
+        }
+    }
 
     runtime.block_on(async move {
         let mut totals = Vec::new();
@@ -682,7 +765,10 @@ fn run_serve(args: ServeArgs) -> i32 {
             .await
             {
                 Ok(r) => {
-                    let r = Arc::new(r);
+                    let r = Arc::new(match &cfg.stages {
+                        Some(stages) => r.with_stages(Arc::clone(stages)),
+                        None => r,
+                    });
                     discovery = Some(Arc::clone(&r));
                     tokio::spawn(async move { r.serve().await });
                 }
@@ -759,11 +845,28 @@ fn run_serve(args: ServeArgs) -> i32 {
                 None => std::future::pending().await,
             }
         };
+        // The scenario, if any, is played against the IOCs as they are now
+        // listening, and the run ends with its last phase.
+        let target = cfg.stages.as_ref().map(|stages| mimus_serve::Target {
+            stages: Arc::clone(stages),
+            totals: totals.clone(),
+            offered_eps: offered_by_ioc.clone(),
+            channels: u64::from(args.pvs),
+        });
+        let record = mimus_serve::scenario::Record::new();
+        let played = async {
+            match (&scenario, &target) {
+                (Some(s), Some(t)) => mimus_serve::scenario::play(s, t, &record).await,
+                _ => std::future::pending().await,
+            }
+        };
         tokio::select! {
             () = interrupt => {}
             () = terminate => {}
             () = deadline => {}
+            () = played => {}
         }
+        let played = target.as_ref().map(|t| record.finish(t));
 
         // Snapshot counters while sessions are still open, rather than relying
         // on end-of-session totals.
@@ -773,6 +876,7 @@ fn run_serve(args: ServeArgs) -> i32 {
             merged.merge(&t.snapshot());
             sessions.total += t.sessions_total();
             sessions.dropped += t.sessions_dropped();
+            sessions.closed_down += t.sessions_closed_down();
             sessions.subscriptions += t.subscriptions();
         }
 
@@ -781,6 +885,7 @@ fn run_serve(args: ServeArgs) -> i32 {
             &summary,
             merged,
             sessions,
+            played.as_ref(),
             started.elapsed().as_secs_f64(),
             args.report.as_deref(),
         );

@@ -21,6 +21,7 @@ serde_json = "1.0.154"
 socket2 = "0.6.5"
 tokio = { version = "1.53.3", features = ["full"] }
 clap = { version = "4.6.7", features = ["derive"] }
+toml = { version = "1.2.2", default-features = false, features = ["std", "parse", "serde"] }
 
 [package]
 name = "mimus-epics"
@@ -42,8 +43,10 @@ mimus-serve = { workspace = true }
 mimus-calibrate = { workspace = true }
 
 clap = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 
 [profile.release]
 opt-level = 3

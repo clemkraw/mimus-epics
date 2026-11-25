@@ -1,0 +1,42 @@
+# A bad day in the control room, twice over.
+#
+# Half the channels jump at once, an IOC restarts, every IOC stalls for a
+# few seconds, then a three-minute storm triples the load. Each phase is
+# reported apart, as is the recovery from the restart.
+
+name = "bad day"
+repeat = 2
+
+[start]
+subscriptions = "all"
+timeout = "10m"
+
+[[phase]]
+kind = "steady"
+duration = "60s"
+label = "quiet"
+
+[[phase]]
+kind = "burst"
+share = 0.5
+label = "mode change"
+
+[[phase]]
+kind = "steady"
+duration = "30s"
+
+[[phase]]
+kind = "restart"
+iocs = [0]
+down = "15s"
+duration = "60s"
+
+[[phase]]
+kind = "freeze"
+duration = "3s"
+
+[[phase]]
+kind = "gain"
+duration = "3m"
+gain = 3
+label = "storm"
