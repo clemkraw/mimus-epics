@@ -688,7 +688,7 @@ fn the_ioc_policy_is_announced_and_what_it_counts_reported() {
     assert!(o.status.success(), "{out}");
     assert!(out.contains("EPICS_PVA_CONN_TMO=6 too"), "{out}");
     assert!(out.contains("every 3.0 s"), "{out}");
-    // Elsewhere the option has nothing to act on, and says so.
+    // Elsewhere the option bounds only the handshake, and says so.
     let o = mimus(&[
         "serve",
         "-p",
@@ -703,7 +703,7 @@ fn the_ioc_policy_is_announced_and_what_it_counts_reported() {
         "0.1",
     ]);
     assert!(
-        text(&o).contains("applies only under --backpressure ioc"),
+        text(&o).contains("only bounds the wait for a new connection's validation"),
         "{}",
         text(&o)
     );
@@ -865,4 +865,153 @@ fn an_activity_model_lowers_the_offered_load_by_its_fraction() {
     assert_eq!(r["offered_eps"], 50.0, "half of ten channels at 10 Hz");
     assert_eq!(r["run"]["activity"], "0.5:4");
     assert_eq!(r["quiet"], 0, "nothing subscribed, nothing due");
+}
+
+/// A client of its own, on blocking sockets: it subscribes to every
+/// channel named and reads to the end of the connection, counting the
+/// monitor updates that arrive, opening values included.
+fn subscribe_and_count(addr: &str, names: &[String], slow_from: Option<Duration>) -> u64 {
+    use mimus_wire::codec::{put_i16, put_i32, put_string};
+    use mimus_wire::{ByteOrder, Direction, Framer, Header, Segmentation, commands};
+    use std::io::{Read, Write};
+
+    const LE: ByteOrder = ByteOrder::Little;
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    let send = |s: &mut std::net::TcpStream, command: u8, payload: &[u8]| {
+        let h = Header::application(
+            command,
+            payload.len() as i32,
+            LE,
+            Direction::FromClient,
+            Segmentation::None,
+        );
+        s.write_all(&h.encode()).unwrap();
+        s.write_all(payload).unwrap();
+    };
+    let mut framer = Framer::new();
+    let mut inbox = bytes::BytesMut::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut next = |s: &mut std::net::TcpStream| -> Option<mimus_wire::Frame> {
+        loop {
+            if let Some(f) = framer.next_frame(&mut inbox).unwrap() {
+                return Some(f);
+            }
+            match s.read(&mut buf) {
+                Ok(0) => return None,
+                Err(e) => {
+                    eprintln!("read: {e}");
+                    return None;
+                }
+                Ok(n) => inbox.extend_from_slice(&buf[..n]),
+            }
+        }
+    };
+    // Validation, as PVXS gives it.
+    while next(&mut s).unwrap().header.command != commands::CONNECTION_VALIDATION {}
+    let mut p = Vec::new();
+    put_i32(&mut p, 16384, LE);
+    put_i16(&mut p, 512, LE);
+    put_i16(&mut p, 0, LE);
+    put_string(&mut p, "anonymous", LE);
+    p.push(0xFF);
+    send(&mut s, commands::CONNECTION_VALIDATION, &p);
+    let mut updates = 0u64;
+    let count = |f: &mimus_wire::Frame, updates: &mut u64| {
+        if f.header.command == commands::MONITOR && f.payload.len() > 4 && f.payload[4] & 0x08 == 0
+        {
+            *updates += 1;
+        }
+    };
+    for (k, name) in names.iter().enumerate() {
+        let mut p = Vec::new();
+        put_i16(&mut p, 1, LE);
+        put_i32(&mut p, k as i32, LE);
+        put_string(&mut p, name, LE);
+        send(&mut s, commands::CREATE_CHANNEL, &p);
+        let sid = loop {
+            let Some(f) = next(&mut s) else {
+                panic!("the connection closed while opening {name}");
+            };
+            count(&f, &mut updates);
+            if f.header.command == commands::CREATE_CHANNEL {
+                break i32::from_le_bytes(f.payload[4..8].try_into().unwrap());
+            }
+        };
+        let mut p = Vec::new();
+        put_i32(&mut p, sid, LE);
+        put_i32(&mut p, 1000 + k as i32, LE);
+        p.push(commands::monitor::INIT);
+        p.push(0xFF);
+        send(&mut s, commands::MONITOR, &p);
+        let mut p = Vec::new();
+        put_i32(&mut p, sid, LE);
+        put_i32(&mut p, 1000 + k as i32, LE);
+        p.push(commands::monitor::START);
+        send(&mut s, commands::MONITOR, &p);
+    }
+    let started = Instant::now();
+    let mut paused = false;
+    while let Some(f) = next(&mut s) {
+        count(&f, &mut updates);
+        // A client that stops reading before the end leaves MIMUS holding
+        // what it has not taken when the run ends.
+        if !paused && slow_from.is_some_and(|t| started.elapsed() > t) {
+            paused = true;
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+    }
+    updates
+}
+
+#[test]
+fn what_a_client_reads_to_the_end_is_what_was_emitted_less_what_was_never_sent() {
+    // The counts are read once every session has stopped and counted what
+    // it held: read while sessions still ran, a client got a few updates
+    // more, or fewer, than `emitted - unsent` said.
+    let dir = Scratch::new("conservation");
+    let demo = demo_profile(&dir);
+    for (backpressure, slow) in [
+        ("block", None),
+        ("drop", None),
+        ("ioc", None),
+        ("drop", Some(Duration::from_millis(600))),
+        ("ioc", Some(Duration::from_millis(600))),
+    ] {
+        let path = dir.path("report.json");
+        let server = Server::start(&[
+            "-p",
+            demo.to_str().unwrap(),
+            "--pvs",
+            "40",
+            "--rate-hz",
+            "1000",
+            "--name-template",
+            "X:{i}",
+            "--backpressure",
+            backpressure,
+            "--duration-s",
+            "1.2",
+            "--base-port",
+            "0",
+            "--search-port",
+            "0",
+            "--report",
+            path.to_str().unwrap(),
+        ]);
+        let names: Vec<String> = (0..40).map(|i| format!("X:{i}")).collect();
+        let read = subscribe_and_count(&server.addrs[0], &names, slow);
+        let mut child = server.into_child();
+        assert!(child.wait().unwrap().success());
+        let r = report(&path);
+        let (emitted, unsent) = (
+            r["emitted"].as_u64().unwrap(),
+            r["unsent"].as_u64().unwrap(),
+        );
+        assert!(emitted > 1000, "{backpressure}: {emitted}");
+        assert_eq!(
+            read,
+            emitted - unsent,
+            "{backpressure}, slow {slow:?}: emitted {emitted}, unsent {unsent}"
+        );
+    }
 }

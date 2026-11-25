@@ -215,11 +215,18 @@ impl Fleet {
             // Taking its template and rate from the global index would give
             // it only the positions of the pattern that share its residue:
             // with a 3:1 mix over four IOCs, three IOCs of one type and one
-            // of the other. Counting from the channel's place within its IOC,
-            // offset by the IOC, gives every IOC the whole mix, as the
-            // blocked layout does.
+            // of the other. Counting from the channel's place within its IOC
+            // gives every IOC the whole mix, as the blocked layout does.
+            //
+            // Each IOC starts at its own share of the pattern, not one place
+            // after the previous IOC: with 26 types over two IOCs of 13
+            // channels, starting one place apart served types 0 to 13 twice
+            // and the other twelve not at all.
             let position = match spec.layout {
-                Layout::RoundRobin => index_in_ioc + u32::from(ioc),
+                Layout::RoundRobin => {
+                    let offset = u32::from(ioc) as usize * pattern.len() / spec.iocs as usize;
+                    index_in_ioc + offset as u32
+                }
                 Layout::Blocked => i,
             };
             let template = pattern[(position as usize) % pattern.len()];
@@ -499,6 +506,31 @@ mod tests {
             );
         }
         assert_eq!(f.template_counts(), vec![("dbl", 750), ("int", 250)]);
+    }
+
+    #[test]
+    fn round_robin_serves_every_type_when_there_are_few_channels_of_each() {
+        // As many channels as types, over two IOCs: each type once. Starting
+        // each IOC one place after the last served the first half twice and
+        // the second half not at all.
+        let mut p = profile();
+        let names: Vec<String> = (0..26).map(|k| format!("t{k}")).collect();
+        p.templates = names.iter().map(|n| template(n)).collect();
+        for iocs in [2u16, 3, 4] {
+            let mut s = spec(iocs, 26, Layout::RoundRobin);
+            s.mix = names.iter().map(|n| (n.clone(), 1)).collect();
+            let f = Fleet::build(&p, &s).unwrap();
+            let counts = f.template_counts();
+            let served = counts.iter().filter(|(_, n)| *n > 0).count();
+            assert!(
+                served >= 26 - usize::from(iocs) && counts.iter().all(|(_, n)| *n <= 2),
+                "{iocs} IOCs: {counts:?}"
+            );
+        }
+        let mut s = spec(2, 26, Layout::RoundRobin);
+        s.mix = names.iter().map(|n| (n.clone(), 1)).collect();
+        let f = Fleet::build(&p, &s).unwrap();
+        assert!(f.template_counts().iter().all(|(_, n)| *n == 1));
     }
 
     #[test]

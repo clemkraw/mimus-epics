@@ -515,6 +515,17 @@ async fn handshake(
     loop {
         while let Ok(Some(frame)) = framer.next_frame(inbox) {
             if frame.header.is_application() && frame.command() == commands::CONNECTION_VALIDATION {
+                // A server writes in its host's byte order. MIMUS declares
+                // little-endian and writes its stamps and generated values
+                // so: templates recorded big-endian would be served as
+                // garbage, with nothing to say so.
+                if frame.header.byte_order() == ByteOrder::Big {
+                    return Err(ClientError::Protocol(
+                        "the IOC writes big-endian; MIMUS serves little-endian \
+                         templates, so calibrate against an IOC on a little-endian host"
+                            .to_string(),
+                    ));
+                }
                 let answer = ConnectionValidationResponse {
                     buffer_size: 32768,
                     registry_size: 1024,
@@ -618,6 +629,47 @@ mod tests {
             .await
             .unwrap_err();
             assert!(matches!(err, ClientError::HandshakeTimeout), "{err}");
+        });
+    }
+
+    #[test]
+    fn a_big_endian_ioc_is_refused_not_recorded() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let order = ByteOrder::Big;
+                let payload = mimus_wire::ConnectionValidation {
+                    buffer_size: 16384,
+                    registry_size: 512,
+                }
+                .encode(order);
+                let header = Header::application(
+                    commands::CONNECTION_VALIDATION,
+                    payload.len() as i32,
+                    order,
+                    Direction::FromServer,
+                    Segmentation::None,
+                );
+                stream.write_all(&header.encode()).await.unwrap();
+                stream.write_all(&payload).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+
+            let err = observe(
+                &addr.to_string(),
+                &["MIM:F64:0".to_string()],
+                Settings::default(),
+                |_, _| false,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&err, ClientError::Protocol(m) if m.contains("big-endian")),
+                "{err}"
+            );
         });
     }
 }

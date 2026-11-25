@@ -249,7 +249,8 @@ struct ServeArgs {
     /// Under `--backpressure ioc`: seconds a connection may go without a
     /// message from the client, or without the client taking anything
     /// waiting for it, before MIMUS closes it. 40 by default, as in a PVXS
-    /// server.
+    /// server. Under every policy, a connection that has not validated
+    /// within it is closed.
     #[arg(long = "conn-timeout-s")]
     conn_timeout_s: Option<f64>,
 
@@ -627,8 +628,9 @@ fn run_serve(args: ServeArgs) -> i32 {
         && let Err(e) = Schedule::new(&rate_mix.scaled(headroom), args.tick_us)
     {
         eprintln!(
-            "error: --scenario: its highest gain, ×{headroom}, takes the rates {rate_mix} Hz \
+            "error: --scenario: its highest gain, ×{}, takes the rates {rate_mix} Hz \
              past what --tick-us {} can schedule: {e}",
+            scenario::factor(headroom),
             args.tick_us
         );
         return 1;
@@ -706,7 +708,10 @@ fn run_serve(args: ServeArgs) -> i32 {
         return 1;
     }
     if args.conn_timeout_s.is_some() && !ioc {
-        eprintln!("warning: --conn-timeout-s applies only under --backpressure ioc");
+        eprintln!(
+            "warning: outside --backpressure ioc, --conn-timeout-s only bounds the \
+             wait for a new connection's validation"
+        );
     }
     // A PVXS client sends an echo every half of its own EPICS_PVA_CONN_TMO,
     // 15 s at most: a shorter timeout here closes clients that are well.
@@ -759,7 +764,10 @@ fn run_serve(args: ServeArgs) -> i32 {
         return 1;
     }
 
+    // Ends every session when the run ends: see below.
+    let (run_end, run_end_rx) = tokio::sync::watch::channel(false);
     let cfg = SessionConfig {
+        run_end: Some(run_end_rx),
         buffer_size: profile.session_rules.server_buffer_size,
         registry_size: profile.session_rules.server_registry_size,
         descriptor_policy: if args.always_full {
@@ -1063,8 +1071,21 @@ fn run_serve(args: ServeArgs) -> i32 {
         }
         let played = target.as_ref().map(|t| record.finish(t));
 
-        // Snapshot counters while sessions are still open, rather than relying
-        // on end-of-session totals.
+        let elapsed = started.elapsed().as_secs_f64();
+        // The monitors open as the run ends, before the sessions close.
+        let subscriptions: u64 = totals.iter().map(|t| t.subscriptions()).sum();
+        // Then every session stops, sends what its socket takes at once, and
+        // counts the rest as never sent. Read while sessions still ran, the
+        // counts would miss what they sent after, and what was left in their
+        // buffers when the process exited: the client would hold a few
+        // updates more, or fewer, than `emitted - unsent` says.
+        let _ = run_end.send(true);
+        let waited = std::time::Instant::now();
+        while totals.iter().any(|t| t.sessions_open() > 0)
+            && waited.elapsed() < std::time::Duration::from_secs(2)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         let mut merged = Counters::default();
         let mut sessions = report::Sessions::default();
         for t in &totals {
@@ -1075,8 +1096,8 @@ fn run_serve(args: ServeArgs) -> i32 {
             sessions.timed_out += t.sessions_timed_out();
             sessions.overflowed += t.sessions_overflowed();
             sessions.backlog_peak = sessions.backlog_peak.max(t.backlog_peak());
-            sessions.subscriptions += t.subscriptions();
         }
+        sessions.subscriptions = subscriptions;
         sessions.written = cfg.written.as_ref().map_or(0, |w| w.channels() as u64);
 
         report::finish(
@@ -1085,7 +1106,7 @@ fn run_serve(args: ServeArgs) -> i32 {
             merged,
             sessions,
             played.as_ref(),
-            started.elapsed().as_secs_f64(),
+            elapsed,
             args.report.as_deref(),
         );
         0

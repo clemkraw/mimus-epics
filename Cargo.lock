@@ -209,6 +209,7 @@ dependencies = [
 name = "mimus-epics"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "mimus-calibrate",
  "mimus-emit",

@@ -102,16 +102,61 @@ struct Node {
     kind: Kind,
     /// Bit positions occupied by this field and, for structures, all its nested members.
     span: usize,
+    /// The nodes this type holds, itself included: what naming it again
+    /// copies.
+    weight: usize,
 }
+
+/// The most nodes the types read in one go may hold, each name of an
+/// earlier type counted at the size of what it names. Far more than any
+/// channel's type, an `NTNDArray` holds about a hundred, and few enough to
+/// copy in an instant: naming a type copies it, and a type that names the
+/// one before it twice doubles at each level, past any memory in a few
+/// dozen.
+const MAX_NODES: usize = 1 << 16;
+
+/// The same for a client's `pvRequest`, which selects a few fields and
+/// sets a few options: a few dozen nodes.
+const MAX_REQUEST_NODES: usize = 1 << 12;
 
 /// Previously defined types, indexed by registry ID.
 /// Lookups fall back to the descriptor's own definitions, avoiding copies when walking a value.
 struct Registry<'a> {
     base: Option<&'a HashMap<u16, Node>>,
     local: HashMap<u16, Node>,
+    /// The nodes read so far, names expanded.
+    nodes: usize,
+    /// The most `nodes` may reach.
+    limit: usize,
 }
 
-impl Registry<'_> {
+impl<'a> Registry<'a> {
+    fn new(base: Option<&'a HashMap<u16, Node>>) -> Self {
+        Self {
+            base,
+            local: HashMap::new(),
+            nodes: 0,
+            limit: MAX_NODES,
+        }
+    }
+
+    /// For a client's request: a smaller limit.
+    fn for_request(base: &'a HashMap<u16, Node>) -> Self {
+        Self {
+            limit: MAX_REQUEST_NODES,
+            ..Self::new(Some(base))
+        }
+    }
+
+    /// Counts `n` more nodes read, refusing types past the limit.
+    fn spend(&mut self, n: usize) -> Result<(), WalkError> {
+        self.nodes = self.nodes.saturating_add(n);
+        if self.nodes > self.limit {
+            return Err(WalkError::Malformed("a type larger than any channel's"));
+        }
+        Ok(())
+    }
+
     fn get(&self, id: u16) -> Option<&Node> {
         self.local
             .get(&id)
@@ -170,10 +215,10 @@ enum Shape {
     Fixed(usize),
     Str,
     /// An array of numbers of `elem` bytes, or of strings if `None`, with a
-    /// size before its elements unless its length is fixed by its type.
+    /// size before its elements unless its type fixes the count, `fixed`.
     Array {
         elem: Option<usize>,
-        sized: bool,
+        fixed: Option<usize>,
     },
     /// A union, an `any`, an array of structures or unions: not reordered.
     Other,
@@ -189,7 +234,7 @@ impl Shape {
                     Elem::Fixed(w) => Some(*w),
                     Elem::Str => None,
                 },
-                sized: fixed.is_none(),
+                fixed: *fixed,
             },
             _ => Shape::Other,
         }
@@ -212,14 +257,14 @@ impl Shape {
         match self {
             Shape::Fixed(w) => out.extend(r.take_exact(w).ok()?.iter().rev()),
             Shape::Str => string(&mut r, &mut out)?,
-            Shape::Array { elem, sized } => {
-                let count = if sized {
-                    let n = r.size().ok()?.or_empty();
-                    put_size(&mut out, n, to);
-                    n
-                } else {
-                    // A fixed length: the elements alone, as many as fit.
-                    elem.map_or(0, |w| bytes.len() / w.max(1))
+            Shape::Array { elem, fixed } => {
+                let count = match fixed {
+                    Some(n) => n,
+                    None => {
+                        let n = r.size().ok()?.or_empty();
+                        put_size(&mut out, n, to);
+                        n
+                    }
                 };
                 for _ in 0..count {
                     match elem {
@@ -258,10 +303,7 @@ impl Descriptor {
                 return Err(WalkError::Malformed("the reply carries an error status"));
             }
         }
-        let mut reg = Registry {
-            base: None,
-            local: HashMap::new(),
-        };
+        let mut reg = Registry::new(None);
         let root = read_type(&mut r, &mut reg, 0)?
             .ok_or(WalkError::Malformed("the descriptor is the null type"))?;
         if !matches!(root.kind, Kind::Struct { .. }) {
@@ -333,6 +375,26 @@ impl Descriptor {
 
     /// The bits of a top-level field and of its members, if the type has a
     /// field of that name: `value` holds bits 1 to 5 of an NTEnum.
+    /// The alarm severity a value carries, read from an NT type's
+    /// `alarm.severity`: `None` if the type has none or the value does not
+    /// carry it. `body` is a monitor update's, changed set and overrun set
+    /// included.
+    pub fn severity(&self, body: &[u8]) -> Option<i32> {
+        let (bit, node) = member(&self.root, &["alarm", "severity"])?;
+        if !matches!(node.kind, Kind::Fixed(4)) {
+            return None;
+        }
+        let mut leaves = Vec::new();
+        self.walk(body, self.order, Tail::Overrun, None, Some(&mut leaves))
+            .ok()?;
+        let leaf = leaves.iter().find(|l| l.bit == bit)?;
+        let b: [u8; 4] = body.get(leaf.range.clone())?.try_into().ok()?;
+        Some(match self.order {
+            ByteOrder::Little => i32::from_le_bytes(b),
+            ByteOrder::Big => i32::from_be_bytes(b),
+        })
+    }
+
     pub fn field_bits(&self, name: &str) -> Option<Range<usize>> {
         let Kind::Struct { fields } = &self.root.kind else {
             return None;
@@ -406,10 +468,7 @@ impl Descriptor {
     ) -> Result<Located, WalkError> {
         let mut w = Walker {
             r: Reader::new(body, order),
-            reg: Registry {
-                base: Some(&self.registry),
-                local: HashMap::new(),
-            },
+            reg: Registry::new(Some(&self.registry)),
             stamp_bits: self.stamp_bits,
             data_stamp_bits: self.data_stamp_bits,
             seconds: None,
@@ -570,10 +629,10 @@ fn read_type(
         NULL_TYPE => Ok(None),
         ONLY_ID => {
             let id = r.u16()?;
-            reg.get(id)
-                .cloned()
-                .map(Some)
-                .ok_or(WalkError::UnknownId(id))
+            // Counted before it is copied: the copy is what may not fit.
+            let weight = reg.get(id).ok_or(WalkError::UnknownId(id))?.weight;
+            reg.spend(weight)?;
+            Ok(reg.get(id).cloned())
         }
         FULL_WITH_ID | FULL_TAGGED_ID => {
             let id = r.u16()?;
@@ -634,7 +693,14 @@ fn read_code(
             Kind::Struct { fields } => 1 + fields.iter().map(|(_, f)| f.span).sum::<usize>(),
             _ => 1,
         };
-        return Ok(Node { kind, span });
+        let weight = 1 + match &kind {
+            Kind::Struct { fields } => fields.iter().map(|(_, f)| f.weight).sum(),
+            Kind::Union(members) => members.iter().map(|m| m.weight).sum(),
+            Kind::StructArray(e) | Kind::UnionArray(e) => e.weight,
+            _ => 0,
+        };
+        reg.spend(1)?;
+        return Ok(Node { kind, span, weight });
     }
 
     let elem = match code & !0x18 {
@@ -663,7 +729,12 @@ fn read_code(
             }
         }
     };
-    Ok(Node { kind, span: 1 })
+    reg.spend(1)?;
+    Ok(Node {
+        kind,
+        span: 1,
+        weight: 1,
+    })
 }
 
 /// Reads a changed or overrun bitset: a byte count followed by 64-bit
@@ -880,7 +951,13 @@ impl Walker<'_> {
 #[derive(Debug, Default)]
 pub struct RequestTypes {
     types: HashMap<u16, Node>,
+    /// The nodes `types` holds.
+    held: usize,
 }
+
+/// The most nodes a connection's request types may hold together: a
+/// client that keeps defining new ones is read without being remembered.
+const MAX_HELD_NODES: usize = 1 << 20;
 
 impl RequestTypes {
     pub fn new() -> Self {
@@ -897,22 +974,20 @@ impl RequestTypes {
     pub fn queue_size(&mut self, request: &[u8], order: ByteOrder) -> Option<u32> {
         let mut r = Reader::new(request, order);
         let (root, defined) = {
-            let mut reg = Registry {
-                base: Some(&self.types),
-                local: HashMap::new(),
-            };
+            let mut reg = Registry::for_request(&self.types);
             let root = read_type(&mut r, &mut reg, 0).ok()??;
             (root, reg.local)
         };
-        self.types.extend(defined);
+        let added: usize = defined.values().map(|n| n.weight).sum();
+        if self.held + added <= MAX_HELD_NODES {
+            self.held += added;
+            self.types.extend(defined);
+        }
         let (bit, node) = member(&root, &["record", "_options", "queueSize"])?;
         let mut leaves = Vec::new();
         let mut w = Walker {
             r,
-            reg: Registry {
-                base: Some(&self.types),
-                local: HashMap::new(),
-            },
+            reg: Registry::new(Some(&self.types)),
             stamp_bits: None,
             data_stamp_bits: None,
             seconds: None,
@@ -1314,6 +1389,58 @@ mod tests {
         put_size(&mut d, 0, order);
         d.extend_from_slice(value);
         d
+    }
+
+    #[test]
+    fn the_severity_an_update_carries_is_read_and_none_when_it_carries_none() {
+        let (desc, body) = alarm_update(2, LE);
+        assert_eq!(desc.severity(&body), Some(2));
+        let (desc, body) = alarm_update(3, ByteOrder::Big);
+        assert_eq!(desc.severity(&body), Some(3));
+        // An update of the value alone.
+        let (desc, _) = alarm_update(0, LE);
+        let mut value_only = vec![0x01, 0x02];
+        value_only.extend_from_slice(&1.5f64.to_le_bytes());
+        value_only.push(0x00);
+        assert_eq!(desc.severity(&value_only), None);
+        assert_eq!(desc.severity(&[0xFF, 0xFF]), None, "damaged");
+    }
+
+    /// An NTScalar-like double with its alarm, and an update carrying
+    /// value and alarm whole, at `severity`.
+    fn alarm_update(severity: i32, order: ByteOrder) -> (Descriptor, Vec<u8>) {
+        let mut d = vec![0xFF, 0x80];
+        put_string(&mut d, "epics:nt/NTScalar:1.0", order);
+        put_size(&mut d, 2, order);
+        put_string(&mut d, "value", order);
+        d.push(0x43);
+        put_string(&mut d, "alarm", order);
+        d.push(0x80);
+        put_string(&mut d, "alarm_t", order);
+        put_size(&mut d, 3, order);
+        put_string(&mut d, "severity", order);
+        d.push(0x22);
+        put_string(&mut d, "status", order);
+        d.push(0x22);
+        put_string(&mut d, "message", order);
+        d.push(0x60);
+        let desc = Descriptor::from_init_reply(&d, order).unwrap();
+        // Bits: value 1, alarm 2 (severity 3, status 4, message 5).
+        let mut body = vec![0x01, 0b0000_0110];
+        let f = 1.5f64;
+        body.extend_from_slice(&match order {
+            ByteOrder::Little => f.to_le_bytes(),
+            ByteOrder::Big => f.to_be_bytes(),
+        });
+        for v in [severity, 1] {
+            body.extend_from_slice(&match order {
+                ByteOrder::Little => v.to_le_bytes(),
+                ByteOrder::Big => v.to_be_bytes(),
+            });
+        }
+        put_string(&mut body, "", order);
+        body.push(0x00);
+        (desc, body)
     }
 
     #[test]

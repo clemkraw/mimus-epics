@@ -598,6 +598,7 @@ pub fn run(args: Args) -> i32 {
             .iter()
             .filter_map(|i| observers[*i].first_update().cloned())
             .collect();
+        let openings = without_alarms(descriptor_bytes, openings, &name);
         let mut template = template;
         if openings.len() >= 2 {
             match lay(&openings) {
@@ -984,6 +985,36 @@ fn now_rfc3339() -> String {
     format!("posix:{secs}")
 }
 
+/// The opening messages of the channels not in alarm, when there are at
+/// least two of them; all of them otherwise.
+///
+/// A catalogue keeps channels in alarm on purpose, so that calibration
+/// records alarm transitions: `MIM:INVALID:*` has a link that never
+/// resolves. Their openings, built into a type's opening template, opened
+/// a quarter of MIMUS's channels of that type INVALID, for good, where
+/// the channels of a facility open as they last were, mostly quiet.
+fn without_alarms(descriptor: &[u8], openings: Vec<Vec<u8>>, name: &str) -> Vec<Vec<u8>> {
+    let Ok(desc) =
+        mimus_wire::pvdata::Descriptor::from_init_reply(descriptor, mimus_wire::ByteOrder::Little)
+    else {
+        return openings;
+    };
+    let quiet: Vec<Vec<u8>> = openings
+        .iter()
+        .filter(|o| desc.severity(o) == Some(0))
+        .cloned()
+        .collect();
+    if quiet.len() >= 2 && quiet.len() < openings.len() {
+        eprintln!(
+            "  {name}: {} of {} opening messages in alarm, left out of its opening template",
+            openings.len() - quiet.len(),
+            openings.len()
+        );
+        return quiet;
+    }
+    openings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1211,5 +1242,56 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "second");
         std::fs::remove_file(a).ok();
         std::fs::remove_file(b).ok();
+    }
+
+    /// An NTScalar double's descriptor, and an opening at `severity`.
+    fn nt_double(severity: i32) -> (Vec<u8>, Vec<u8>) {
+        use mimus_wire::codec::{put_size, put_string};
+        let o = mimus_wire::ByteOrder::Little;
+        let mut d = vec![0xFF, 0x80];
+        put_string(&mut d, "epics:nt/NTScalar:1.0", o);
+        put_size(&mut d, 2, o);
+        put_string(&mut d, "value", o);
+        d.push(0x43);
+        put_string(&mut d, "alarm", o);
+        d.push(0x80);
+        put_string(&mut d, "alarm_t", o);
+        put_size(&mut d, 3, o);
+        for f in ["severity", "status"] {
+            put_string(&mut d, f, o);
+            d.push(0x22);
+        }
+        put_string(&mut d, "message", o);
+        d.push(0x60);
+        // The whole structure: bit 0.
+        let mut body = vec![0x01, 0x01];
+        body.extend_from_slice(&2.5f64.to_le_bytes());
+        body.extend_from_slice(&severity.to_le_bytes());
+        body.extend_from_slice(&0i32.to_le_bytes());
+        put_string(&mut body, if severity == 0 { "" } else { "LOLO" }, o);
+        body.push(0x00);
+        (d, body)
+    }
+
+    #[test]
+    fn openings_in_alarm_are_left_out_when_two_others_remain() {
+        let (d, quiet) = nt_double(0);
+        let (_, minor) = nt_double(1);
+        let (_, invalid) = nt_double(3);
+        let all = vec![quiet.clone(), invalid.clone(), quiet.clone(), minor.clone()];
+        assert_eq!(
+            without_alarms(&d, all, "t"),
+            vec![quiet.clone(), quiet.clone()]
+        );
+        // One quiet opening would serve every channel the same: keep all.
+        let few = vec![quiet.clone(), invalid.clone(), minor];
+        assert_eq!(without_alarms(&d, few.clone(), "t"), few);
+        // Nothing in alarm, or a type without an alarm: unchanged.
+        let calm = vec![quiet.clone(), quiet.clone()];
+        assert_eq!(without_alarms(&d, calm.clone(), "t"), calm);
+        assert_eq!(
+            without_alarms(&[0xFF, 0x43], vec![invalid.clone()], "t"),
+            vec![invalid]
+        );
     }
 }
