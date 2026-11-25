@@ -26,6 +26,7 @@ use tokio::net::TcpStream;
 use crate::fleet::Fleet;
 use crate::registry::Registry;
 use crate::shared::{Dropper, SharedCounters};
+use crate::stage::{Stage, Stages};
 
 /// Configuration shared by sessions that belong to the same virtual IOC.
 #[derive(Debug, Clone)]
@@ -71,6 +72,17 @@ pub struct SessionConfig {
     pub debug: bool,
     /// Whether to enforce pipeline credits or only count them.
     pub pipeline: Pipeline,
+    /// The stages a scenario sets for each virtual IOC, if the run plays
+    /// one. The session follows the stage of its own IOC.
+    pub stages: Option<Arc<Stages>>,
+    /// The highest rate factor the scenario asks for, at least 1.
+    ///
+    /// The schedule is built at the configured rates times this factor and
+    /// thinned back to the factor of the moment. A raised rate then spreads
+    /// its updates over the wheel as the configured one does, instead of
+    /// arriving in clumps once per configured period, and no wheel has to be
+    /// rebuilt while clients are connected.
+    pub headroom: f64,
 }
 
 impl Default for SessionConfig {
@@ -90,6 +102,8 @@ impl Default for SessionConfig {
             coalesce_us: 0,
             debug: false,
             pipeline: Pipeline::default(),
+            stages: None,
+            headroom: 1.0,
         }
     }
 }
@@ -159,6 +173,12 @@ struct Monitor {
     /// Kept separate from the instance because the same channel can be monitored
     /// on multiple connections, each with its own update stream.
     step: u64,
+    /// Fraction of an update owed to this monitor while the schedule is
+    /// thinned: the factor of the moment over the headroom, added on every
+    /// due step, one update sent per whole unit. It starts at a fraction
+    /// drawn from the channel's seed, so thinned channels do not all send on
+    /// the same steps.
+    credit: f64,
 }
 
 /// Describes why a session ended.
@@ -174,6 +194,8 @@ pub enum SessionEnd {
     Io(std::io::Error),
     /// MIMUS closed the connection on purpose, under `--drop-connections`.
     Dropped,
+    /// The connection's virtual IOC went down in a scenario.
+    IocDown,
 }
 
 /// Completes when this session has claimed a drop request, and never when
@@ -185,6 +207,17 @@ async fn claim_drop(dropper: Option<&Dropper>) {
     }
 }
 
+/// Completes with the new stage when the session's IOC changes stage, and
+/// never when the run plays no scenario or the scenario has ended.
+async fn stage_changed(rx: &mut Option<tokio::sync::watch::Receiver<Stage>>) -> Stage {
+    if let Some(r) = rx
+        && r.changed().await.is_ok()
+    {
+        return *r.borrow_and_update();
+    }
+    std::future::pending().await
+}
+
 impl std::fmt::Display for SessionEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -192,6 +225,7 @@ impl std::fmt::Display for SessionEnd {
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Dropped => f.write_str("dropped by MIMUS"),
+            Self::IocDown => f.write_str("closed: its IOC went down"),
         }
     }
 }
@@ -220,6 +254,10 @@ pub struct Session {
     last_flush: Option<std::time::Instant>,
     /// Template and message-shape combinations already logged in debug mode.
     debugged: Vec<(u16, Shape)>,
+    /// The scenario stage of this session's IOC, as last seen.
+    stage: Stage,
+    /// Where stage changes arrive, if the run plays a scenario.
+    stage_rx: Option<tokio::sync::watch::Receiver<Stage>>,
     order: ByteOrder,
     inbox: BytesMut,
     outbox: BytesMut,
@@ -229,8 +267,11 @@ pub struct Session {
 impl Session {
     /// Creates a session with its own channel, monitor, and registry state.
     pub fn new(cfg: SessionConfig, fleet: Arc<Fleet>) -> Result<Self, mimus_emit::WheelError> {
-        let schedule = Schedule::new(&cfg.rate_mix, cfg.tick_us)?;
+        let schedule = Schedule::new(&cfg.rate_mix.scaled(cfg.headroom), cfg.tick_us)?;
         let registry = Registry::new(fleet.templates.len(), cfg.descriptor_policy);
+        let stage_rx = cfg.stages.as_ref().and_then(|s| s.watch(cfg.ioc));
+        // Bursts asked for before the session existed are not its to send.
+        let stage = stage_rx.as_ref().map(|r| *r.borrow()).unwrap_or_default();
         Ok(Self {
             cfg,
             fleet,
@@ -245,6 +286,8 @@ impl Session {
             last_tick: None,
             last_flush: None,
             debugged: Vec::new(),
+            stage,
+            stage_rx,
             // Outgoing messages use little-endian byte order. Incoming
             // messages are decoded using the byte order in their own headers.
             order: ByteOrder::Little,
@@ -292,14 +335,25 @@ impl Session {
         // times a second per session.
         let dropper = self.cfg.dropper.clone();
         let mut dropped = std::pin::pin!(claim_drop(dropper.as_deref()));
+        let mut stage_rx = self.stage_rx.take();
 
         let end = loop {
+            // An IOC can go down between the accept and the first pass.
+            if self.stage.down {
+                break SessionEnd::IocDown;
+            }
             // When there is nothing scheduled, wait only for socket input.
             // `pending()` never completes, so the timer branch is disabled
             // until the schedule contains work.
             let idle = self.schedule.is_empty();
             tokio::select! {
                 () = &mut dropped => break SessionEnd::Dropped,
+                stage = stage_changed(&mut stage_rx) => {
+                    if self.follow(stage) && self.should_flush()
+                        && let Err(e) = self.flush(&mut stream).await {
+                            break SessionEnd::Io(e);
+                        }
+                }
                 _ = ticker.tick(), if !idle => {
                     self.emit_due();
                     if self.should_flush()
@@ -360,8 +414,10 @@ impl Session {
             for _ in 0..live {
                 shared.subscription_stopped();
             }
-            if matches!(end, SessionEnd::Dropped) {
-                shared.session_dropped();
+            match end {
+                SessionEnd::Dropped => shared.session_dropped(),
+                SessionEnd::IocDown => shared.session_closed_down(),
+                _ => {}
             }
         }
         (end, self.counters)
@@ -572,6 +628,7 @@ impl Session {
                     pipelined: credit.is_some(),
                     credits: credit.unwrap_or(0),
                     step: 0,
+                    credit: unit_fraction(self.fleet.instances[instance as usize].seed),
                 },
             );
             return Ok(());
@@ -719,7 +776,8 @@ impl Session {
                 Some(initial) => {
                     mimus_wire::codec::put_status_ok(&mut out);
                     let inst = self.fleet.instances[instance as usize];
-                    let when = last_processed(&self.schedule, &inst, EpicsTime::now());
+                    let rate = channel_rate(&self.cfg.rate_mix, self.stage.gain, &inst);
+                    let when = last_processed(rate, &inst, EpicsTime::now());
                     let body = out.len();
                     initial.render(inst.seed, inst.seed, when, &mut out);
                     if let Some(desc) = &self.fleet.openings[template as usize]
@@ -841,8 +899,18 @@ impl Session {
         self.counters.wheel_steps += 1;
         self.pending.wheel_steps += 1;
         let over_high_water = self.outbox.len() >= self.cfg.high_water;
-        let due = self.schedule.tick();
+        let mut due = self.schedule.tick();
         if due.is_empty() {
+            return;
+        }
+        self.thin(&mut due);
+
+        if self.stage.frozen {
+            // A frozen IOC processes nothing: what falls due is held, and
+            // never sent, rather than queued for the resume.
+            let n: u64 = due.iter().map(|d| u64::from(d.repeats)).sum();
+            self.counters.held += n;
+            self.pending.held += n;
             return;
         }
 
@@ -873,6 +941,97 @@ impl Session {
                 self.emit_one(d.request_id, at, Shape::SteadyState);
             }
         }
+    }
+
+    /// Thins this step's due monitors down to the rate of the moment.
+    ///
+    /// The schedule runs at the configured rates times the headroom. Each
+    /// due monitor is owed the factor of the moment over the headroom for
+    /// each update the schedule offers it, and sends one update per whole
+    /// unit it is owed, its timestamps spread over the tick as the
+    /// schedule's were. Without a scenario both are 1, and nothing is
+    /// touched.
+    fn thin(&mut self, due: &mut Vec<mimus_emit::Due>) {
+        let ratio = self.stage.gain / self.cfg.headroom;
+        if ratio == 1.0 {
+            return;
+        }
+        due.retain_mut(|d| {
+            let Some(mon) = self.monitors.get_mut(&d.request_id) else {
+                return false;
+            };
+            mon.credit += ratio * f64::from(d.repeats);
+            let owed = mon.credit.floor();
+            mon.credit -= owed;
+            let n = owed as u32;
+            if n == 0 {
+                return false;
+            }
+            d.spacing_ns = d.spacing_ns * u64::from(d.repeats) / u64::from(n);
+            d.spacing_us = d.spacing_ns / 1000;
+            d.repeats = n;
+            true
+        });
+    }
+
+    /// Takes in a new stage of this session's IOC, and returns whether
+    /// anything was queued for the client.
+    ///
+    /// A burst is sent at once; whether it reaches the client in one write
+    /// is then up to the flush policy, as for any tick.
+    fn follow(&mut self, stage: Stage) -> bool {
+        let burst = stage.bursts != self.stage.bursts;
+        self.stage = stage;
+        if burst && !stage.frozen && !stage.down {
+            return self.burst(stage.burst_share) > 0;
+        }
+        false
+    }
+
+    /// Sends one update from each started monitor the burst selects, all
+    /// stamped with the same instant, as when a beam dump moves thousands of
+    /// channels at once. Returns how many were queued.
+    ///
+    /// The selection is drawn from each channel's seed and the burst's
+    /// number, so a burst of half the channels picks the same half on every
+    /// connection and in every run. A static channel has nothing to send.
+    /// Under the drop policy, what does not fit under the high-water mark is
+    /// dropped and counted, as for any tick.
+    fn burst(&mut self, share: f64) -> u64 {
+        let draw = self.stage.bursts;
+        let mut selected: Vec<i32> = self
+            .monitors
+            .values()
+            .filter(|m| m.started)
+            .filter(|m| {
+                let instance = &self.fleet.instances[m.instance as usize];
+                !self.fleet.templates[usize::from(instance.template)].is_static()
+                    && unit_fraction(instance.seed ^ draw.wrapping_mul(0xA24B_AED4_963E_E407))
+                        < share
+            })
+            .map(|m| m.request_id)
+            .collect();
+        // In request order, so a burst's messages do not depend on how the
+        // monitor table happens to be laid out.
+        selected.sort_unstable();
+        let now = EpicsTime::now();
+        let mut queued = 0;
+        for request_id in selected {
+            if self.cfg.backpressure == Backpressure::Drop
+                && self.outbox.len() >= self.cfg.high_water
+            {
+                self.counters.dropped_backpressure += 1;
+                self.pending.dropped_backpressure += 1;
+                continue;
+            }
+            let before = self.counters.emitted;
+            self.emit_one(request_id, now, Shape::SteadyState);
+            queued += self.counters.emitted - before;
+        }
+        self.counters.burst += queued;
+        self.pending.burst += queued;
+        self.publish();
+        queued
     }
 
     /// Renders one monitor update into the outbox.
@@ -919,7 +1078,11 @@ impl Session {
         // values represent the channel's current value and use its last
         // processing time, as they do in a GET response.
         let when = match shape {
-            Shape::Initial => last_processed(&self.schedule, &instance, now),
+            Shape::Initial => last_processed(
+                channel_rate(&self.cfg.rate_mix, self.stage.gain, &instance),
+                &instance,
+                now,
+            ),
             Shape::SteadyState => now,
         };
         compiled.render(step, instance.seed, when, &mut payload);
@@ -1147,16 +1310,28 @@ fn catch_up(
 /// All values sent within one period share the same timestamp. The result
 /// is never in the future and is at most one period old. If the rate does
 /// not yield a usable period, the current time is returned.
-fn last_processed(schedule: &Schedule, instance: &Instance, now: EpicsTime) -> EpicsTime {
-    let rate = schedule
-        .wheel(usize::from(instance.rate_group))
-        .map_or(0.0, |w| w.rate_hz());
+fn last_processed(rate: f64, instance: &Instance, now: EpicsTime) -> EpicsTime {
     let period_ns = 1e9 / rate;
     if !(period_ns.is_finite() && period_ns >= 1.0) {
         return now;
     }
     let period_ns = period_ns.round() as u64;
     now.last_boundary(period_ns, phase_of(instance.seed) % period_ns)
+}
+
+/// The rate a channel runs at at the moment: its group's configured rate
+/// times the scenario's factor.
+fn channel_rate(mix: &RateMix, gain: f64, instance: &Instance) -> f64 {
+    let configured = mix
+        .groups
+        .get(usize::from(instance.rate_group))
+        .map_or(0.0, |g| g.0);
+    configured * gain
+}
+
+/// Maps a seed to a fraction in [0, 1), the same for the same seed.
+fn unit_fraction(seed: u64) -> f64 {
+    (phase_of(seed) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Computes a stable phase within the update period from a channel seed.

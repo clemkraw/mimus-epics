@@ -79,6 +79,8 @@ pub struct SearchResponder {
     /// no matching channels, which require different troubleshooting.
     pub seen: std::sync::atomic::AtomicU64,
     pub answered: std::sync::atomic::AtomicU64,
+    /// Scenario stages: an IOC a scenario holds down answers no search.
+    stages: Option<Arc<crate::stage::Stages>>,
 }
 
 impl SearchResponder {
@@ -129,7 +131,20 @@ impl SearchResponder {
             iocs,
             seen: std::sync::atomic::AtomicU64::new(0),
             answered: std::sync::atomic::AtomicU64::new(0),
+            stages: None,
         })
+    }
+
+    /// Follows a scenario's stages: an IOC held down answers no search, as a
+    /// host whose IOC has exited does not, so a client looking for its
+    /// channels finds nothing until it comes back.
+    pub fn with_stages(mut self, stages: Arc<crate::stage::Stages>) -> Self {
+        self.stages = Some(stages);
+        self
+    }
+
+    fn is_down(&self, ioc: u16) -> bool {
+        self.stages.as_ref().is_some_and(|s| s.is_down(ioc))
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -193,7 +208,9 @@ impl SearchResponder {
         for (id, name) in &req.channels {
             for ioc in &self.iocs {
                 if self.fleet.lookup_on(name, ioc.index).is_some() {
-                    by_ioc.entry(ioc.index).or_default().push(*id);
+                    if !self.is_down(ioc.index) {
+                        by_ioc.entry(ioc.index).or_default().push(*id);
+                    }
                     break;
                 }
             }
@@ -524,6 +541,61 @@ mod tests {
         assert_eq!(seen[0].1, 5099);
         assert_eq!(seen[1].1, 5100);
         assert_ne!(seen[0].0, seen[1].0, "each IOC must have its own GUID");
+    }
+
+    #[tokio::test]
+    async fn an_ioc_a_scenario_holds_down_answers_no_search() {
+        // A client looking for the channels of an IOC that has gone must
+        // find nothing until it comes back, as with a real IOC, or it would
+        // try to connect to a closed port and learn nothing from the search.
+        let fleet = Arc::new(test_fleet(4, 2));
+        let iocs: Vec<IocEndpoint> = [5099u16, 5100]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| IocEndpoint {
+                index: i as u16,
+                tcp_port: *p,
+                guid: [i as u8; GUID_LEN],
+            })
+            .collect();
+        let stages = crate::stage::Stages::new(2);
+        let r = Arc::new(
+            SearchResponder::bind("127.0.0.1", 0, fleet, iocs)
+                .await
+                .expect("bind")
+                .with_stages(Arc::clone(&stages)),
+        );
+        let addr = r.local_addr().unwrap();
+        let run = Arc::clone(&r);
+        tokio::spawn(async move { run.serve().await });
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ask = |seq| search_datagram(seq, &[(1, "MIM:dbl:0"), (2, "MIM:dbl:2")], 0);
+        let mut buf = [0u8; 2048];
+
+        stages.modify(1, |s| s.down = true);
+        client.send_to(&ask(11), addr).await.unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .expect("the IOC still up answers")
+            .unwrap();
+        assert_eq!(parse_response(&buf[..n]).1, 5099);
+        let more =
+            tokio::time::timeout(std::time::Duration::from_millis(400), client.recv(&mut buf))
+                .await;
+        assert!(more.is_err(), "the IOC that is down answered");
+
+        stages.normal(1);
+        client.send_to(&ask(12), addr).await.unwrap();
+        let mut ports = Vec::new();
+        for _ in 0..2 {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv(&mut buf))
+                .await
+                .expect("both answer once it is back")
+                .unwrap();
+            ports.push(parse_response(&buf[..n]).1);
+        }
+        ports.sort_unstable();
+        assert_eq!(ports, [5099, 5100]);
     }
 
     #[tokio::test]
