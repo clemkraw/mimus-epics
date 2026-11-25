@@ -15,15 +15,17 @@
 //! and for `dataTimeStamp`, the second stamp an NTNDArray carries, the same way.
 //!
 //! The same walk lists where a value's arrays lie, which calibration needs
-//! to keep a large array whole: see [`Descriptor::arrays`].
+//! to keep a large array whole: see [`Descriptor::arrays`]. It also reads
+//! the fields a PUT writes, and puts them in the updates that follow: see
+//! [`Descriptor::written`] and [`Descriptor::overwrite`].
 //!
 //! Anything it cannot understand is an error, never a guess. The caller then
 //! sends the message unchanged, preserving the previous behavior.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
-use crate::codec::{CodecError, Reader, Size};
+use crate::codec::{CodecError, Reader, Size, put_size};
 use crate::header::ByteOrder;
 
 /// Maximum nesting depth for descriptors and values.
@@ -133,6 +135,9 @@ pub struct Descriptor {
 /// Layout of a body: changed set, selected value, and optional overrun set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Located {
+    /// Offset of the value, immediately after the changed set. An RPC reply
+    /// carries the value from here, without the set.
+    pub value_start: usize,
     /// Offset immediately after the value, where the overrun set starts.
     /// GET responses end here.
     pub value_end: usize,
@@ -142,6 +147,99 @@ pub struct Located {
     /// The same for `dataTimeStamp`, if the type has one and the changed
     /// set includes it.
     pub data_stamp: Option<(usize, usize)>,
+}
+
+/// One field a value carries whole, where no member of it can be selected
+/// on its own: a scalar, a string, an array, a union, an `any`, an array of
+/// structures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Leaf {
+    /// The field's place in a changed set.
+    bit: usize,
+    /// Its encoding in the body: a size before its elements, a selector
+    /// before a union's member, all of it.
+    range: Range<usize>,
+    shape: Shape,
+}
+
+/// What a field carried whole is made of, as far as its byte order goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// A number or a boolean of this many bytes.
+    Fixed(usize),
+    Str,
+    /// An array of numbers of `elem` bytes, or of strings if `None`, with a
+    /// size before its elements unless its length is fixed by its type.
+    Array {
+        elem: Option<usize>,
+        sized: bool,
+    },
+    /// A union, an `any`, an array of structures or unions: not reordered.
+    Other,
+}
+
+impl Shape {
+    fn of(kind: &Kind) -> Self {
+        match kind {
+            Kind::Fixed(w) => Shape::Fixed(*w),
+            Kind::Str => Shape::Str,
+            Kind::Array { elem, fixed } => Shape::Array {
+                elem: match elem {
+                    Elem::Fixed(w) => Some(*w),
+                    Elem::Str => None,
+                },
+                sized: fixed.is_none(),
+            },
+            _ => Shape::Other,
+        }
+    }
+
+    /// The same field in another byte order, or `None` for a field whose
+    /// shape this does not cover or whose bytes do not match it.
+    fn reorder(self, bytes: &[u8], from: ByteOrder, to: ByteOrder) -> Option<Vec<u8>> {
+        if from == to {
+            return Some(bytes.to_vec());
+        }
+        let mut r = Reader::new(bytes, from);
+        let mut out = Vec::with_capacity(bytes.len());
+        let string = |r: &mut Reader<'_>, out: &mut Vec<u8>| -> Option<()> {
+            let s = r.string().ok()?;
+            put_size(out, s.len(), to);
+            out.extend_from_slice(s.as_bytes());
+            Some(())
+        };
+        match self {
+            Shape::Fixed(w) => out.extend(r.take_exact(w).ok()?.iter().rev()),
+            Shape::Str => string(&mut r, &mut out)?,
+            Shape::Array { elem, sized } => {
+                let count = if sized {
+                    let n = r.size().ok()?.or_empty();
+                    put_size(&mut out, n, to);
+                    n
+                } else {
+                    // A fixed length: the elements alone, as many as fit.
+                    elem.map_or(0, |w| bytes.len() / w.max(1))
+                };
+                for _ in 0..count {
+                    match elem {
+                        Some(w) => out.extend(r.take_exact(w).ok()?.iter().rev()),
+                        None => string(&mut r, &mut out)?,
+                    }
+                }
+            }
+            Shape::Other => return None,
+        }
+        r.is_empty().then_some(out)
+    }
+}
+
+/// What follows the value in a body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// A monitor update: the overrun set.
+    Overrun,
+    /// A PUT: nothing.
+    Nothing,
 }
 
 impl Descriptor {
@@ -185,7 +283,101 @@ impl Descriptor {
     /// Locates the end of the value and the timestamp in a body.
     /// Expects a changed set, a value, and an overrun set, with no trailing bytes.
     pub fn locate(&self, body: &[u8]) -> Result<Located, WalkError> {
-        self.walk(body, None)
+        self.walk(body, self.order, Tail::Overrun, None, None)
+    }
+
+    /// The fields a PUT writes, from its changed set and value: what
+    /// follows the sub-command in the request, with nothing after it, in
+    /// the byte order of the request. Each field comes with its bit and its
+    /// encoding in this descriptor's byte order, ready for
+    /// [`Descriptor::overwrite`].
+    ///
+    /// A structure written whole is listed member by member, so that a
+    /// write of `value` and a write of `value.index` name the same fields.
+    /// A union, an `any` or an array of structures written in the other
+    /// byte order is left out: MIMUS does not reorder their insides.
+    pub fn written(
+        &self,
+        put: &[u8],
+        order: ByteOrder,
+    ) -> Result<Vec<(usize, Vec<u8>)>, WalkError> {
+        let mut found = Vec::new();
+        self.walk(put, order, Tail::Nothing, None, Some(&mut found))?;
+        Ok(found
+            .into_iter()
+            .filter_map(|leaf| {
+                let bytes = leaf.shape.reorder(&put[leaf.range], order, self.order)?;
+                Some((leaf.bit, bytes))
+            })
+            .collect())
+    }
+
+    /// The value a monitor update or a read carries, encoded in full: every
+    /// field of the type, in order, without a changed set, as an RPC reply
+    /// carries its value.
+    ///
+    /// An IOC's opening message is a partial value: QSRV marks the fields a
+    /// record holds and leaves the rest out. The fields left out are written
+    /// as a client that applied the partial value would hold them: zero, an
+    /// empty string or array, a union with no member selected, a null `any`.
+    pub fn full_value(&self, body: &[u8]) -> Result<Vec<u8>, WalkError> {
+        let mut carried = Vec::new();
+        self.walk(body, self.order, Tail::Overrun, None, Some(&mut carried))?;
+        let carried: HashMap<usize, Range<usize>> =
+            carried.into_iter().map(|l| (l.bit, l.range)).collect();
+        let mut out = Vec::with_capacity(body.len());
+        write_full(&self.root, 0, &carried, body, self.order, &mut out);
+        Ok(out)
+    }
+
+    /// The bits of a top-level field and of its members, if the type has a
+    /// field of that name: `value` holds bits 1 to 5 of an NTEnum.
+    pub fn field_bits(&self, name: &str) -> Option<Range<usize>> {
+        let Kind::Struct { fields } = &self.root.kind else {
+            return None;
+        };
+        let mut off = 1;
+        for (n, f) in fields {
+            if n == name {
+                return Some(off..off + f.span);
+            }
+            off += f.span;
+        }
+        None
+    }
+
+    /// Writes the fields of `written`, by bit, over those the monitor update
+    /// at `buf[at..]` carries, and returns how many it replaced. A field the
+    /// update does not carry is left out; one of another length, a string
+    /// or an array, moves what follows it.
+    ///
+    /// Each replacement is a whole field's encoding in place of another of
+    /// the same type, so the update stays a value of its type.
+    pub fn overwrite(
+        &self,
+        buf: &mut Vec<u8>,
+        at: usize,
+        written: &BTreeMap<usize, Vec<u8>>,
+    ) -> Result<usize, WalkError> {
+        let mut carried = Vec::new();
+        self.walk(
+            &buf[at..],
+            self.order,
+            Tail::Overrun,
+            None,
+            Some(&mut carried),
+        )?;
+        let mut replaced = 0;
+        // From the last field back, so that a change of length leaves the
+        // fields still to replace where they were found.
+        for leaf in carried.iter().rev() {
+            if let Some(bytes) = written.get(&leaf.bit) {
+                let range = at + leaf.range.start..at + leaf.range.end;
+                buf.splice(range, bytes.iter().copied());
+                replaced += 1;
+            }
+        }
+        Ok(replaced)
     }
 
     /// Returns where the elements of each array of fixed-width elements
@@ -199,17 +391,20 @@ impl Descriptor {
     /// thousands of one-byte fields.
     pub fn arrays(&self, body: &[u8]) -> Result<Vec<Range<usize>>, WalkError> {
         let mut found = Vec::new();
-        self.walk(body, Some(&mut found))?;
+        self.walk(body, self.order, Tail::Overrun, Some(&mut found), None)?;
         Ok(found)
     }
 
     fn walk(
         &self,
         body: &[u8],
+        order: ByteOrder,
+        tail: Tail,
         arrays: Option<&mut Vec<Range<usize>>>,
+        leaves: Option<&mut Vec<Leaf>>,
     ) -> Result<Located, WalkError> {
         let mut w = Walker {
-            r: Reader::new(body, self.order),
+            r: Reader::new(body, order),
             reg: Registry {
                 base: Some(&self.registry),
                 local: HashMap::new(),
@@ -221,15 +416,20 @@ impl Descriptor {
             data_seconds: None,
             data_nanos: None,
             arrays,
+            leaves,
         };
-        let changed = read_bitset(&mut w.r, self.order)?;
+        let changed = read_bitset(&mut w.r, order)?;
+        let value_start = w.r.position();
         w.partial(&self.root, 0, &changed, 0)?;
         let value_end = w.r.position();
-        read_bitset(&mut w.r, self.order)?;
+        if tail == Tail::Overrun {
+            read_bitset(&mut w.r, order)?;
+        }
         if !w.r.is_empty() {
-            return Err(WalkError::Malformed("bytes follow the overrun set"));
+            return Err(WalkError::Malformed("bytes follow the value"));
         }
         Ok(Located {
+            value_start,
             value_end,
             stamp: w.seconds.zip(w.nanos),
             data_stamp: w.data_seconds.zip(w.data_nanos),
@@ -270,6 +470,47 @@ impl Descriptor {
         };
         body[s..s + 8].copy_from_slice(&sb);
         body[n..n + 4].copy_from_slice(&nb);
+    }
+}
+
+/// Writes `node`, at `bit`, in full: the fields `body` carries as they are,
+/// the others as their type's empty value.
+fn write_full(
+    node: &Node,
+    bit: usize,
+    carried: &HashMap<usize, Range<usize>>,
+    body: &[u8],
+    order: ByteOrder,
+    out: &mut Vec<u8>,
+) {
+    if let Kind::Struct { fields } = &node.kind {
+        let mut off = bit + 1;
+        for (_, f) in fields {
+            write_full(f, off, carried, body, order, out);
+            off += f.span;
+        }
+        return;
+    }
+    if let Some(range) = carried.get(&bit) {
+        out.extend_from_slice(&body[range.clone()]);
+        return;
+    }
+    match &node.kind {
+        Kind::Fixed(w) => out.resize(out.len() + w, 0),
+        Kind::Str => put_size(out, 0, order),
+        Kind::Array { elem, fixed } => match (fixed, elem) {
+            (None, _) => put_size(out, 0, order),
+            (Some(n), Elem::Fixed(w)) => out.resize(out.len() + n * w, 0),
+            (Some(n), Elem::Str) => {
+                for _ in 0..*n {
+                    put_size(out, 0, order);
+                }
+            }
+        },
+        // No member selected; a null type.
+        Kind::Union(_) | Kind::Any => out.push(NULL_TYPE),
+        Kind::StructArray(_) | Kind::UnionArray(_) | Kind::AnyArray => put_size(out, 0, order),
+        Kind::Struct { .. } => unreachable!("written member by member above"),
     }
 }
 
@@ -474,6 +715,8 @@ struct Walker<'a> {
     data_nanos: Option<usize>,
     /// Where to list the arrays of fixed-width elements, when asked.
     arrays: Option<&'a mut Vec<Range<usize>>>,
+    /// Where to list every field carried whole, by bit, when asked.
+    leaves: Option<&'a mut Vec<Leaf>>,
 }
 
 impl Walker<'_> {
@@ -522,6 +765,23 @@ impl Walker<'_> {
         if depth > MAX_DEPTH {
             return Err(WalkError::Malformed("value nested too deeply"));
         }
+        let start = self.r.position();
+        self.field(node, offset, depth)?;
+        // A structure's members are listed on their own; anything else is
+        // carried whole. Members of a union or an `any` have no bit.
+        if let (Some(bit), Some(found)) = (offset, self.leaves.as_deref_mut())
+            && !matches!(node.kind, Kind::Struct { .. })
+        {
+            found.push(Leaf {
+                bit,
+                range: start..self.r.position(),
+                shape: Shape::of(&node.kind),
+            });
+        }
+        Ok(())
+    }
+
+    fn field(&mut self, node: &Node, offset: Option<usize>, depth: usize) -> Result<(), WalkError> {
         match &node.kind {
             Kind::Fixed(w) => {
                 if let Some(o) = offset {
@@ -714,6 +974,7 @@ mod tests {
         assert_eq!(
             at,
             Located {
+                value_start: 3,
                 value_end: end,
                 stamp: Some((s, s + 8)),
                 data_stamp: None,
@@ -821,6 +1082,143 @@ mod tests {
     }
 
     #[test]
+    fn a_put_lists_the_fields_it_writes_member_by_member() {
+        let d = Descriptor::from_init_reply(&ntscalar_descriptor(), LE).unwrap();
+
+        // pvxput writes the value alone: bit 1.
+        let mut put = vec![0x01, 0x02];
+        put.extend_from_slice(&2.5f64.to_le_bytes());
+        assert_eq!(
+            d.written(&put, LE).unwrap(),
+            vec![(1, 2.5f64.to_le_bytes().to_vec())]
+        );
+
+        // The whole alarm, bit 2, is its three members.
+        let mut put = vec![0x01, 0x04];
+        put.extend_from_slice(&2i32.to_le_bytes());
+        put.extend_from_slice(&3i32.to_le_bytes());
+        put_string(&mut put, "HIHI", LE);
+        let bits: Vec<usize> = d.written(&put, LE).unwrap().iter().map(|l| l.0).collect();
+        assert_eq!(bits, vec![3, 4, 5]);
+
+        // A PUT carries no overrun set: a byte after the value is an error.
+        let mut put = vec![0x01, 0x02];
+        put.extend_from_slice(&2.5f64.to_le_bytes());
+        put.push(0x00);
+        assert!(d.written(&put, LE).is_err());
+    }
+
+    #[test]
+    fn a_put_in_the_other_byte_order_is_read_in_it_and_kept_in_ours() {
+        const BE: ByteOrder = ByteOrder::Big;
+        let d = Descriptor::from_init_reply(&ntscalar_descriptor(), LE).unwrap();
+        // The value and the alarm's message, bits 1 and 5.
+        let mut put = vec![0x01, 0x22];
+        put.extend_from_slice(&2.5f64.to_be_bytes());
+        put_string(&mut put, "HIHI", BE);
+        let mut message = Vec::new();
+        put_string(&mut message, "HIHI", LE);
+        assert_eq!(
+            d.written(&put, BE).unwrap(),
+            vec![(1, 2.5f64.to_le_bytes().to_vec()), (5, message)]
+        );
+
+        // An array of numbers, each element turned around.
+        let desc = Descriptor::from_init_reply(&image_descriptor(), LE).unwrap();
+        let mut put = vec![0x01, 0x08];
+        put_size(&mut put, 2, BE);
+        put.extend_from_slice(&1f64.to_be_bytes());
+        put.extend_from_slice(&2f64.to_be_bytes());
+        let mut wave = Vec::new();
+        put_size(&mut wave, 2, LE);
+        wave.extend_from_slice(&1f64.to_le_bytes());
+        wave.extend_from_slice(&2f64.to_le_bytes());
+        assert_eq!(desc.written(&put, BE).unwrap(), vec![(3, wave)]);
+
+        // A union is left out rather than half turned around.
+        let mut put = vec![0x01, 0x02];
+        put_size(&mut put, 0, BE);
+        put_size(&mut put, 1, BE);
+        put.push(7);
+        assert!(desc.written(&put, BE).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_partial_value_is_written_in_full_with_the_rest_empty() {
+        let d = Descriptor::from_init_reply(&ntscalar_descriptor(), LE).unwrap();
+        // An opening as QSRV sends it: the value and the stamp's seconds and
+        // nanoseconds (bits 1, 7, 8), the alarm and the user tag left out.
+        let mut body = vec![0x02, 0x82, 0x01];
+        body.extend_from_slice(&1.5f64.to_le_bytes());
+        body.extend_from_slice(&10i64.to_le_bytes());
+        body.extend_from_slice(&5i32.to_le_bytes());
+        body.push(0x00);
+
+        let mut want = 1.5f64.to_le_bytes().to_vec();
+        want.extend_from_slice(&[0; 8]); // severity, status
+        want.push(0x00); // empty message
+        want.extend_from_slice(&10i64.to_le_bytes());
+        want.extend_from_slice(&5i32.to_le_bytes());
+        want.extend_from_slice(&[0; 4]); // userTag
+        assert_eq!(d.full_value(&body).unwrap(), want);
+
+        // An empty union, array and string where the image leaves them out.
+        let desc = Descriptor::from_init_reply(&image_descriptor(), LE).unwrap();
+        let mut body = vec![0x01, 0x10];
+        body.extend_from_slice(&7i32.to_le_bytes());
+        body.push(0x00);
+        let mut want = vec![0xFF, 0x00, 0x00];
+        want.extend_from_slice(&7i32.to_le_bytes());
+        assert_eq!(desc.full_value(&body).unwrap(), want);
+    }
+
+    #[test]
+    fn a_field_s_bits_cover_its_members() {
+        let d = Descriptor::from_init_reply(&ntscalar_descriptor(), LE).unwrap();
+        assert_eq!(d.field_bits("value"), Some(1..2));
+        assert_eq!(d.field_bits("alarm"), Some(2..6));
+        assert_eq!(d.field_bits("timeStamp"), Some(6..10));
+        assert_eq!(d.field_bits("display"), None);
+    }
+
+    #[test]
+    fn written_fields_replace_those_an_update_carries() {
+        let desc = Descriptor::from_init_reply(&image_descriptor(), LE).unwrap();
+        // An update of the waveform (bit 3) and the counter (bit 4).
+        let mut update = vec![0x01, 0x18];
+        put_size(&mut update, 2, LE);
+        update.extend_from_slice(&1f64.to_le_bytes());
+        update.extend_from_slice(&2f64.to_le_bytes());
+        update.extend_from_slice(&7i32.to_le_bytes());
+        update.push(0x00);
+        let mut buf = vec![0xAA, 0xBB];
+        buf.extend_from_slice(&update);
+
+        // A longer waveform, a counter, and a string array the update does
+        // not carry.
+        let mut wave = Vec::new();
+        put_size(&mut wave, 3, LE);
+        for v in [10f64, 20.0, 30.0] {
+            wave.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut names = Vec::new();
+        put_size(&mut names, 0, LE);
+        let written = BTreeMap::from([
+            (2, names),
+            (3, wave.clone()),
+            (4, 9i32.to_le_bytes().to_vec()),
+        ]);
+        assert_eq!(desc.overwrite(&mut buf, 2, &written).unwrap(), 2);
+
+        let mut want = vec![0xAA, 0xBB, 0x01, 0x18];
+        want.extend_from_slice(&wave);
+        want.extend_from_slice(&9i32.to_le_bytes());
+        want.push(0x00);
+        assert_eq!(buf, want);
+        assert!(desc.locate(&buf[2..]).is_ok(), "still a value of its type");
+    }
+
+    #[test]
     fn lists_the_arrays_of_fixed_width_elements_a_value_carries() {
         let desc = Descriptor::from_init_reply(&image_descriptor(), LE).unwrap();
 
@@ -917,6 +1315,7 @@ mod tests {
         assert_eq!(
             at,
             Located {
+                value_start: 2,
                 value_end: end,
                 stamp: Some((s, s + 8)),
                 data_stamp: None,

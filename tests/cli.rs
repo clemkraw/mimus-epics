@@ -381,6 +381,15 @@ fn a_timed_run_reports_what_it_offered() {
     assert!(out.contains("offered load 21 updates/s, about "), "{out}");
     assert_eq!(r["emitted"], 0, "nothing subscribed");
     assert_eq!(r["bytes_per_s"], 0.0);
+    // Writes are applied and calls answered unless the run says otherwise;
+    // nothing wrote or called.
+    assert!(out.contains("put apply, rpc value"), "{out}");
+    assert_eq!(r["run"]["put"], "apply");
+    assert_eq!(r["run"]["rpc"], "value");
+    for key in ["puts", "put_bytes", "rpcs"] {
+        assert_eq!(r[key].as_u64(), Some(0), "{key}");
+    }
+    assert_eq!(r["channels_written"], 0);
     assert_eq!(r["run"]["rate_mix"], "10:2,1:60,0.1:38");
 }
 

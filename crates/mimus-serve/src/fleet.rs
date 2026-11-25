@@ -148,6 +148,9 @@ pub struct Fleet {
     /// `None` means the template has no opening message or its descriptor
     /// could not be read. In that case, the message is sent unchanged.
     pub openings: Vec<Option<Descriptor>>,
+    /// Each template's descriptor, parallel to `templates`, to read what a
+    /// PUT writes and put it in what follows. `None` if it cannot be read.
+    pub descriptors: Vec<Option<Descriptor>>,
     /// One entry per PV, parallel to `names`.
     pub instances: Vec<Instance>,
     pub names: Vec<String>,
@@ -239,17 +242,20 @@ impl Fleet {
 
         // Parse opening descriptors in the order templates are declared.
         // The session uses little-endian byte order.
+        let descriptors: Vec<Option<Descriptor>> = templates
+            .iter()
+            .map(|t| Descriptor::from_init_reply(&t.intro_full, ByteOrder::Little).ok())
+            .collect();
         let openings = templates
             .iter()
-            .map(|t| {
-                t.initial.as_ref()?;
-                Descriptor::from_init_reply(&t.intro_full, ByteOrder::Little).ok()
-            })
+            .zip(&descriptors)
+            .map(|(t, d)| t.initial.as_ref().and(d.clone()))
             .collect();
 
         Ok(Self {
             templates,
             openings,
+            descriptors,
             instances,
             names,
             index,

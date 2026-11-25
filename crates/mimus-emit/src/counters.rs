@@ -49,6 +49,15 @@ pub struct Counters {
     /// Updates that carried an alarm transition under `--alarms`: a part of
     /// `emitted`.
     pub alarms: u64,
+    /// PUT requests answered: the writes themselves, not their INIT, and not
+    /// the reads a client makes of the value it is about to write. Not
+    /// updates: none of the counts above includes them.
+    pub puts: u64,
+    /// The bytes of those PUT requests, headers included: what the clients
+    /// wrote, where `bytes` is what MIMUS sent.
+    pub put_bytes: u64,
+    /// RPC requests answered, INIT apart.
+    pub rpcs: u64,
 }
 
 impl Counters {
@@ -86,6 +95,9 @@ impl Counters {
         self.burst += other.burst;
         self.quiet += other.quiet;
         self.alarms += other.alarms;
+        self.puts += other.puts;
+        self.put_bytes += other.put_bytes;
+        self.rpcs += other.rpcs;
     }
 
     /// Returns what was counted between `earlier` and these totals.
@@ -110,6 +122,9 @@ impl Counters {
             burst: self.burst.saturating_sub(earlier.burst),
             quiet: self.quiet.saturating_sub(earlier.quiet),
             alarms: self.alarms.saturating_sub(earlier.alarms),
+            puts: self.puts.saturating_sub(earlier.puts),
+            put_bytes: self.put_bytes.saturating_sub(earlier.put_bytes),
+            rpcs: self.rpcs.saturating_sub(earlier.rpcs),
         }
     }
 }
@@ -222,6 +237,9 @@ mod tests {
             burst: 8,
             quiet: 9,
             alarms: 10,
+            puts: 3,
+            put_bytes: 12,
+            rpcs: 1,
         };
         a.merge(&Counters {
             emitted: 10,
@@ -235,6 +253,9 @@ mod tests {
             burst: 80,
             quiet: 90,
             alarms: 100,
+            puts: 30,
+            put_bytes: 120,
+            rpcs: 10,
         });
         assert_eq!(
             a,
@@ -250,6 +271,9 @@ mod tests {
                 burst: 88,
                 quiet: 99,
                 alarms: 110,
+                puts: 33,
+                put_bytes: 132,
+                rpcs: 11,
             }
         );
     }
