@@ -17,7 +17,8 @@
 //! The same walk lists where a value's arrays lie, which calibration needs
 //! to keep a large array whole: see [`Descriptor::arrays`]. It also reads
 //! the fields a PUT writes, and puts them in the updates that follow: see
-//! [`Descriptor::written`] and [`Descriptor::overwrite`].
+//! [`Descriptor::written`] and [`Descriptor::overwrite`]. And it reads the
+//! queue a client asks for in a monitor request: see [`RequestTypes`].
 //!
 //! Anything it cannot understand is an error, never a guess. The caller then
 //! sends the message unchanged, preserving the previous behavior.
@@ -870,6 +871,110 @@ impl Walker<'_> {
     }
 }
 
+/// The types a client has described in its requests on one connection, so
+/// that a request naming one by its identifier alone can still be read.
+///
+/// A PVXS client describes its `pvRequest` in full every time; a
+/// pvAccessCPP client may describe it once and name it afterwards, as a
+/// server may do with the types it sends.
+#[derive(Debug, Default)]
+pub struct RequestTypes {
+    types: HashMap<u16, Node>,
+}
+
+impl RequestTypes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The queue a monitor request asks for, `record._options.queueSize`,
+    /// read as PVXS reads it: a number, or a string holding one. `request`
+    /// is what follows the sub-command: the `pvRequest`'s type and value,
+    /// then anything after them.
+    ///
+    /// `None` when the request asks for none, or for one this cannot read;
+    /// the caller then keeps the server's own size, as PVXS does.
+    pub fn queue_size(&mut self, request: &[u8], order: ByteOrder) -> Option<u32> {
+        let mut r = Reader::new(request, order);
+        let (root, defined) = {
+            let mut reg = Registry {
+                base: Some(&self.types),
+                local: HashMap::new(),
+            };
+            let root = read_type(&mut r, &mut reg, 0).ok()??;
+            (root, reg.local)
+        };
+        self.types.extend(defined);
+        let (bit, node) = member(&root, &["record", "_options", "queueSize"])?;
+        let mut leaves = Vec::new();
+        let mut w = Walker {
+            r,
+            reg: Registry {
+                base: Some(&self.types),
+                local: HashMap::new(),
+            },
+            stamp_bits: None,
+            data_stamp_bits: None,
+            seconds: None,
+            nanos: None,
+            data_seconds: None,
+            data_nanos: None,
+            arrays: None,
+            leaves: Some(&mut leaves),
+        };
+        w.full(&root, Some(0), 0).ok()?;
+        let leaf = leaves.iter().find(|l| l.bit == bit)?;
+        let mut v = Reader::new(&request[leaf.range.clone()], order);
+        match node.kind {
+            Kind::Str => v.string().ok()?.trim().parse().ok(),
+            Kind::Fixed(w) => {
+                let bytes = v.take_exact(w).ok()?;
+                let mut n = 0u64;
+                for i in 0..w {
+                    let b = match order {
+                        ByteOrder::Little => bytes[w - 1 - i],
+                        ByteOrder::Big => bytes[i],
+                    };
+                    n = n << 8 | u64::from(b);
+                }
+                // Eight bytes may hold a double: a count read as an integer
+                // would be far past any queue.
+                if w == 8 && n > u64::from(u32::MAX) {
+                    let f = f64::from_bits(n);
+                    return (f.fract() == 0.0 && f >= 0.0 && f <= f64::from(u32::MAX))
+                        .then_some(f as u32);
+                }
+                u32::try_from(n).ok()
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The bit of the member a path names, from the top of a structure, and
+/// its type.
+fn member<'a>(root: &'a Node, path: &[&str]) -> Option<(usize, &'a Node)> {
+    let mut bit = 0;
+    let mut node = root;
+    for name in path {
+        let Kind::Struct { fields } = &node.kind else {
+            return None;
+        };
+        let mut off = bit + 1;
+        let mut found = None;
+        for (n, f) in fields {
+            if n == name {
+                found = Some(f);
+                break;
+            }
+            off += f.span;
+        }
+        node = found?;
+        bit = off;
+    }
+    Some((bit, node))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,6 +1284,104 @@ mod tests {
         assert_eq!(d.field_bits("alarm"), Some(2..6));
         assert_eq!(d.field_bits("timeStamp"), Some(6..10));
         assert_eq!(d.field_bits("display"), None);
+    }
+
+    /// A `pvRequest` as PVXS builds `record[queueSize=…]field(value)`: the
+    /// option, then the field selection, one of each structure. `option`
+    /// is the option's type code, with `value` its encoding.
+    fn pv_request(head: &[u8], option: u8, value: &[u8], order: ByteOrder) -> Vec<u8> {
+        let mut d = head.to_vec();
+        d.push(0x80);
+        put_string(&mut d, "", order);
+        put_size(&mut d, 2, order);
+        put_string(&mut d, "record", order);
+        d.push(0x80);
+        put_string(&mut d, "", order);
+        put_size(&mut d, 1, order);
+        put_string(&mut d, "_options", order);
+        d.push(0x80);
+        put_string(&mut d, "", order);
+        put_size(&mut d, 1, order);
+        put_string(&mut d, "queueSize", order);
+        d.push(option);
+        put_string(&mut d, "field", order);
+        d.push(0x80);
+        put_string(&mut d, "", order);
+        put_size(&mut d, 1, order);
+        put_string(&mut d, "value", order);
+        d.push(0x80);
+        put_string(&mut d, "", order);
+        put_size(&mut d, 0, order);
+        d.extend_from_slice(value);
+        d
+    }
+
+    #[test]
+    fn a_monitor_request_s_queue_is_read_as_text_or_as_a_number() {
+        let mut types = RequestTypes::new();
+        let mut text = Vec::new();
+        put_string(&mut text, " 10", LE);
+        assert_eq!(
+            types.queue_size(&pv_request(&[], 0x60, &text, LE), LE),
+            Some(10)
+        );
+        let be = ByteOrder::Big;
+        let mut text = Vec::new();
+        put_string(&mut text, "6", be);
+        assert_eq!(
+            types.queue_size(&pv_request(&[], 0x60, &text, be), be),
+            Some(6)
+        );
+        // An unsigned and a signed integer, and a double: PVXS converts each.
+        let u32_7 = pv_request(&[], 0x26, &7u32.to_le_bytes(), LE);
+        assert_eq!(types.queue_size(&u32_7, LE), Some(7));
+        let i16_5 = pv_request(&[], 0x21, &5i16.to_be_bytes(), be);
+        assert_eq!(types.queue_size(&i16_5, be), Some(5));
+        let f64_16 = pv_request(&[], 0x43, &16.0f64.to_le_bytes(), LE);
+        assert_eq!(types.queue_size(&f64_16, LE), Some(16));
+        // What a pipelined INIT appends after the request does not matter.
+        let mut with_nack = u32_7.clone();
+        with_nack.extend_from_slice(&7u32.to_le_bytes());
+        assert_eq!(types.queue_size(&with_nack, LE), Some(7));
+    }
+
+    #[test]
+    fn a_request_that_names_a_type_described_before_is_read_with_it() {
+        let mut types = RequestTypes::new();
+        let first = pv_request(&[FULL_WITH_ID, 0x07, 0x00], 0x26, &12u32.to_le_bytes(), LE);
+        assert_eq!(types.queue_size(&first, LE), Some(12));
+        let mut again = vec![ONLY_ID, 0x07, 0x00];
+        again.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(types.queue_size(&again, LE), Some(3));
+        // On another connection, the identifier means nothing.
+        assert_eq!(RequestTypes::new().queue_size(&again, LE), None);
+    }
+
+    #[test]
+    fn a_request_without_a_queue_asks_for_none() {
+        let mut types = RequestTypes::new();
+        assert_eq!(types.queue_size(&[NULL_TYPE], LE), None);
+        assert_eq!(types.queue_size(&[], LE), None);
+        // `field(value)` alone.
+        let mut d = vec![0x80];
+        put_string(&mut d, "", LE);
+        put_size(&mut d, 1, LE);
+        put_string(&mut d, "field", LE);
+        d.push(0x80);
+        put_string(&mut d, "", LE);
+        put_size(&mut d, 0, LE);
+        assert_eq!(types.queue_size(&d, LE), None);
+        // Text that is not a number, and a value cut short.
+        let mut text = Vec::new();
+        put_string(&mut text, "lots", LE);
+        assert_eq!(
+            types.queue_size(&pv_request(&[], 0x60, &text, LE), LE),
+            None
+        );
+        assert_eq!(
+            types.queue_size(&pv_request(&[], 0x26, &[1, 0], LE), LE),
+            None
+        );
     }
 
     #[test]
