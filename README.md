@@ -192,8 +192,9 @@ mimus demo-profile  write a hand-made profile for trying the server out
 
 | Option | Default | What it does |
 |---|---|---|
-| `--backpressure` | `block` | `block` lets TCP throttle MIMUS; `drop` holds the nominal rate and counts what it discards (see below) |
-| `--high-water` | `1048576` | Bytes allowed to queue per connection before `drop` discards: the stand-in for an IOC's monitor queue. Raise it for images: MIMUS warns when it holds fewer than two updates of the largest type served |
+| `--backpressure` | `block` | `block` lets TCP throttle MIMUS; `drop` holds the nominal rate and counts what it discards; `ioc` does what a PVXS IOC does with a client that falls behind (see below) |
+| `--high-water` | `1048576`, `268435456` under `ioc` | Bytes allowed to queue per connection before `drop` discards: the stand-in for an IOC's monitor queue. Raise it for images: MIMUS warns when it holds fewer than two updates of the largest type served. Under `ioc`, the most a connection may hold before MIMUS closes it |
+| `--conn-timeout-s` | `40` | Under `ioc`: seconds a connection may go without a message from the client, or without the client taking anything waiting for it, before MIMUS closes it, as a PVXS server does |
 | `--put` | `apply` | What a write does. `apply` keeps the value written, and the channel's later updates, reads and RPC replies carry it; `accept` answers and changes nothing; `refuse` answers with an error (see [Writes and calls](#writes-and-calls)) |
 | `--rpc` | `value` | What an RPC gets. `value` answers with the channel's type and whole value, whatever the request; `refuse` answers with an error |
 | `--pipeline` | `permissive` | `strict` withholds updates from a pipelined monitor with no credit left, as PVXS does: the credit starts at the client's queue size and grows with each acknowledgement. `permissive` only counts acknowledgements |
@@ -243,14 +244,45 @@ With the defaults, MIMUS answers UDP searches on port 5076 while its TCP listene
 
 MIMUS shares UDP port 5076 with an IOC on the same host, as PVAccess servers do, and both stay discoverable; only the TCP port must differ from the IOC's 5075 (`--base-port`).
 
-### Backpressure: two different questions
+### Backpressure: three different questions
 
 When the client under test cannot keep up, TCP would normally throttle the sender, which silently turns a throughput measurement into something else. A real IOC does not behave that way: its monitor queue overflows, it drops, and it keeps running at its scan rate. MIMUS makes the choice explicit:
 
 - **`--backpressure block`**: MIMUS lets TCP throttle it. What it managed to send over the window *is* the client's real absorption capacity. This is the saturation measurement.
 - **`--backpressure drop`**: MIMUS holds its nominal rate and discards what does not fit within `--high-water`, counting every discard, as intermediate values are lost when an IOC's monitor queue overflows. This is the loss-under-offered-load measurement.
+- **`--backpressure ioc`**: MIMUS does what a PVXS IOC does with a client that falls behind, described below. This is the measurement of what a consumer loses when it stalls in a facility, and of how long it takes to recover.
 
 These answer different questions. Any published figure must state which mode produced it.
+
+### A client that falls behind
+
+A consumer does not only run slower than its load; it also stops: a garbage-collection pause, a saturated disk, a stopped process. What it loses then depends on what the IOC does, and a PVXS IOC does one of two things, as its server code in PVXS 1.4.1 shows:
+
+- **The client sends nothing**, stopped or in a long pause. The IOC keeps what the client does not read in its send buffer, without limit, until the connection has been silent for its timeout, 40 s by default (`EPICS_PVA_CONN_TMO`). A client back within the timeout finds every update, in one burst; past it, the IOC closes the connection, and what it held is lost.
+- **The client still sends**, an echo every 15 s or a pipeline acknowledgement, but reads less than it is sent. A message from it while the IOC's send buffer holds more than twice the socket's send buffer suspends the connection: the IOC stops reading from it, and each subscription keeps four updates, or the `queueSize` the client asked for, writing the newest over the last. The client is not told: PVXS sends no overrun mask. Once the client has taken half of what waited, the subscriptions send what they hold.
+
+`--backpressure ioc` does both, and a pipelined monitor out of credit under `--pipeline strict` queues in the same way. Where an IOC would run out of memory, MIMUS stops at `--high-water`, 256 MiB by default under this policy, and closes the connection. A `--conn-timeout-s` of 15 s or less also closes clients that are well, unless their own `EPICS_PVA_CONN_TMO` is lowered with it: a PVXS client sends an echo every half of it, 15 s at most.
+
+MIMUS cannot stop the consumer itself; a phase of a scenario can, with a command as it starts and another as it ends (see [Scenarios](#scenarios)). [`scenarios/slow-client.toml`](scenarios/slow-client.toml) stops it for 15 s, then for 50 s, either side of the timeout:
+
+```bash
+CONSUMER_PID=4242 mimus serve -p profile.json --pvs 100000 \
+    --backpressure ioc --scenario scenarios/slow-client.toml
+```
+
+The report counts what a pause cost: the updates written over, the time the connections spent behind and the most one of them held, the connections closed for the timeout, and, after each phase with a command at its end, how long the connections took to catch up. From 500 channels at 200 Hz, with `pvxmonitor` stopped for 5 s by a phase's commands:
+
+```
+behind                        5.4 s, holding 15 MiB at most
+...
+  phase                          start    length     offered     emitted   dropped      held  late closed   subscr.
+  before                         0.0 s     4.0 s      400179      400200         0         0     0      0       500
+  paused 5 s                     4.0 s     5.0 s      499989      500000         0         0     0      0       500
+  after the pause                9.0 s     5.0 s      499997      499200         0         0     1      0       500
+  after paused 5 s: 1 connection behind, caught up 1.68 s later
+```
+
+Nothing was dropped or written over: `pvxmonitor` sent nothing while stopped, so the connection was never suspended, and MIMUS held the 15 MiB that piled up meanwhile.
 
 ### Irregular updates
 
@@ -362,7 +394,9 @@ duration = "30s"
 | `freeze` | `duration`, `iocs`, `resume` | The IOCs targeted send nothing; what falls due is counted as `held` and never sent. At the end, `resume = "burst"` (the default) sends every subscription its latest value at once, as a monitor queue does; `"silent"` carries on at the rates |
 | `restart` | `down`, `duration`, `iocs` | The IOCs targeted close every connection, refuse new ones and answer no search for `down`, then come back on the same ports. The rest of `duration` (`down` by default) is left for the consumer to reconnect |
 
-`iocs` is `"all"`, the default, or a list of indices. `label` names a phase in the report. Durations carry their unit: `500ms`, `60s`, `5m`, `1h`, `1m30s`. `repeat = 3` plays the phases three times. [`scenarios/`](scenarios) holds a beam dump, an IOC restart, a freeze, a staircase to find a consumer's limit, and a bad day that combines them.
+`iocs` is `"all"`, the default, or a list of indices. `label` names a phase in the report. Durations carry their unit: `500ms`, `60s`, `5m`, `1h`, `1m30s`. `repeat = 3` plays the phases three times. [`scenarios/`](scenarios) holds a beam dump, an IOC restart, a freeze, a staircase to find a consumer's limit, a bad day that combines them, and a slow client.
+
+Any phase can also run a command, through the shell, as it starts (`on_start`) and as it ends (`on_end`), to act where MIMUS cannot: stop the consumer and resume it, slow its disk, shape its network with `tc`. A staircase runs them at its first and last steps. The commands inherit MIMUS's environment, with `MIMUS_PHASE` and `MIMUS_CYCLE` set. MIMUS does not wait for them, reports at once one that fails, and records what each returned. After a phase with a command at its end, the report gives how many connections were behind and how long they took to catch up. A scenario file runs its commands with MIMUS's rights: play only files you trust.
 
 Each phase starts from the configured rates, and what it changes lasts as long as it does. A raised rate is not a rebuilt wheel: every schedule is built at the highest gain of the scenario and thinned back to the gain of the moment, so a channel at three times its rate sends three evenly spread updates, not three at once. A file that cannot be played is refused before MIMUS listens, with the line and the phase at fault.
 
@@ -408,7 +442,7 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 
 | Field | Meaning |
 |---|---|
-| `emitted` | Updates written to the wire, opening messages included |
+| `emitted` | Updates put in a connection's send buffer, opening messages included. All reach the socket but those counted in `unsent` |
 | `sessions`, `sessions_dropped`, `sessions_closed_down` | Connections accepted over the run, those MIMUS closed under `--drop-connections`, and those closed because a scenario took their IOC down |
 | `dropped_backpressure` | Updates discarded under `--backpressure drop`. Counted, never silent |
 | `bytes` | Bytes written, headers included |
@@ -423,18 +457,22 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 | `held`, `burst` | Under a scenario: updates that fell due while their IOC was frozen and were never sent, and updates sent by bursts and resumes, a part of `emitted` |
 | `quiet` | Under `--activity`: updates due while the channel was quiet, and so not sent |
 | `alarms` | Under `--alarms`: updates that carried an alarm transition, a part of `emitted` |
+| `squashed`, `suspensions` | Under `--backpressure ioc`: updates written over in a subscription's full queue, never sent, and the times a connection was suspended |
+| `queued_at_close`, `unsent` | Updates still queued for a subscription, and still in MIMUS's send buffer, when the subscription stopped or the connection closed: never sent. `unsent` is a part of `emitted` |
+| `behind_s`, `backlog_peak_bytes` | Seconds connections spent holding what their client would not take yet, summed over connections, and the most one connection held |
+| `sessions_timed_out`, `sessions_overflowed` | Under `--backpressure ioc`: connections closed for the timeout, and past `--high-water` |
 | `puts`, `put_bytes`, `channels_written` | Writes answered (not their INIT, nor the reads a client makes of the value it is about to write over), their bytes as received, headers included, and the channels that hold a value written under `--put apply`. Requests, not updates: neither `emitted` nor `bytes` includes them |
 | `rpcs` | Calls answered, INIT apart |
-| `scenario` | The scenario played, phase by phase, with its restarts' recovery times; `null` without one |
+| `scenario` | The scenario played, phase by phase, with its restarts' recovery times, its commands' outcomes and how the connections caught up after them; `null` without one |
 | `profile`, `run` | The manifest: what was served, and with which options |
 
-`emitted` is what makes an end-to-end conservation check possible on the consumer side. Updates dropped under `--backpressure drop` never reached the wire, so they are not part of it. For an archiver:
+`emitted` is what makes an end-to-end conservation check possible on the consumer side. Updates dropped under `--backpressure drop` never reached the wire, so they are not part of it; those still in a closing connection's send buffer are, and `unsent` counts them. For an archiver:
 
 ```
-mimus.emitted == rows_stored + <every loss counter the client exposes>
+mimus.emitted - mimus.unsent == rows_stored + <every loss counter the client exposes>
 ```
 
-Any residual is either a bug in the client or a missing counter in it, and both are worth knowing. A consumer that cannot close this equation is a consumer that loses data without noticing. On MIMUS's side, an update due on a subscribed channel is either emitted, dropped (`dropped_backpressure`), withheld from a pipelined monitor with no credit (`flow_control_holds`), held while a scenario froze its IOC (`held`) or left unsent while its channel was quiet under `--activity` (`quiet`); only the time skipped after a late tick is in none of the five.
+Any residual is either a bug in the client or a missing counter in it, and both are worth knowing. A consumer that cannot close this equation is a consumer that loses data without noticing. On MIMUS's side, an update due on a subscribed channel is either emitted, dropped (`dropped_backpressure`), withheld from a pipelined monitor with no credit (`flow_control_holds`), held while a scenario froze its IOC (`held`), left unsent while its channel was quiet under `--activity` (`quiet`), written over in a full queue (`squashed`) or still queued when its subscription closed (`queued_at_close`); only the time skipped after a late tick is in none of these.
 
 ## Performance
 
@@ -501,7 +539,7 @@ A profile is more than a bag of bytes. It also records what the reference server
 - **The monitor path, plus `GET`, `GET_FIELD`, `PUT` and `RPC`.** The monitor path dominates a long-running client's workload; the other commands make `pvxget`, `pvxinfo`, `pvxput` and `pvxcall` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. A write changes the value the channel carries, and nothing else: no record processes, no alarm is raised by it, no update is posted for it. An RPC returns the channel's value, not the result of a service. MIMUS sends no beacons.
 - **PVXS (QSRV2) only.** QSRV1 puts different bytes on the wire for the same record; a profile calibrated against one is wrong against the other.
 - **One ordinary update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape, a type of images the few frames its sample budget kept; the alarm variant replaces it only under `--alarms`, and the other variants are recorded but not sent. Static channels of a type that also has a moving channel update at the serving rate (`--rate-hz` must be positive); a type whose every channel was static gets a static template, whose channels send their opening message and nothing after it, as on the IOC. Without `--alarms`, a channel keeps the alarm state of its opening message.
-- **Structure is replicated; IOC dynamics are not.** Scan jitter under host load and monitor-queue behavior are properties *of an IOC*, and MIMUS deliberately does not reproduce them: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client (overflow policy), it is exposed as `--backpressure`.
+- **Structure is replicated; IOC dynamics are not.** Scan jitter under host load is a property *of an IOC*, and MIMUS deliberately does not reproduce it: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client, what it does with a client that falls behind, it is exposed as `--backpressure`, and `ioc` follows PVXS 1.4.1's server.
 - **A profile is bound to a version.** Its manifest records the PVXS and EPICS base versions, a checksum of each catalogue database, the host, the date and the MIMUS version. Comparing profiles across PVXS releases is, incidentally, a wire-behavior change detector.
 - **Calibrate at small scale, generate at large scale.** The shipped catalogue has fewer than a hundred channels, enough to cover every type. Replication to millions happens afterwards, without the reference IOC.
 
