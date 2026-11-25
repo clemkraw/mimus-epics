@@ -150,6 +150,52 @@ pub fn template(obs: &Observed<'_>, name: impl Into<String>) -> Result<Template,
     Ok(t)
 }
 
+/// What [`keep_samples`] kept of a template's samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kept {
+    /// Observations whose samples are kept: the first ones.
+    pub kept: usize,
+    /// Observations the samples came from.
+    pub of: usize,
+    /// Bytes of samples each observation takes.
+    pub per_observation: usize,
+}
+
+/// Keeps no more than `budget` bytes of a template's samples: the samples
+/// of its first observations, at least two.
+///
+/// A template replays the updates it was learned from, so it carries them:
+/// thirty updates of a scalar are a few hundred bytes, thirty frames of an
+/// image thirty images. Past the budget, every slot keeps the samples of the
+/// same first observations. Sample `k` of every slot still comes from
+/// observation `k`, so each update kept is still reproduced byte for byte:
+/// what is replayed stays real, there is only less of it.
+///
+/// Returns what was kept, or `None` when everything fits.
+pub fn keep_samples(t: &mut Template, budget: usize) -> Option<Kept> {
+    let of = t.slots.iter().map(|s| s.samples.len()).max().unwrap_or(0);
+    let per_observation: usize = t
+        .slots
+        .iter()
+        .map(|s| s.samples.iter().map(Vec::len).max().unwrap_or(0))
+        .sum();
+    if per_observation == 0 {
+        return None;
+    }
+    let kept = (budget / per_observation).max(2);
+    if kept >= of {
+        return None;
+    }
+    for s in &mut t.slots {
+        s.samples.truncate(kept);
+    }
+    Some(Kept {
+        kept,
+        of,
+        per_observation,
+    })
+}
+
 /// Extracts the type identifier from a full introspection descriptor, if present.
 ///
 /// A full descriptor starts with an OK status, followed by an optional
@@ -605,6 +651,80 @@ mod tests {
         let obs = capture();
         let pieces = layout::layout(&obs).unwrap();
         assert_eq!(base_name(&inline_intro(), &pieces), "ntscalar_f64");
+    }
+
+    /// Updates of a waveform of 200 doubles beside a timestamp, with the
+    /// array kept whole.
+    fn waveform() -> (Vec<Vec<u8>>, Template) {
+        let mut obs = Vec::new();
+        let mut arrays = Vec::new();
+        for k in 0..10u32 {
+            let mut m = vec![0x02, 0x42, 0x00, 200];
+            let start = m.len();
+            for i in 0..200u32 {
+                m.extend_from_slice(&f64::from(i * k).to_le_bytes());
+            }
+            // The one array this message carries.
+            let array = start..m.len();
+            arrays.push(vec![array]);
+            m.extend_from_slice(&(1_787_174_889i64 + i64::from(k)).to_le_bytes());
+            m.extend_from_slice(&(157_360_595u32 + k * 7_919).to_le_bytes());
+            m.extend_from_slice(&[0u8; 5]);
+            obs.push(m);
+        }
+        let pieces = layout::layout_with_arrays(&obs, &arrays, 1024).unwrap();
+        let full = ntscalar_intro(1);
+        let t = template(
+            &Observed {
+                pv: "MIM:WF:0",
+                pieces: &pieces,
+                introspection_full: Some(&full),
+                introspection_id_only: None,
+                observations: obs.len() as u32,
+            },
+            "ntscalararray_f64a",
+        )
+        .unwrap();
+        (obs, t)
+    }
+
+    #[test]
+    fn past_the_budget_the_first_updates_are_kept_and_still_exact() {
+        let (obs, mut t) = waveform();
+        // 1600 B of array and 12 B of timestamp per update.
+        let kept = keep_samples(&mut t, 5_000).expect("past the budget");
+        assert_eq!(
+            kept,
+            Kept {
+                kept: 3,
+                of: 10,
+                per_observation: 1_612
+            }
+        );
+        assert!(t.slots.iter().all(|s| s.samples.len() == 3));
+        assert!(crate::shadow::verify(&t, &obs[..3]).passed());
+        // What is gone is gone: the fourth update is no longer carried.
+        assert!(!crate::shadow::verify(&t, &obs[..4]).passed());
+        // The count of what the template was learned from is unchanged.
+        assert_eq!(t.observations, 10);
+    }
+
+    #[test]
+    fn two_updates_are_kept_whatever_the_budget() {
+        let (_, mut t) = waveform();
+        assert_eq!(keep_samples(&mut t, 0).map(|k| k.kept), Some(2));
+    }
+
+    #[test]
+    fn a_template_within_the_budget_is_left_alone() {
+        let (_, mut t) = waveform();
+        let before = t.clone();
+        assert_eq!(keep_samples(&mut t, 4 << 20), None);
+        assert_eq!(t, before);
+
+        // A scalar's samples are far within any budget.
+        let (_, _, mut scalar) = built();
+        assert_eq!(keep_samples(&mut scalar, 4 << 20), None);
     }
 
     #[test]

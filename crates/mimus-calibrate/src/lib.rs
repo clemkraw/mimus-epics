@@ -28,9 +28,9 @@ pub mod layout;
 pub mod observe;
 pub mod shadow;
 
-pub use build::{BuildError, Namer, Observed, base_name, template};
+pub use build::{BuildError, Kept, Namer, Observed, base_name, keep_samples, template};
 pub use client::{ClientError, Descriptor, Settings, descriptor_key, descriptor_shape, observe};
 pub use diff::{DiffError, InferredSlot, Kind, changed_mask, infer};
-pub use layout::{Alignment, Piece, align, layout, rebuild};
+pub use layout::{Alignment, Piece, align, layout, layout_with_arrays, rebuild};
 pub use observe::{ChannelObserver, Criterion, Progress, Status, progress, status};
 pub use shadow::{Divergence, Report, verify};

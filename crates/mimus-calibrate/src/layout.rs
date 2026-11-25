@@ -27,6 +27,8 @@
 //! still be identified and populated with a live clock instead of being
 //! swallowed by a single opaque tail region.
 
+use std::ops::Range;
+
 use crate::diff::{self, DiffError, InferredSlot, Kind};
 
 /// A message segment: either constant bytes or a variable slot.
@@ -164,6 +166,103 @@ pub fn layout(observations: &[Vec<u8>]) -> Result<Vec<Piece>, DiffError> {
 
             Ok(out)
         }
+    }
+}
+
+/// Builds the layout of observations that carry large arrays, keeping each
+/// large array whole.
+///
+/// Compared byte by byte, a megabyte image is hundreds of thousands of
+/// one-byte slots, each with a sample per observation: a profile larger
+/// than the capture, describing nothing the bytes do not. Yet where the
+/// array lies is known: `arrays[k]` lists the arrays of observation `k`,
+/// as [`mimus_wire::pvdata::Descriptor::arrays`] finds them. An array of at
+/// least `min_bytes` in any observation becomes one slot of
+/// [`Kind::Array`], or fixed bytes if it never changed; the bytes around
+/// the arrays are laid out as [`layout`] lays out a whole message, so the
+/// timestamp beside an image is still found and filled live.
+///
+/// Observations that do not list the same number of arrays have no common
+/// structure to cut along; they are laid out byte by byte, as before.
+pub fn layout_with_arrays(
+    observations: &[Vec<u8>],
+    arrays: &[Vec<Range<usize>>],
+    min_bytes: usize,
+) -> Result<Vec<Piece>, DiffError> {
+    let count = arrays.first().map(Vec::len).unwrap_or(0);
+    if observations.len() < 2
+        || arrays.len() != observations.len()
+        || arrays.iter().any(|a| a.len() != count)
+    {
+        return layout(observations);
+    }
+    let large: Vec<usize> = (0..count)
+        .filter(|&i| arrays.iter().any(|a| a[i].len() >= min_bytes))
+        .collect();
+    if large.is_empty() {
+        return layout(observations);
+    }
+
+    let mut out = Vec::new();
+    let mut cursors = vec![0usize; observations.len()];
+    for &i in &large {
+        let before: Vec<Vec<u8>> = observations
+            .iter()
+            .zip(arrays)
+            .zip(&cursors)
+            .map(|((o, a), &c)| o[c..a[i].start].to_vec())
+            .collect();
+        push_laid_out(&mut out, &before)?;
+
+        let samples: Vec<Vec<u8>> = observations
+            .iter()
+            .zip(arrays)
+            .map(|(o, a)| o[a[i].clone()].to_vec())
+            .collect();
+        if samples.windows(2).all(|w| w[0] == w[1]) {
+            push_fixed(&mut out, &samples[0]);
+        } else {
+            out.push(Piece::Slot(InferredSlot {
+                range: 0..samples[0].len(),
+                kind: Kind::Array,
+                samples,
+            }));
+        }
+        for (c, a) in cursors.iter_mut().zip(arrays) {
+            *c = a[i].end;
+        }
+    }
+    let after: Vec<Vec<u8>> = observations
+        .iter()
+        .zip(&cursors)
+        .map(|(o, &c)| o[c..].to_vec())
+        .collect();
+    push_laid_out(&mut out, &after)?;
+    Ok(out)
+}
+
+/// Appends the layout of one stretch between arrays, merging constant
+/// bytes with the constant bytes before them.
+fn push_laid_out(out: &mut Vec<Piece>, windows: &[Vec<u8>]) -> Result<(), DiffError> {
+    if windows.iter().all(Vec::is_empty) {
+        return Ok(());
+    }
+    for piece in layout(windows)? {
+        match piece {
+            Piece::Fixed(bytes) => push_fixed(out, &bytes),
+            slot => out.push(slot),
+        }
+    }
+    Ok(())
+}
+
+fn push_fixed(out: &mut Vec<Piece>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    match out.last_mut() {
+        Some(Piece::Fixed(prev)) => prev.extend_from_slice(bytes),
+        _ => out.push(Piece::Fixed(bytes.to_vec())),
     }
 }
 
@@ -366,6 +465,107 @@ mod tests {
         for (k, expected) in obs.iter().enumerate() {
             assert_eq!(&rebuild(&pieces, k), expected);
         }
+    }
+
+    /// Waveform updates as an NTScalarArray of doubles sends them: a
+    /// changed set, the array's size and elements, the timestamp, the
+    /// overrun set. Each lists where its array lies.
+    fn waveform_channel(len: usize) -> (Vec<Vec<u8>>, Vec<Vec<Range<usize>>>) {
+        let mut obs = Vec::new();
+        let mut arrays = Vec::new();
+        for k in 0..5u32 {
+            let mut m = vec![0x02, 0x42, 0x00];
+            m.push(len as u8);
+            let start = m.len();
+            for i in 0..len {
+                m.extend_from_slice(&((i as f64) * 0.5 + f64::from(k)).to_le_bytes());
+            }
+            // The one array this message carries.
+            let array = start..m.len();
+            arrays.push(vec![array]);
+            m.extend_from_slice(&(1_787_174_889i64 + i64::from(k)).to_le_bytes());
+            m.extend_from_slice(&(157_360_595u32 + k * 7_919).to_le_bytes());
+            m.extend_from_slice(&[0u8; 5]);
+            obs.push(m);
+        }
+        (obs, arrays)
+    }
+
+    #[test]
+    fn a_large_array_is_one_slot_and_the_stamp_beside_it_is_still_found() {
+        let (obs, arrays) = waveform_channel(100);
+        let pieces = layout_with_arrays(&obs, &arrays, 512).unwrap();
+        let kinds: Vec<Kind> = pieces
+            .iter()
+            .filter_map(|p| p.as_slot())
+            .map(|s| s.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![Kind::Array, Kind::TimestampSeconds, Kind::TimestampNanos]
+        );
+        for (k, original) in obs.iter().enumerate() {
+            assert_eq!(&rebuild(&pieces, k), original, "observation {k}");
+        }
+    }
+
+    #[test]
+    fn a_small_array_is_compared_byte_by_byte_as_before() {
+        let (obs, arrays) = waveform_channel(10);
+        assert_eq!(
+            layout_with_arrays(&obs, &arrays, 512).unwrap(),
+            layout(&obs).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_array_that_never_changed_is_fixed_bytes_merged_with_its_neighbours() {
+        let (mut obs, arrays) = waveform_channel(100);
+        let first = obs[0][arrays[0][0].clone()].to_vec();
+        for (o, a) in obs.iter_mut().zip(&arrays) {
+            o[a[0].clone()].copy_from_slice(&first);
+        }
+        let pieces = layout_with_arrays(&obs, &arrays, 512).unwrap();
+        assert!(matches!(&pieces[0], Piece::Fixed(b) if b.len() == 4 + 800));
+        for (k, original) in obs.iter().enumerate() {
+            assert_eq!(&rebuild(&pieces, k), original, "observation {k}");
+        }
+    }
+
+    #[test]
+    fn arrays_of_varying_length_keep_every_byte() {
+        let mut obs = Vec::new();
+        let mut arrays = Vec::new();
+        for len in [600usize, 700, 650] {
+            let mut m = vec![0x01, 0x02];
+            m.extend_from_slice(&(len as u16).to_le_bytes());
+            let start = m.len();
+            m.extend((0..len).map(|i| (i * len) as u8));
+            // The one array this message carries.
+            let array = start..m.len();
+            arrays.push(vec![array]);
+            m.extend_from_slice(&[9, 9, 0]);
+            obs.push(m);
+        }
+        let pieces = layout_with_arrays(&obs, &arrays, 512).unwrap();
+        for (k, original) in obs.iter().enumerate() {
+            assert_eq!(&rebuild(&pieces, k), original, "observation {k}");
+        }
+        assert!(
+            pieces
+                .iter()
+                .any(|p| p.as_slot().is_some_and(|s| s.kind == Kind::Array))
+        );
+    }
+
+    #[test]
+    fn observations_without_a_common_structure_are_laid_out_byte_by_byte() {
+        let (obs, mut arrays) = waveform_channel(100);
+        arrays[2].clear();
+        assert_eq!(
+            layout_with_arrays(&obs, &arrays, 512).unwrap(),
+            layout(&obs).unwrap()
+        );
     }
 
     #[test]
