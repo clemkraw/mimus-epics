@@ -198,6 +198,31 @@ impl Descriptor {
         Ok(Located { value_end, stamp })
     }
 
+    /// Names the top-level fields a changed set touches, in the order the
+    /// type lists them: `value`, `alarm` and `timeStamp` for an update that
+    /// crosses an alarm limit. `bits` holds the changed set's bytes, without
+    /// the size before them. A set with the structure's own bit names every
+    /// field.
+    pub fn changed_fields(&self, bits: &[u8]) -> Vec<String> {
+        let mut words = vec![0u64; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            words[i / 8] |= u64::from(b) << (8 * (i % 8));
+        }
+        let Kind::Struct { fields } = &self.root.kind else {
+            return Vec::new();
+        };
+        let whole = next_set(&words, 0) == Some(0);
+        let mut out = Vec::new();
+        let mut off = 1;
+        for (name, f) in fields {
+            if whole || next_set(&words, off).is_some_and(|b| b < off + f.span) {
+                out.push(name.clone());
+            }
+            off += f.span;
+        }
+        out
+    }
+
     /// Writes a timestamp at the given offsets, using the descriptor's byte order.
     pub fn write_stamp(&self, body: &mut [u8], at: (usize, usize), seconds: i64, nanos: i32) {
         let (s, n) = at;
@@ -598,6 +623,21 @@ mod tests {
             assert_eq!(&body[s..s + 8], &1_794_812_962i64.to_le_bytes());
             assert_eq!(&body[n..n + 4], &530_111_386i32.to_le_bytes());
         }
+    }
+
+    #[test]
+    fn a_changed_set_is_named_by_the_fields_it_touches() {
+        let d = Descriptor::from_init_reply(&ntscalar_descriptor(), LE).unwrap();
+        // Bits 1, 7, 8, 9: an ordinary update.
+        assert_eq!(d.changed_fields(&[0x82, 0x03]), ["value", "timeStamp"]);
+        // Bits 1, 3, 4, 5, 7, 8: an alarm limit crossed.
+        assert_eq!(
+            d.changed_fields(&[0xBA, 0x01]),
+            ["value", "alarm", "timeStamp"]
+        );
+        // Bit 0: the whole structure, as an opening message sends it.
+        assert_eq!(d.changed_fields(&[0x01]), ["value", "alarm", "timeStamp"]);
+        assert!(d.changed_fields(&[]).is_empty());
     }
 
     #[test]

@@ -108,6 +108,9 @@ pub struct Compiled {
     /// updates. Without the initial value, fields that never change remain
     /// undefined for the lifetime of the connection.
     pub initial: Option<Box<Compiled>>,
+    /// The update that carries an alarm transition, if calibration learned
+    /// one for this type.
+    pub alarm: Option<Box<Compiled>>,
     /// Monitor INIT bytes for the first channel of this type on a
     /// connection. Replayed verbatim without parsing.
     pub intro_full: Vec<u8>,
@@ -298,6 +301,10 @@ impl Compiled {
             Some(inner) => Some(Box::new(Compiled::new(inner)?)),
             None => None,
         };
+        let alarm = match template.alarm_variant() {
+            Some(v) => Some(Box::new(Compiled::new(v)?)),
+            None => None,
+        };
 
         let (intro_full, intro_id_only) = match &template.introspection {
             Some(i) => (i.full.clone(), i.id_only.clone()),
@@ -307,6 +314,7 @@ impl Compiled {
         Ok(Self {
             name: template.name.clone(),
             initial,
+            alarm,
             intro_full,
             intro_id_only,
             layout,

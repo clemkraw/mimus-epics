@@ -2796,3 +2796,109 @@ async fn channels_with_an_activity_model_post_in_bursts_and_fall_silent() {
         "what was not sent is counted as quiet"
     );
 }
+
+// ---------------------------------------------------------------- alarms
+
+/// A profile whose `dbl` type carries an alarm variant: changed set
+/// `03 ba 01`, then the value, a severity that goes 1, 2, 1, 0 as recorded,
+/// and the timestamp.
+fn alarm_fleet(pvs: u32) -> Arc<Fleet> {
+    let mut p = profile();
+    let mut alarm = Template::new("dbl+alarm", MONITOR);
+    alarm
+        .with_introspection(p.templates[0].introspection.clone().unwrap())
+        .push_fixed(vec![0x03, 0xBA, 0x01])
+        .push_slot(
+            Slot::new(1, SlotWidth::Fixed { bytes: 8 }).with_samples(
+                [11.0f64, 12.0, 13.0, 14.0]
+                    .iter()
+                    .map(|v| v.to_le_bytes().to_vec())
+                    .collect(),
+            ),
+        )
+        .push_slot(
+            Slot::new(2, SlotWidth::Fixed { bytes: 4 }).with_samples(
+                [1i32, 2, 1, 0]
+                    .iter()
+                    .map(|s| s.to_le_bytes().to_vec())
+                    .collect(),
+            ),
+        )
+        .push_slot(
+            Slot::new(3, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds),
+        )
+        .push_slot(Slot::new(4, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos));
+    alarm.observations = 4;
+    alarm.changes = vec!["value".into(), "alarm".into(), "timeStamp".into()];
+    p.templates[0].with_variant(alarm);
+    p.validate(0).unwrap();
+    let spec = FleetSpec {
+        iocs: 1,
+        pvs,
+        layout: Layout::Blocked,
+        mix: vec![("dbl".into(), 1)],
+        rate_mix: mimus_emit::RateMix::uniform(1.0),
+        names: mimus_serve::NameTemplate::default_pattern("MIM"),
+    };
+    Arc::new(Fleet::build(&p, &spec).unwrap())
+}
+
+#[tokio::test]
+async fn alarm_transitions_are_sent_in_place_of_ordinary_updates_in_the_order_recorded() {
+    // At 50 Hz, 36 000 transitions an hour is one update in five.
+    let f = alarm_fleet(1);
+    let stages = mimus_serve::Stages::new(1);
+    let cfg = SessionConfig {
+        alarms: Some(36_000.0),
+        ..fast_config()
+    };
+    let (addr, totals) = start_staged(Arc::clone(&f), cfg, &stages).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let ids = c.subscribe_all(&f.names).await;
+
+    let got = c
+        .collect_updates(ids[0], 1000, Duration::from_secs(2))
+        .await;
+    let alarms: Vec<&Vec<u8>> = got
+        .iter()
+        .filter(|b| b[..3] == [0x03, 0xBA, 0x01])
+        .collect();
+    let ordinary = got.iter().filter(|b| b[..3] == [0x03, 0x83, 0x01]).count();
+    assert_eq!(alarms.len() + ordinary, got.len(), "only the two shapes");
+    assert!(
+        (8..=40).contains(&alarms.len()),
+        "about one in five of {}: {}",
+        got.len(),
+        alarms.len()
+    );
+    let severities: Vec<i32> = alarms
+        .iter()
+        .map(|b| i32::from_le_bytes(b[11..15].try_into().unwrap()))
+        .collect();
+    let recorded = [1, 2, 1, 0];
+    for (k, s) in severities.iter().enumerate() {
+        assert_eq!(
+            *s,
+            recorded[k % 4],
+            "transition {k} out of order: {severities:?}"
+        );
+    }
+    assert_eq!(totals.snapshot().alarms, alarms.len() as u64);
+}
+
+#[tokio::test]
+async fn without_alarms_asked_for_the_variant_is_never_sent() {
+    let f = alarm_fleet(1);
+    let stages = mimus_serve::Stages::new(1);
+    let (addr, totals) = start_staged(Arc::clone(&f), fast_config(), &stages).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let ids = c.subscribe_all(&f.names).await;
+    let got = c
+        .collect_updates(ids[0], 1000, Duration::from_millis(600))
+        .await;
+    assert!(!got.is_empty());
+    assert!(got.iter().all(|b| b[..3] == [0x03, 0x83, 0x01]));
+    assert_eq!(totals.snapshot().alarms, 0);
+}

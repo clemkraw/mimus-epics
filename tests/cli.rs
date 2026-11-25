@@ -366,6 +366,11 @@ fn options_that_cannot_work_are_refused_before_serving() {
         (&["--report", missing_dir.to_str().unwrap()], "--report"),
         (&["--activity", "0.9:2"], "--activity"),
         (&["--activity", "0"], "--activity"),
+        (&["--alarms", "0"], "--alarms"),
+        (
+            &["--alarms", "2"],
+            "no template served carries an alarm transition",
+        ),
     ];
     for (extra, expect) in cases {
         let mut args = vec!["serve", "-p", p, "--search-port", "0", "--base-port", "0"];

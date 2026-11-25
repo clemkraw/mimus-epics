@@ -23,6 +23,7 @@ use mimus_calibrate::build::Observed;
 use mimus_calibrate::observe::{Criterion, Status, progress, status};
 use mimus_calibrate::{Settings, build, layout, shadow};
 use mimus_profile::{Assignment, Manifest, Profile, SessionRules, Template};
+use mimus_wire::header::ByteOrder;
 
 /// Everything the command needs.
 pub struct Args {
@@ -645,6 +646,95 @@ pub fn run(args: Args) -> i32 {
         );
         verified += 1;
 
+        // ---- the type's other updates -----------------------------------
+        //
+        // A channel whose alarm changes sends an update with more in its
+        // changed set than the ordinary one: `alarm` as well as `value` and
+        // `timeStamp`. The catalogue's MIM:ALM channels cross their limits
+        // for that. Every channel of the type is searched for such updates,
+        // and each other changed set seen in at least two distinct bodies is
+        // templated and checked as the ordinary update was, as a variant.
+        let descriptor =
+            mimus_wire::pvdata::Descriptor::from_init_reply(descriptor_bytes, ByteOrder::Little)
+                .ok();
+        let fields = |bits: &[u8]| {
+            descriptor
+                .as_ref()
+                .map(|d| d.changed_fields(bits))
+                .unwrap_or_default()
+        };
+        let main_key = all_shapes
+            .first()
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default();
+        template.changes = fields(&main_key);
+        let mut others: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        for i in members {
+            let o = &observers[*i];
+            let opening = o.opening_changed_set();
+            for (key, group) in o.by_changed_set() {
+                if key == main_key || opening.as_ref() == Some(&key) {
+                    continue;
+                }
+                let bodies = others.entry(key).or_default();
+                // Distinct bodies, in the order they arrived: replayed in
+                // that order, transitions follow one another as observed.
+                for body in group {
+                    if !bodies.contains(&body) {
+                        bodies.push(body);
+                    }
+                }
+            }
+        }
+        for (key, group) in others {
+            let changes = fields(&key);
+            let label = variant_label(&template.changes, &changes, &key);
+            let vname = format!("{name}+{label}");
+            if group.len() < 2 {
+                if args.debug {
+                    out!("    {vname:<26} seen once: nothing to compare it with, left out");
+                }
+                continue;
+            }
+            let variant = layout::layout(&group)
+                .map_err(|e| e.to_string())
+                .and_then(|pieces| {
+                    build::template(
+                        &Observed {
+                            pv: &first.pv,
+                            pieces: &pieces,
+                            introspection_full: Some(descriptor_bytes),
+                            introspection_id_only: cached,
+                            observations: group.len() as u32,
+                        },
+                        vname.clone(),
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            let mut variant = match variant {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("    {vname}: left out: {e}");
+                    continue;
+                }
+            };
+            variant.changes = changes;
+            let v = shadow::verify(&variant, &group);
+            if !v.passed() {
+                eprintln!("    {vname}: left out, the shadow check failed");
+                for d in v.divergences.iter().take(3) {
+                    eprintln!("      {d}");
+                }
+                continue;
+            }
+            out!(
+                "    + {vname:<26}      {:>4} updates  {}",
+                group.len(),
+                v.summary()
+            );
+            template.with_variant(variant);
+        }
+
         for i in members {
             profile.assignments.push(Assignment {
                 pv: observers[*i].pv.clone(),
@@ -748,6 +838,29 @@ pub fn run(args: Args) -> i32 {
     0
 }
 
+/// Names a variant by the fields it changes beyond the ordinary update:
+/// `alarm` for an alarm transition. Without the fields, by its changed set.
+fn variant_label(ordinary: &[String], changes: &[String], bits: &[u8]) -> String {
+    let extra: Vec<&str> = changes
+        .iter()
+        .filter(|f| !ordinary.contains(f))
+        .map(String::as_str)
+        .collect();
+    if !extra.is_empty() {
+        return extra.join("+");
+    }
+    let missing: Vec<&str> = ordinary
+        .iter()
+        .filter(|f| !changes.contains(f))
+        .map(String::as_str)
+        .collect();
+    if !changes.is_empty() && !missing.is_empty() {
+        return format!("without-{}", missing.join("-"));
+    }
+    let hex: Vec<String> = bits.iter().map(|b| format!("{b:02x}")).collect();
+    format!("set-{}", hex.join(""))
+}
+
 /// Writes `text` to `path` so that the file is either the old one or the
 /// new one, never a part of the new one: the text goes to a file beside it,
 /// which then replaces it in one step. A profile from a previous calibration
@@ -811,6 +924,30 @@ mod tests {
         p.push(format!("mimus-{label}-{}-{unique}.tmp", std::process::id()));
         std::fs::write(&p, contents).expect("temp file");
         p
+    }
+
+    #[test]
+    fn a_variant_is_named_by_what_it_changes_beyond_the_ordinary_update() {
+        let ordinary: Vec<String> = vec!["value".into(), "timeStamp".into()];
+        let with = |f: &[&str]| f.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            variant_label(
+                &ordinary,
+                &with(&["value", "alarm", "timeStamp"]),
+                &[0xBA, 0x01]
+            ),
+            "alarm"
+        );
+        assert_eq!(
+            variant_label(&ordinary, &with(&["timeStamp"]), &[0x80, 0x03]),
+            "without-value"
+        );
+        assert_eq!(
+            variant_label(&ordinary, &ordinary, &[0xC0, 0x9D]),
+            "set-c09d",
+            "same fields, other members: named by the set"
+        );
+        assert_eq!(variant_label(&[], &[], &[0x01]), "set-01");
     }
 
     #[test]

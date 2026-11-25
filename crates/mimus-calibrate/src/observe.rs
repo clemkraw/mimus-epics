@@ -144,6 +144,12 @@ impl ChannelObserver {
         self.first_update.as_ref()
     }
 
+    /// Returns the changed set of the opening message: every field, in the
+    /// form the server marks a complete value with.
+    pub fn opening_changed_set(&self) -> Option<Vec<u8>> {
+        self.first_update.as_deref().and_then(leading_bitset)
+    }
+
     pub fn total_updates(&self) -> u64 {
         self.total_updates
     }

@@ -169,6 +169,7 @@ mimus demo-profile  write a hand-made profile for trying the server out
 | `--iocs` | `1` | Virtual IOCs, one listening port each. A consumer typically runs one task per connection, so this caps how far its work can spread across cores |
 | `--rate-hz` | `1` | Updates per second per channel. Offered load is `pvs × rate` |
 | `--rate-mix` | - | Several rates at once: `10:2,1:60,0.1:38` puts 2 % of channels at 10 Hz, 60 % at 1 Hz, 38 % at 0.1 Hz. Shares are relative. Overrides `--rate-hz` |
+| `--alarms` | - | Alarm transitions per channel and per hour, on the channels whose type carries one: the transitions the reference IOC sent, learned by calibration and sent in place of an ordinary update (see [Alarm transitions](#alarm-transitions)) |
 | `--activity` | every update sent | Channels post in bursts and fall silent in between, as behind a monitor deadband: `0.3:20` keeps each channel active 30 % of the time, in bursts of 20 updates on average (see [Irregular updates](#irregular-updates)) |
 | `--mix` | every template, equal shares | Which templates to serve and in what proportion: `ntscalar_f64:3,ntscalar_i32:1` |
 | `--layout` | `blocked` | `blocked` gives each IOC a contiguous range of channels, as a facility does; `round-robin` interleaves them, each IOC still getting every template and rate of the mix |
@@ -253,6 +254,14 @@ A real IOC does not post every channel like a clock. A monitor with a deadband s
 `--activity FRACTION:BURST` gives every channel that behavior. A channel is either active, and sends each update it is due, or quiet, and sends none. After each update it is due, an active channel falls quiet with probability `1/BURST`, and a quiet one wakes at the rate that keeps it active `FRACTION` of the time. Its bursts then last `BURST` updates on average, its silences `BURST × (1 − FRACTION) / FRACTION`, and it sends `FRACTION` of what its rate asks, which is the offered load MIMUS reports. The draws come from the channel's seed and the count of updates it was due, so the same channel goes through the same bursts and silences on every run.
 
 What a quiet channel does not send is counted as `quiet`, not as a loss: an IOC would not have sent it either. Bursts asked for by a scenario send from every channel they select, quiet or not.
+
+### Alarm transitions
+
+An update that crosses an alarm limit carries more than the ordinary one: the alarm's severity, status and message, besides the value and the timestamp. An archiver that indexes alarms, or a display that colors them, takes a path the ordinary update never exercises.
+
+Calibration learns these updates from the reference IOC. Besides the ordinary update of each type, it templates and checks, as **variants**, the other changed-sets the channels of that type sent; the catalogue's `MIM:ALM:*` channels cross their limits for that purpose (see the [catalogue README](catalogue/README.md#from-catalogue-to-profile)). `mimus inspect` lists the variants under their template.
+
+`--alarms N` sends the alarm variant N times per channel and per hour, on average, in place of an ordinary update, on every channel whose type has one. The transitions follow one another as the IOC sent them, a raise and later its clear, each with its own value, severity, status and message, and `pvxmonitor` shows them as it shows the IOC's. Which updates carry one comes from the channel's seed, so the same channels alarm at the same moments on every run. A profile calibrated before MIMUS learned variants has none, and `--alarms` says so.
 
 ### Scenarios
 
@@ -347,6 +356,7 @@ MIMUS knows exactly what it put on the wire. On exit it prints a summary and, wi
 | `wheel_steps` | Turns of the timing wheel, to tell a wheel turning at the wrong speed from a wrong population |
 | `held`, `burst` | Under a scenario: updates that fell due while their IOC was frozen and were never sent, and updates sent by bursts and resumes, a part of `emitted` |
 | `quiet` | Under `--activity`: updates due while the channel was quiet, and so not sent |
+| `alarms` | Under `--alarms`: updates that carried an alarm transition, a part of `emitted` |
 | `scenario` | The scenario played, phase by phase, with its restarts' recovery times; `null` without one |
 | `profile`, `run` | The manifest: what was served, and with which options |
 
@@ -408,9 +418,10 @@ For every type it observed, a profile reproduces:
 
 - the exact type descriptor;
 - the **opening message** of a subscription or a `GET`, taken from the opening messages the reference IOC sent for that type, with its timestamp set to the channel's last processing time. Opening messages rotate across the served channels, so limits, units, enum choices and alarm states vary as they did on the IOC;
-- a stream of **steady-state updates** in the shape the IOC used most for that type, typically value and timestamp, at the rate chosen when serving. Length changes are reproduced: a string whose length moves between updates stays variable.
+- a stream of **steady-state updates** in the shape the IOC used most for that type, typically value and timestamp, at the rate chosen when serving. Length changes are reproduced: a string whose length moves between updates stays variable;
+- the type's **other update shapes**, each seen in at least two bodies, as variants, among them the **alarm transitions**, which `--alarms` sends.
 
-What it does not reproduce yet, by design of the current calibration: channels that stay static, alarm transitions, and the less frequent update shapes of a type. [The catalogue README](catalogue/README.md#from-catalogue-to-profile) gives the detail.
+What it does not reproduce: channels that stay static, and the update shapes seen only once. [The catalogue README](catalogue/README.md#from-catalogue-to-profile) gives the detail.
 
 ### Session rules
 
@@ -420,7 +431,7 @@ A profile is more than a bag of bytes. It also records what the reference server
 
 - **The monitor path, plus `GET` and `GET_FIELD`.** The monitor path dominates a long-running client's workload; the two read commands make `pvxget` and `pvxinfo` work against MIMUS, which turns the standard PVXS tools into an independent conformance check. `PUT` and `RPC` are out of scope and answered with an error, and MIMUS sends no beacons.
 - **PVXS (QSRV2) only.** QSRV1 puts different bytes on the wire for the same record; a profile calibrated against one is wrong against the other.
-- **One update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape. Static channels of a type that also has a moving channel update at the serving rate (`--rate-hz` must be positive); a type whose every channel was static gets a static template, whose channels send their opening message and nothing after it, as on the IOC. A channel keeps the alarm state of its opening message.
+- **One ordinary update shape per type.** Every channel of a type replays the same recorded values in a loop, in the type's most frequent shape; the alarm variant replaces it only under `--alarms`, and the other variants are recorded but not sent. Static channels of a type that also has a moving channel update at the serving rate (`--rate-hz` must be positive); a type whose every channel was static gets a static template, whose channels send their opening message and nothing after it, as on the IOC. Without `--alarms`, a channel keeps the alarm state of its opening message.
 - **Structure is replicated; IOC dynamics are not.** Scan jitter under host load and monitor-queue behavior are properties *of an IOC*, and MIMUS deliberately does not reproduce them: a measurement rig wants a deterministic, reproducible offered load. Where IOC behavior does affect the client (overflow policy), it is exposed as `--backpressure`.
 - **A profile is bound to a version.** Its manifest records the PVXS and EPICS base versions, a checksum of each catalogue database, the host, the date and the MIMUS version. Comparing profiles across PVXS releases is, incidentally, a wire-behavior change detector.
 - **Calibrate at small scale, generate at large scale.** The shipped catalogue has fewer than a hundred channels, enough to cover every type. Replication to millions happens afterwards, without the reference IOC.

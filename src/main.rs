@@ -132,6 +132,17 @@ struct ServeArgs {
     #[arg(long)]
     activity: Option<String>,
 
+    /// Send alarm transitions: this many per channel and per hour, on the
+    /// channels whose type carries one. `2` gives each such channel two an
+    /// hour on average: a raise, and later its clear.
+    ///
+    /// The transitions are those the reference IOC sent, learned by
+    /// `mimus calibrate` from the catalogue's channels that cross their alarm
+    /// limits, and replayed in the order observed. A consumer that indexes
+    /// or alerts on alarms is measured on a path it otherwise never takes.
+    #[arg(long)]
+    alarms: Option<f64>,
+
     /// Pattern for channel names. Tokens, each in braces: `i` global index,
     /// `ioc` IOC index, `n` index within the IOC, `t` template name. A width
     /// zero-pads, as in `{i:06}`. The default is `{prefix}:{t}:{i}`, with
@@ -506,6 +517,12 @@ fn run_serve(args: ServeArgs) -> i32 {
         eprintln!("error: --rate-hz / --rate-mix / --tick-us: {e}");
         return 1;
     }
+    if let Some(n) = args.alarms
+        && !(n.is_finite() && n > 0.0)
+    {
+        eprintln!("error: --alarms: {n} is not a positive number of transitions per hour");
+        return 1;
+    }
     let activity = match args.activity.as_deref().map(Activity::parse) {
         None => None,
         Some(Ok(a)) => Some(a),
@@ -614,6 +631,21 @@ fn run_serve(args: ServeArgs) -> i32 {
     for (name, why) in fleet.unstamped_openings() {
         eprintln!("warning: {name}: opening message sent with its recorded timestamp: {why}");
     }
+    // Channels that can carry an alarm transition: those whose type has one.
+    let alarm_channels = fleet
+        .instances
+        .iter()
+        .filter(|i| fleet.templates[usize::from(i.template)].alarm.is_some())
+        .count() as u64;
+    if args.alarms.is_some() && alarm_channels == 0 {
+        eprintln!(
+            "error: --alarms: no template served carries an alarm transition. A profile \
+             learns them from the catalogue's MIM:ALM channels; recalibrate with this \
+             version of MIMUS, and check that --mix keeps a type that has one \
+             (`mimus inspect` lists them)"
+        );
+        return 1;
+    }
 
     let cfg = SessionConfig {
         buffer_size: profile.session_rules.server_buffer_size,
@@ -636,6 +668,7 @@ fn run_serve(args: ServeArgs) -> i32 {
             .map(|_| mimus_serve::Stages::new(args.iocs)),
         headroom,
         activity,
+        alarms: args.alarms,
         ..Default::default()
     };
 
@@ -682,6 +715,7 @@ fn run_serve(args: ServeArgs) -> i32 {
         backpressure: args.backpressure.to_string(),
         tick_us: args.tick_us,
         activity,
+        alarms: args.alarms.map(|n| (n, alarm_channels)),
         scenario: scenario.as_ref().map(|s| report::ScenarioSummary {
             name: s.name.clone(),
             file: args.scenario.clone().unwrap_or_default(),
@@ -958,6 +992,19 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
             format!("{}..{} B variable", t.min_len(), t.max_len())
         };
         out!("{name:<24} {pvs:>6} {:>6}  {shape}", t.observations);
+        for v in &t.variants {
+            let changes = if v.changes.is_empty() {
+                String::new()
+            } else {
+                format!(", changes {}", v.changes.join(", "))
+            };
+            out!(
+                "  + {:<20} {:>6} {:>6}  variant{changes}",
+                v.name.strip_prefix(name).unwrap_or(&v.name),
+                "",
+                v.observations
+            );
+        }
     }
 
     if let Some(share) = profile.session_rules.dominant_share() {
@@ -966,7 +1013,17 @@ fn run_inspect(path: &std::path::Path, diff: Option<&std::path::Path>) -> i32 {
             "dominant changed-set covers {:.1}% of observed updates",
             share * 100.0
         );
-        if share < 0.95 {
+        let alarms = profile
+            .templates
+            .iter()
+            .filter(|t| t.alarm_variant().is_some())
+            .count();
+        if alarms > 0 {
+            out!(
+                "{alarms} template(s) carry an alarm transition, which `serve --alarms` \
+                 sends in place of an ordinary update"
+            );
+        } else if share < 0.95 {
             out!(
                 "  note: a large minority of updates use other patterns; emitting only \
                  the dominant one would leave decode paths untested"

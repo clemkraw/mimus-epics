@@ -46,6 +46,9 @@ pub struct Counters {
     /// had it quiet, as a value that moved less than its deadband. Not a
     /// loss: an IOC would not have sent them either.
     pub quiet: u64,
+    /// Updates that carried an alarm transition under `--alarms`: a part of
+    /// `emitted`.
+    pub alarms: u64,
 }
 
 impl Counters {
@@ -82,6 +85,7 @@ impl Counters {
         self.held += other.held;
         self.burst += other.burst;
         self.quiet += other.quiet;
+        self.alarms += other.alarms;
     }
 
     /// Returns what was counted between `earlier` and these totals.
@@ -105,6 +109,7 @@ impl Counters {
             held: self.held.saturating_sub(earlier.held),
             burst: self.burst.saturating_sub(earlier.burst),
             quiet: self.quiet.saturating_sub(earlier.quiet),
+            alarms: self.alarms.saturating_sub(earlier.alarms),
         }
     }
 }
@@ -216,6 +221,7 @@ mod tests {
             held: 7,
             burst: 8,
             quiet: 9,
+            alarms: 10,
         };
         a.merge(&Counters {
             emitted: 10,
@@ -228,6 +234,7 @@ mod tests {
             held: 70,
             burst: 80,
             quiet: 90,
+            alarms: 100,
         });
         assert_eq!(
             a,
@@ -242,6 +249,7 @@ mod tests {
                 held: 77,
                 burst: 88,
                 quiet: 99,
+                alarms: 110,
             }
         );
     }

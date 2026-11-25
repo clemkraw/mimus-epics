@@ -33,6 +33,9 @@ pub struct RunSummary {
     pub tick_us: u64,
     /// How channels alternate bursts and silences, if they do.
     pub activity: Option<mimus_emit::Activity>,
+    /// Alarm transitions per channel per hour, and the channels that can
+    /// carry one.
+    pub alarms: Option<(f64, u64)>,
     /// The scenario played, if any.
     pub scenario: Option<ScenarioSummary>,
 }
@@ -84,6 +87,13 @@ pub fn print_banner(
         run.offered_eps,
         run.backpressure
     );
+    if let Some((per_hour, channels)) = run.alarms {
+        out!(
+            "alarms {per_hour} per channel per hour, on the {channels} channels whose \
+             type carries a transition: about {:.2}/s in all",
+            per_hour * channels as f64 / 3600.0
+        );
+    }
     if let Some(a) = run.activity.filter(|a| !a.is_constant()) {
         out!(
             "activity {a}: each channel active {}% of the time, in bursts of {} updates \
@@ -237,6 +247,7 @@ pub fn finish(
             "held": counters.held,
             "burst": counters.burst,
             "quiet": counters.quiet,
+            "alarms": counters.alarms,
             "bytes": counters.bytes,
             "elapsed_s": elapsed_s,
             "achieved_eps": achieved,
@@ -254,6 +265,8 @@ pub fn finish(
                 "tick_us": run.tick_us,
                 "mix": run.mix,
                 "activity": run.activity.map(|a| a.to_string()),
+                "alarms_per_hour": run.alarms.map(|(n, _)| n),
+                "alarm_channels": run.alarms.map(|(_, c)| c),
             },
             "scenario": scenario_json(run, played),
             "profile": {
@@ -282,6 +295,9 @@ pub fn finish(
     }
     if counters.quiet > 0 {
         out!("quiet (activity)   {:>14}", counters.quiet);
+    }
+    if counters.alarms > 0 {
+        out!("alarm transitions  {:>14}", counters.alarms);
     }
     if sessions.closed_down > 0 {
         out!("closed by restarts {:>14}", sessions.closed_down);
@@ -389,6 +405,7 @@ fn scenario_json(run: &RunSummary, played: Option<&Played>) -> serde_json::Value
             "held": p.counters.held,
             "burst": p.counters.burst,
             "quiet": p.counters.quiet,
+            "alarms": p.counters.alarms,
             "late_ticks": p.counters.late_ticks,
             "flow_control_holds": p.counters.flow_control_holds,
             "closed": p.closed,

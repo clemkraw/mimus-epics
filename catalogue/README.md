@@ -117,17 +117,19 @@ these, because each exercises a decode path nothing else reaches:
   HIHI and LOLO. `MIM:INVALID:*` read a record that does not exist, which
   gives INVALID with a link alarm.
 
-A profile reproduces the first; the next section says when it reproduces
-the second, and why not the last two.
+A profile reproduces the first and the alarm transitions; the next section
+says when it reproduces the second, and why not the static channels.
 
 ## From catalogue to profile
 
 `mimus calibrate` groups the channels by type descriptor and builds **one
 template per type**, from the first channel of that type in `channels.txt`
 and its most frequent steady-state changed-set. The opening messages of
-all the channels of the type go into the template's opening message; their
-later updates are not used. Every channel of the type is assigned to the
-template.
+all the channels of the type go into the template's opening message. Their
+later updates are searched for other changed-sets: each one seen in at
+least two distinct bodies is templated and checked the same way, as a
+**variant** of the type, named by the fields it changes beyond the ordinary
+update. Every channel of the type is assigned to the template.
 
 `channels.txt` is ordered for that rule: each type lists a moving channel
 before its static ones, and the strings list the variable-length
@@ -141,16 +143,33 @@ whatever lengths it happened to see. Started later, it sees them full and
 templates them at 64 elements. Only the second gives the same profile
 twice: start the IOC, wait at least 70 s, then calibrate.
 
+**Alarm transitions.** The `MIM:ALM:*` channels are of the same type as
+`MIM:F64:*`, so their limit crossings become the `alarm` variant of
+`ntscalar_f64`: in one calibration, ten distinct transitions through
+`HIGH`, `HIHI`, `LOW` and back, each reproduced exactly. `mimus inspect`
+lists it under its template, and `mimus serve --alarms N` sends it, N times
+per channel and per hour, in place of an ordinary update. The transitions
+follow one another in the order the IOC sent them, each with the value, the
+severity, the status and the message it had; between them, the value
+follows the ordinary update's replay, so a channel can read a value inside
+its limits while its last transition left it in `MAJOR`.
+
+A group structure such as `nttable_f64` changes `alarm` in every update. It
+gets a variant for the updates that move other members, named by its
+changed-set since the fields it touches are the same, and no alarm
+transition.
+
 What a profile does not reproduce:
 
 - **Static channels.** Every type here has a moving channel listed first,
   so its static channels share the moving template. A type whose channels
   were all static would get a static template instead, whose channels send
   their opening message and nothing after it.
-- **Alarm transitions.** The alarm changed-sets are recorded in the profile,
-  under `session_rules.changed_sets`, and `mimus inspect` reports how much
-  of the traffic the dominant one covers. Templates emit the dominant one
-  only.
+- **The changed-sets nothing was learned from.** A changed-set seen in a
+  single body is left out: there is nothing to compare it with, and its
+  timestamp cannot be told apart. `session_rules.changed_sets` records
+  every one seen, and `mimus inspect` says how much of the traffic the
+  dominant one covers.
 
 ## Not covered
 
