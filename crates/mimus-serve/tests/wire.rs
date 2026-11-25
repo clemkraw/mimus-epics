@@ -2743,3 +2743,56 @@ async fn a_down_ioc_refuses_connections_and_comes_back_on_the_same_port() {
         "and serves again"
     );
 }
+
+// -------------------------------------------------------------- activity
+
+/// Seconds and nanoseconds of an update's timestamp, as nanoseconds.
+fn stamp_of(body: &[u8]) -> i128 {
+    let s = i64::from_le_bytes(body[11..19].try_into().unwrap());
+    let ns = i32::from_le_bytes(body[19..23].try_into().unwrap());
+    i128::from(s) * 1_000_000_000 + i128::from(ns)
+}
+
+#[tokio::test]
+async fn channels_with_an_activity_model_post_in_bursts_and_fall_silent() {
+    // 200 Hz, active a quarter of the time in bursts of ten updates: about
+    // 150 updates in three seconds, in runs one period apart, between
+    // silences many periods long.
+    let f = fleet(1, 1);
+    let stages = mimus_serve::Stages::new(1);
+    let cfg = SessionConfig {
+        rate_mix: RateMix::uniform(200.0),
+        activity: Some(mimus_emit::Activity::new(0.25, 10.0).unwrap()),
+        ..Default::default()
+    };
+    let (addr, totals) = start_staged(Arc::clone(&f), cfg, &stages).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let ids = c.subscribe_all(&f.names).await;
+
+    let got = c
+        .collect_updates(ids[0], 10_000, Duration::from_secs(3))
+        .await;
+    assert!(
+        (90..=220).contains(&got.len()),
+        "a quarter of 600: {}",
+        got.len()
+    );
+    let period = 5_000_000i128;
+    let gaps: Vec<i128> = got
+        .windows(2)
+        .map(|w| stamp_of(&w[1]) - stamp_of(&w[0]))
+        .collect();
+    let in_bursts = gaps.iter().filter(|&&g| g < period * 3 / 2).count();
+    let silences = gaps.iter().filter(|&&g| g > period * 5).count();
+    assert!(
+        in_bursts > gaps.len() / 2,
+        "most updates follow one another a period apart: {in_bursts} of {}",
+        gaps.len()
+    );
+    assert!(silences >= 3, "with silences between bursts: {silences}");
+    assert!(
+        totals.snapshot().quiet > 0,
+        "what was not sent is counted as quiet"
+    );
+}
