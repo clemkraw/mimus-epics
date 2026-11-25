@@ -1349,7 +1349,7 @@ impl Session {
 const MONITOR_BODY: usize = 5;
 
 /// Replaces the timestamp in a replayed opening message with the current
-/// run's timestamp.
+/// run's timestamp, and the data's timestamp beside it if there is one.
 ///
 /// Opening messages are captured once per channel during calibration.
 /// Replaying one unchanged would preserve the calibration timestamp as the
@@ -1360,7 +1360,9 @@ const MONITOR_BODY: usize = 5;
 /// In that case, the body is left unchanged.
 fn restamp(desc: &Descriptor, body: &mut [u8], when: EpicsTime) -> Option<usize> {
     let at = desc.locate(body).ok()?;
-    if let Some(site) = at.stamp {
+    // An NTNDArray's frame was taken when it was sent, as far as a consumer
+    // can tell: its dataTimeStamp is restamped with its timeStamp.
+    for site in [at.stamp, at.data_stamp].into_iter().flatten() {
         desc.write_stamp(body, site, when.seconds, when.nanos);
     }
     Some(at.value_end)
