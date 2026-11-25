@@ -14,7 +14,7 @@ use mimus_emit::{Activity, Backpressure, Counters, EpicsTime, Instance, RateMix,
 use mimus_profile::DescriptorPolicy;
 use mimus_wire::codec::put_i32;
 use mimus_wire::header::{ByteOrder, Direction, Header, Segmentation};
-use mimus_wire::pvdata::Descriptor;
+use mimus_wire::pvdata::{Descriptor, Located};
 use mimus_wire::{
     ConnectionValidation, ConnectionValidationResponse, CreateChannelRequest,
     CreateChannelResponse, Frame, Framer, GUID_LEN, GetFieldRequest, GetRequest, MonitorRequest,
@@ -27,6 +27,7 @@ use crate::fleet::Fleet;
 use crate::registry::Registry;
 use crate::shared::{Dropper, SharedCounters};
 use crate::stage::{Stage, Stages};
+use crate::written::Written;
 
 /// Configuration shared by sessions that belong to the same virtual IOC.
 #[derive(Debug, Clone)]
@@ -89,6 +90,40 @@ pub struct SessionConfig {
     /// Alarm transitions per channel per hour, for the channels whose type
     /// carries an alarm variant. `None` sends the ordinary update only.
     pub alarms: Option<f64>,
+    /// What a PUT does.
+    pub put: Put,
+    /// What an RPC gets.
+    pub rpc: Rpc,
+    /// Where what is written is kept, shared by every connection of a run so
+    /// that each sees what another wrote. `None` keeps it to the session.
+    pub written: Option<Arc<Written>>,
+}
+
+/// What a PUT does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Put {
+    /// What is written under `value` is what the channel carries from then
+    /// on: in its updates on every connection, in a read, in an RPC reply.
+    /// What is written elsewhere is answered and counted, and left out, as
+    /// an IOC leaves a write to a field no record holds.
+    #[default]
+    Apply,
+    /// Answered and counted, and changes nothing.
+    Accept,
+    /// Refused with an error status, as before MIMUS answered writes.
+    Refuse,
+}
+
+/// What an RPC gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rpc {
+    /// The channel's value, as a read gets it, whatever the request: MIMUS
+    /// runs no service, and this gives the RPC path of a client or a gateway
+    /// replies of the size and type the channel has.
+    #[default]
+    Value,
+    /// Refused with an error status.
+    Refuse,
 }
 
 impl Default for SessionConfig {
@@ -112,6 +147,9 @@ impl Default for SessionConfig {
             headroom: 1.0,
             activity: None,
             alarms: None,
+            put: Put::default(),
+            rpc: Rpc::default(),
+            written: None,
         }
     }
 }
@@ -151,6 +189,50 @@ impl std::str::FromStr for Pipeline {
             "permissive" | "off" => Ok(Self::Permissive),
             "strict" => Ok(Self::Strict),
             other => Err(format!("unknown pipeline policy {other:?}")),
+        }
+    }
+}
+
+impl std::fmt::Display for Put {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Apply => "apply",
+            Self::Accept => "accept",
+            Self::Refuse => "refuse",
+        })
+    }
+}
+
+impl std::str::FromStr for Put {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "apply" => Ok(Self::Apply),
+            "accept" => Ok(Self::Accept),
+            "refuse" => Ok(Self::Refuse),
+            other => Err(format!(
+                "unknown PUT policy {other:?}: apply, accept or refuse"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Rpc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Value => "value",
+            Self::Refuse => "refuse",
+        })
+    }
+}
+
+impl std::str::FromStr for Rpc {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "value" => Ok(Self::Value),
+            "refuse" => Ok(Self::Refuse),
+            other => Err(format!("unknown RPC policy {other:?}: value or refuse")),
         }
     }
 }
@@ -252,6 +334,9 @@ impl std::fmt::Display for SessionEnd {
 pub struct Session {
     cfg: SessionConfig,
     fleet: Arc<Fleet>,
+    /// Where what clients write is kept: the run's, shared by every
+    /// connection, or the session's own. `None` unless PUTs are applied.
+    written: Option<Arc<Written>>,
     registry: Registry,
     /// Maps server-assigned channel IDs to fleet instance indices.
     channels: HashMap<i32, u32>,
@@ -290,7 +375,16 @@ impl Session {
         let stage_rx = cfg.stages.as_ref().and_then(|s| s.watch(cfg.ioc));
         // Bursts asked for before the session existed are not its to send.
         let stage = stage_rx.as_ref().map(|r| *r.borrow()).unwrap_or_default();
+        let written = match cfg.put {
+            Put::Apply => Some(
+                cfg.written
+                    .clone()
+                    .unwrap_or_else(|| Written::new(fleet.instances.len())),
+            ),
+            Put::Accept | Put::Refuse => None,
+        };
         Ok(Self {
+            written,
             cfg,
             fleet,
             registry,
@@ -525,8 +619,8 @@ impl Session {
             commands::GET_FIELD => self.on_get_field(&frame.payload, order),
             commands::DESTROY_CHANNEL => self.on_destroy_channel(&frame.payload, order),
             commands::DESTROY_REQUEST => self.on_destroy_request(&frame.payload, order),
-            commands::PUT => self.refuse(commands::PUT, "PUT", &frame.payload, order),
-            commands::RPC => self.refuse(commands::RPC, "RPC", &frame.payload, order),
+            commands::PUT => self.on_put(&frame.payload, order),
+            commands::RPC => self.on_rpc(&frame.payload, order),
             _ => Ok(()),
         }
     }
@@ -747,7 +841,7 @@ impl Session {
         out.push(req.sub_command);
         put_status_error(
             &mut out,
-            &format!("{what} not implemented: MIMUS serves GET and MONITOR only"),
+            &format!("{what} refused: this MIMUS run serves no {what}"),
             self.order,
         );
         self.push_app(command, &out);
@@ -785,8 +879,8 @@ impl Session {
         let Some(&instance) = self.channels.get(&req.server_cid) else {
             return Ok(());
         };
-        let template = self.fleet.instances[instance as usize].template;
-        let compiled = &self.fleet.templates[template as usize];
+        let compiled =
+            &self.fleet.templates[self.fleet.instances[instance as usize].template as usize];
 
         let mut out = Vec::with_capacity(compiled.max_len() + 16);
         put_i32(&mut out, req.request_id, self.order);
@@ -795,19 +889,159 @@ impl Session {
         if req.is_init() {
             out.extend_from_slice(&compiled.intro_full);
         } else {
-            match compiled.initial.as_deref() {
-                Some(initial) => {
-                    mimus_wire::codec::put_status_ok(&mut out);
-                    let inst = self.fleet.instances[instance as usize];
-                    let rate = channel_rate(&self.cfg.rate_mix, self.stage.gain, &inst);
-                    let when = last_processed(rate, &inst, EpicsTime::now());
-                    let body = out.len();
-                    initial.render(inst.seed, inst.seed, when, &mut out);
-                    if let Some(desc) = &self.fleet.openings[template as usize]
-                        && let Some(value_end) = restamp(desc, &mut out[body..], when)
-                    {
-                        out.truncate(body + value_end);
-                    }
+            self.read(instance, &mut out);
+        }
+        self.push_app(commands::GET, &out);
+        Ok(())
+    }
+
+    /// Appends a read's reply after its request ID and sub-command: an OK
+    /// status and the channel's value, from its changed set to the end of
+    /// the value, or an error status if the profile has no complete value.
+    fn read(&self, instance: u32, out: &mut Vec<u8>) {
+        let template = self.fleet.instances[instance as usize].template as usize;
+        if self.fleet.templates[template].initial.is_none() {
+            put_status_error(
+                out,
+                "this profile carries no complete value for the channel",
+                self.order,
+            );
+            return;
+        }
+        mimus_wire::codec::put_status_ok(out);
+        let body = out.len();
+        if let Some(at) = self.current(instance, out) {
+            out.truncate(body + at.value_end);
+        }
+    }
+
+    /// Appends the channel's value as a read gets it, in the form of a
+    /// monitor update: the opening message a subscription would receive,
+    /// carrying what was written to the channel, stamped with its last
+    /// processing time. Returns where it lies relative to where it was
+    /// appended, or `None` if the profile has no complete value or its type
+    /// cannot be read, in which case what was appended is sent unchanged.
+    fn current(&self, instance: u32, out: &mut Vec<u8>) -> Option<Located> {
+        let inst = self.fleet.instances[instance as usize];
+        let template = inst.template as usize;
+        let initial = self.fleet.templates[template].initial.as_deref()?;
+        let rate = channel_rate(&self.cfg.rate_mix, self.stage.gain, &inst);
+        let when = last_processed(rate, &inst, EpicsTime::now());
+        let body = out.len();
+        initial.render(inst.seed, inst.seed, when, out);
+        apply_written(self.written.as_deref(), &self.fleet, instance, out, body);
+        let desc = self.fleet.openings[template].as_ref()?;
+        restamp(desc, &mut out[body..], when)
+    }
+
+    /// Answers a PUT.
+    ///
+    /// The exchange is a read's: an INIT reply carrying the channel's type,
+    /// then, for each write, the value the client built from that type, after
+    /// its changed set, answered with a status. A write with the `0x40` bit
+    /// asks instead for the value about to be written over, as a read does;
+    /// PVXS clients ask before they build a value from the one present.
+    ///
+    /// Under [`Put::Apply`], what is written under `value` is kept and
+    /// carried from then on, by every update, read and RPC reply of the
+    /// channel, on every connection sharing the store. MIMUS does not post
+    /// an update on a write: the next one the channel sends carries it, as
+    /// the next scan of a periodic record would. A read right after the
+    /// write returns it at once.
+    fn on_put(&mut self, payload: &[u8], order: ByteOrder) -> Result<(), ()> {
+        if self.cfg.put == Put::Refuse {
+            return self.refuse(commands::PUT, "PUT", payload, order);
+        }
+        let Ok(req) = GetRequest::decode(payload, order) else {
+            return Err(());
+        };
+        let Some(&instance) = self.channels.get(&req.server_cid) else {
+            return Ok(());
+        };
+        let template = self.fleet.instances[instance as usize].template as usize;
+        let mut out = Vec::with_capacity(64);
+        put_i32(&mut out, req.request_id, self.order);
+        out.push(req.sub_command);
+        if req.is_init() {
+            out.extend_from_slice(&self.fleet.templates[template].intro_full);
+        } else if req.sub_command & commands::put::GET != 0 {
+            self.read(instance, &mut out);
+        } else {
+            let n = (payload.len() + mimus_wire::HEADER_SIZE) as u64;
+            self.counters.puts += 1;
+            self.pending.puts += 1;
+            self.counters.put_bytes += n;
+            self.pending.put_bytes += n;
+            match self.write(instance, &payload[GPR_REQUEST..], order) {
+                Ok(()) => mimus_wire::codec::put_status_ok(&mut out),
+                Err(why) => put_status_error(&mut out, why, self.order),
+            }
+        }
+        self.push_app(commands::PUT, &out);
+        Ok(())
+    }
+
+    /// Keeps what a PUT writes under the channel's `value`, under
+    /// [`Put::Apply`]. A value that is not of the channel's type is refused;
+    /// one MIMUS cannot read, because the type's descriptor could not be,
+    /// is accepted and changes nothing.
+    fn write(&self, instance: u32, value: &[u8], order: ByteOrder) -> Result<(), &'static str> {
+        let Some(written) = &self.written else {
+            return Ok(());
+        };
+        let template = self.fleet.instances[instance as usize].template as usize;
+        let Some(desc) = &self.fleet.descriptors[template] else {
+            return Ok(());
+        };
+        let fields = desc
+            .written(value, order)
+            .map_err(|_| "the value written is not of the channel's type")?;
+        let Some(bits) = desc.field_bits("value") else {
+            return Ok(());
+        };
+        written.write(
+            instance,
+            fields.into_iter().filter(|(bit, _)| bits.contains(bit)),
+        );
+        Ok(())
+    }
+
+    /// Answers an RPC with the channel's value, under [`Rpc::Value`].
+    ///
+    /// The INIT reply is a status alone. Each request, whatever it carries,
+    /// is answered with a status, the channel's type and its value in full,
+    /// without a changed set: what a read returns, in the form an RPC reply
+    /// takes, the fields a read leaves out written empty. The request is not
+    /// read.
+    fn on_rpc(&mut self, payload: &[u8], order: ByteOrder) -> Result<(), ()> {
+        if self.cfg.rpc == Rpc::Refuse {
+            return self.refuse(commands::RPC, "RPC", payload, order);
+        }
+        let Ok(req) = GetRequest::decode(payload, order) else {
+            return Err(());
+        };
+        let Some(&instance) = self.channels.get(&req.server_cid) else {
+            return Ok(());
+        };
+        let template = self.fleet.instances[instance as usize].template as usize;
+        let mut out = Vec::with_capacity(self.fleet.templates[template].max_len() + 64);
+        put_i32(&mut out, req.request_id, self.order);
+        out.push(req.sub_command);
+        if req.is_init() {
+            mimus_wire::codec::put_status_ok(&mut out);
+        } else {
+            self.counters.rpcs += 1;
+            self.pending.rpcs += 1;
+            let mut value = Vec::new();
+            let full = self.current(instance, &mut value).and_then(|_| {
+                let desc = self.fleet.openings[template].as_ref()?;
+                desc.full_value(&value).ok()
+            });
+            match full {
+                Some(full) => {
+                    // The stored descriptor begins with the OK status.
+                    out.extend_from_slice(&self.fleet.templates[template].intro_full);
+                    out.extend_from_slice(&full);
                 }
                 None => put_status_error(
                     &mut out,
@@ -816,7 +1050,7 @@ impl Session {
                 ),
             }
         }
-        self.push_app(commands::GET, &out);
+        self.push_app(commands::RPC, &out);
         Ok(())
     }
 
@@ -1188,6 +1422,13 @@ impl Session {
             Shape::SteadyState | Shape::Alarm => now,
         };
         compiled.render(step, instance.seed, when, &mut payload);
+        apply_written(
+            self.written.as_deref(),
+            &self.fleet,
+            mon.instance,
+            &mut payload,
+            MONITOR_BODY,
+        );
         if shape == Shape::SteadyState {
             mon.step += 1;
         } else if shape == Shape::Alarm {
@@ -1358,15 +1599,41 @@ const MONITOR_BODY: usize = 5;
 ///
 /// Returns `None` if the descriptor cannot locate the value in the body.
 /// In that case, the body is left unchanged.
-fn restamp(desc: &Descriptor, body: &mut [u8], when: EpicsTime) -> Option<usize> {
+fn restamp(desc: &Descriptor, body: &mut [u8], when: EpicsTime) -> Option<Located> {
     let at = desc.locate(body).ok()?;
     // An NTNDArray's frame was taken when it was sent, as far as a consumer
     // can tell: its dataTimeStamp is restamped with its timeStamp.
     for site in [at.stamp, at.data_stamp].into_iter().flatten() {
         desc.write_stamp(body, site, when.seconds, when.nanos);
     }
-    Some(at.value_end)
+    Some(at)
 }
+
+/// Writes what was written to a channel over the fields of the update at
+/// `buf[at..]` that carries them, if anything was.
+///
+/// One atomic load for a channel nothing was written to, which is almost
+/// every update of almost every run.
+fn apply_written(
+    written: Option<&Written>,
+    fleet: &Fleet,
+    instance: u32,
+    buf: &mut Vec<u8>,
+    at: usize,
+) {
+    let Some(fields) = written.and_then(|w| w.get(instance)) else {
+        return;
+    };
+    let template = fleet.instances[instance as usize].template as usize;
+    if let Some(desc) = &fleet.descriptors[template] {
+        // An update the walker cannot read is sent as rendered.
+        let _ = desc.overwrite(buf, at, &fields);
+    }
+}
+
+/// Bytes before a GET, PUT or RPC request's data: the server channel ID,
+/// the request ID and the sub-command.
+const GPR_REQUEST: usize = 4 + 4 + 1;
 
 /// The most steps a session runs in one wakeup to catch up.
 const MAX_CATCH_UP: u32 = 16;

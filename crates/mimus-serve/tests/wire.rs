@@ -22,7 +22,7 @@ use mimus_profile::{
 };
 use mimus_serve::Dropper;
 use mimus_serve::fleet::{Fleet, FleetSpec, Layout};
-use mimus_serve::session::{Session, SessionConfig};
+use mimus_serve::session::{Put, Rpc, Session, SessionConfig};
 use mimus_wire::codec::{Reader, put_i16, put_i32, put_size, put_string};
 use mimus_wire::header::{ByteOrder, Direction, Header, Segmentation};
 use mimus_wire::{Frame, Framer, commands};
@@ -2450,12 +2450,17 @@ async fn without_a_request_a_connection_stays_open() {
 }
 
 #[tokio::test]
-async fn a_put_or_an_rpc_is_refused_not_left_unanswered() {
-    // MIMUS serves reads only. A PVXS server answers the INIT of an
-    // operation it does not implement with an error status; silence would
-    // leave the client waiting until its own timeout.
+async fn a_put_or_an_rpc_refused_is_refused_not_left_unanswered() {
+    // A run that serves no PUT or RPC answers their INIT with an error
+    // status, as a PVXS server does for an operation its channel does not
+    // implement; silence would leave the client waiting until its timeout.
     let f = fleet(4, 1);
-    let addr = start(Arc::clone(&f), fast_config()).await;
+    let cfg = SessionConfig {
+        put: Put::Refuse,
+        rpc: Rpc::Refuse,
+        ..fast_config()
+    };
+    let addr = start(Arc::clone(&f), cfg).await;
     let mut c = Client::connect(addr).await;
     c.handshake().await;
     let cid = c.create_channel(&f.names[0].clone()).await.unwrap();
@@ -2476,7 +2481,7 @@ async fn a_put_or_an_rpc_is_refused_not_left_unanswered() {
         assert_eq!(r.i32().unwrap(), request_id);
         assert_eq!(r.u8().unwrap(), commands::get::INIT);
         assert_eq!(r.u8().unwrap(), 0x02, "an error status");
-        assert!(r.string().unwrap().contains("not implemented"));
+        assert!(r.string().unwrap().contains("refused"));
     }
 
     // The connection is still good for what MIMUS does serve.
@@ -3123,4 +3128,285 @@ async fn an_image_of_a_megabyte_arrives_whole_frame_after_frame() {
     for k in 0..3u8 {
         assert!(seen.contains(&k), "frame {k} never replayed: {seen:?}");
     }
+}
+
+// ------------------------------------------------------------ writes and calls
+
+/// A profile of one NTScalar double whose updates the walker can read, as
+/// calibration leaves them: the value, the stamp's seconds and nanoseconds
+/// (bits 1, 7, 8), the overrun set; its opening as in
+/// [`profile_with_stamped_opening`].
+fn writable_fleet() -> Arc<Fleet> {
+    let mut p = profile_with_stamped_opening();
+    let initial = p.templates[0].initial.take().unwrap();
+    let mut steady = Template::new("nts", MONITOR);
+    steady
+        .with_introspection(Introspection {
+            full: ntscalar_descriptor(),
+            id_only: Some(vec![0xFF, 0xFE, 0x03, 0x00]),
+        })
+        .push_fixed(vec![0x02, 0x82, 0x01])
+        .push_slot(
+            Slot::new(1, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::Value {
+                scalar: ScalarType::F64,
+            }),
+        )
+        .push_slot(
+            Slot::new(2, SlotWidth::Fixed { bytes: 8 }).with_role(SlotRole::TimestampSeconds),
+        )
+        .push_slot(Slot::new(3, SlotWidth::Fixed { bytes: 4 }).with_role(SlotRole::TimestampNanos))
+        .push_fixed(vec![0x00]);
+    steady.observations = 100;
+    steady.with_initial(*initial);
+    p.templates = vec![steady];
+    p.validate(0).unwrap();
+    let spec = FleetSpec {
+        iocs: 1,
+        pvs: 2,
+        layout: Layout::Blocked,
+        mix: vec![("nts".into(), 1)],
+        rate_mix: RateMix::uniform(50.0),
+        names: mimus_serve::NameTemplate::default_pattern("MIM"),
+    };
+    Arc::new(Fleet::build(&p, &spec).unwrap())
+}
+
+/// Serves a fleet on one IOC that takes any number of connections, with
+/// `cfg`, and returns its address.
+async fn serve_ioc(fleet: Arc<Fleet>, cfg: SessionConfig) -> std::net::SocketAddr {
+    let ioc = mimus_serve::Ioc::bind(0, "127.0.0.1:0", cfg, fleet)
+        .await
+        .unwrap();
+    let addr = ioc.addr;
+    tokio::spawn(ioc.serve());
+    addr
+}
+
+impl Client {
+    /// Sends a GET, PUT or RPC request: the channel, the request, the
+    /// sub-command and what follows it.
+    async fn gpr(&mut self, command: u8, cid: i32, ioid: i32, sub: u8, rest: &[u8]) {
+        let mut p = Vec::new();
+        put_i32(&mut p, cid, LE);
+        put_i32(&mut p, ioid, LE);
+        p.push(sub);
+        p.extend_from_slice(rest);
+        self.send(command, &p).await;
+    }
+
+    /// The reply to a GET, PUT or RPC request after its request ID and
+    /// sub-command, which it checks.
+    async fn gpr_reply(&mut self, command: u8, ioid: i32, sub: u8) -> Vec<u8> {
+        let frame = self
+            .recv_command(command, Duration::from_millis(500))
+            .await
+            .unwrap_or_else(|| panic!("no reply to command {command:#04x}"));
+        let mut r = Reader::new(&frame.payload, LE);
+        assert_eq!(r.i32().unwrap(), ioid);
+        assert_eq!(r.u8().unwrap(), sub, "the sub-command is echoed");
+        r.rest().to_vec()
+    }
+
+    /// Writes a double as `pvxput` does: INIT, then the value's bit and
+    /// the value. Returns the status the write was answered with.
+    async fn put_f64(&mut self, cid: i32, ioid: i32, v: f64) -> u8 {
+        self.gpr(commands::PUT, cid, ioid, commands::get::INIT, &[0xFF])
+            .await;
+        let init = self
+            .gpr_reply(commands::PUT, ioid, commands::get::INIT)
+            .await;
+        assert_eq!(init[0], 0xFF, "OK status");
+        assert_eq!(&init[1..], &ntscalar_descriptor()[1..], "then the type");
+        let mut value = vec![0x01, 0x02];
+        value.extend_from_slice(&v.to_le_bytes());
+        self.gpr(commands::PUT, cid, ioid, 0x00, &value).await;
+        self.gpr_reply(commands::PUT, ioid, 0x00).await[0]
+    }
+
+    /// Reads a channel once and returns the double it carries.
+    async fn get_f64(&mut self, cid: i32, ioid: i32) -> f64 {
+        self.gpr(commands::GET, cid, ioid, commands::get::INIT, &[0xFF])
+            .await;
+        self.gpr_reply(commands::GET, ioid, commands::get::INIT)
+            .await;
+        self.gpr(commands::GET, cid, ioid, 0x00, &[]).await;
+        let body = self.gpr_reply(commands::GET, ioid, 0x00).await;
+        assert_eq!(&body[..3], &[0xFF, 0x01, 0x01], "OK, then the whole value");
+        f64::from_le_bytes(body[3..11].try_into().unwrap())
+    }
+}
+
+#[tokio::test]
+async fn a_value_written_is_read_back_and_carried_on_every_connection() {
+    let f = writable_fleet();
+    let cfg = SessionConfig {
+        written: Some(mimus_serve::Written::new(f.instances.len())),
+        ..fast_config()
+    };
+    let addr = serve_ioc(Arc::clone(&f), cfg).await;
+
+    let mut writer = Client::connect(addr).await;
+    writer.handshake().await;
+    let cid = writer.create_channel(&f.names[0]).await.unwrap();
+    assert_eq!(writer.put_f64(cid, 70, 42.5).await, 0xFF, "OK status");
+    // A read right after the write returns it.
+    assert_eq!(writer.get_f64(cid, 71).await, 42.5);
+
+    // Another connection subscribes: the opening value and each update
+    // carry what was written, each with a current stamp.
+    let mut reader = Client::connect(addr).await;
+    reader.handshake().await;
+    let (rid, _) = reader.subscribe(&f.names[0]).await;
+    let updates = reader.collect_updates(rid, 4, Duration::from_secs(2)).await;
+    assert_eq!(updates.len(), 4);
+    let opening = &updates[0];
+    assert_eq!(&opening[..2], &[0x01, 0x01]);
+    assert_eq!(f64::from_le_bytes(opening[2..10].try_into().unwrap()), 42.5);
+    assert_current(opening, OPENING_SECONDS_AT, "the opening");
+    for u in &updates[1..] {
+        assert_eq!(&u[..3], &[0x02, 0x82, 0x01]);
+        assert_eq!(f64::from_le_bytes(u[3..11].try_into().unwrap()), 42.5);
+        assert_current(u, 11, "an update");
+    }
+
+    // The other channel of the type was not written to.
+    let other = writer.create_channel(&f.names[1]).await.unwrap();
+    assert_ne!(writer.get_f64(other, 72).await, 42.5);
+}
+
+#[tokio::test]
+async fn a_client_reads_the_value_it_is_about_to_write_over() {
+    // The 0x40 bit asks for the present value rather than writing one, as
+    // a PVXS client does before it builds its value from the one present.
+    let f = writable_fleet();
+    let addr = start(Arc::clone(&f), fast_config()).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let cid = c.create_channel(&f.names[0]).await.unwrap();
+    c.gpr(commands::PUT, cid, 80, commands::get::INIT, &[0xFF])
+        .await;
+    c.gpr_reply(commands::PUT, 80, commands::get::INIT).await;
+    c.gpr(commands::PUT, cid, 80, commands::put::GET, &[]).await;
+    let body = c.gpr_reply(commands::PUT, 80, commands::put::GET).await;
+    assert_eq!(&body[..3], &[0xFF, 0x01, 0x01], "OK, then the whole value");
+    assert_current(&body[1..], OPENING_SECONDS_AT, "the value present");
+}
+
+#[tokio::test]
+async fn a_write_in_the_other_byte_order_is_read_in_it() {
+    const BE: ByteOrder = ByteOrder::Big;
+    let f = writable_fleet();
+    let addr = start(Arc::clone(&f), fast_config()).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let cid = c.create_channel(&f.names[0]).await.unwrap();
+    c.gpr(commands::PUT, cid, 90, commands::get::INIT, &[0xFF])
+        .await;
+    c.gpr_reply(commands::PUT, 90, commands::get::INIT).await;
+
+    let mut p = Vec::new();
+    put_i32(&mut p, cid, BE);
+    put_i32(&mut p, 90, BE);
+    p.push(0x00);
+    p.extend_from_slice(&[0x01, 0x02]);
+    p.extend_from_slice(&42.5f64.to_be_bytes());
+    let hdr = Header::application(
+        commands::PUT,
+        p.len() as i32,
+        BE,
+        Direction::FromClient,
+        Segmentation::None,
+    );
+    c.stream.write_all(&hdr.encode()).await.unwrap();
+    c.stream.write_all(&p).await.unwrap();
+    assert_eq!(c.gpr_reply(commands::PUT, 90, 0x00).await[0], 0xFF);
+    assert_eq!(c.get_f64(cid, 91).await, 42.5, "kept in the server's order");
+}
+
+#[tokio::test]
+async fn a_write_that_is_not_of_the_channel_s_type_is_refused_and_changes_nothing() {
+    let f = writable_fleet();
+    let addr = start(Arc::clone(&f), fast_config()).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let cid = c.create_channel(&f.names[0]).await.unwrap();
+    let before = c.get_f64(cid, 100).await;
+    c.gpr(commands::PUT, cid, 101, commands::get::INIT, &[0xFF])
+        .await;
+    c.gpr_reply(commands::PUT, 101, commands::get::INIT).await;
+    // The value's bit, and four bytes of a double.
+    c.gpr(commands::PUT, cid, 101, 0x00, &[0x01, 0x02, 0, 0, 0, 0])
+        .await;
+    assert_ne!(c.gpr_reply(commands::PUT, 101, 0x00).await[0], 0xFF);
+    assert_eq!(c.get_f64(cid, 102).await, before);
+}
+
+#[tokio::test]
+async fn an_accepted_write_is_answered_and_counted_and_changes_nothing() {
+    let f = writable_fleet();
+    let stages = mimus_serve::Stages::new(1);
+    let cfg = SessionConfig {
+        put: Put::Accept,
+        ..fast_config()
+    };
+    let (addr, totals) = start_staged(Arc::clone(&f), cfg, &stages).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let cid = c.create_channel(&f.names[0]).await.unwrap();
+    let before = c.get_f64(cid, 110).await;
+    assert_eq!(c.put_f64(cid, 111, 42.5).await, 0xFF);
+    assert_eq!(c.get_f64(cid, 112).await, before);
+    // Counted when the session publishes, on its next tick.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (rid, _) = c.subscribe(&f.names[0]).await;
+    let _ = c.collect_updates(rid, 2, Duration::from_secs(1)).await;
+    let counted = totals.snapshot();
+    assert_eq!(counted.puts, 1, "the write, not its INIT");
+    // Header, server id, request id, sub-command, then the changed set and
+    // the double.
+    assert_eq!(counted.put_bytes, 8 + 4 + 4 + 1 + 2 + 8);
+}
+
+#[tokio::test]
+async fn an_rpc_gets_the_channel_s_value_in_full_whatever_it_asks() {
+    let f = writable_fleet();
+    let stages = mimus_serve::Stages::new(1);
+    let (addr, totals) = start_staged(Arc::clone(&f), fast_config(), &stages).await;
+    let mut c = Client::connect(addr).await;
+    c.handshake().await;
+    let cid = c.create_channel(&f.names[0]).await.unwrap();
+    assert_eq!(c.put_f64(cid, 120, 42.5).await, 0xFF);
+
+    c.gpr(commands::RPC, cid, 121, commands::get::INIT, &[0xFF])
+        .await;
+    assert_eq!(
+        c.gpr_reply(commands::RPC, 121, commands::get::INIT).await,
+        vec![0xFF],
+        "the INIT reply is a status alone"
+    );
+    // An NTURI-like request MIMUS does not read: its type, then its value.
+    let mut request = vec![0x80];
+    put_string(&mut request, "epics:nt/NTURI:1.0", LE);
+    put_size(&mut request, 1, LE);
+    put_string(&mut request, "path", LE);
+    request.push(0x60);
+    put_string(&mut request, "anything", LE);
+    c.gpr(commands::RPC, cid, 121, 0x00, &request).await;
+    let reply = c.gpr_reply(commands::RPC, 121, 0x00).await;
+
+    // A status and the channel's type, then its value, every field, with
+    // no changed set before it and no overrun set after it.
+    // The stored descriptor begins with the OK status.
+    let desc = ntscalar_descriptor();
+    assert_eq!(&reply[..desc.len()], &desc[..]);
+    let value = &reply[desc.len()..];
+    assert_eq!(value.len(), OPENING_SECONDS_AT - 2 + 8 + 4 + 4);
+    assert_eq!(f64::from_le_bytes(value[..8].try_into().unwrap()), 42.5);
+    assert_current(value, OPENING_SECONDS_AT - 2, "the reply");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (rid, _) = c.subscribe(&f.names[0]).await;
+    let _ = c.collect_updates(rid, 2, Duration::from_secs(1)).await;
+    let counted = totals.snapshot();
+    assert_eq!((counted.puts, counted.rpcs), (1, 1));
 }
